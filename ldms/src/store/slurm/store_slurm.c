@@ -151,8 +151,9 @@ static const char *job_rank_time_attrs[] = { "job_id", "task_rank", "timestamp" 
 static const char *job_time_rank_attrs[] = { "job_id", "timestamp", "task_rank" };
 static const char *tag_start_job_attrs[] = { "job_tag", "job_start", "job_id" };
 
+static char schema_name[PATH_MAX];
 struct sos_schema_template slurm_schema_template = {
-	.name = "job",
+	.name = schema_name,
 	.attrs = {
 		{
 			.name = "timestamp",
@@ -501,9 +502,14 @@ open_store(struct ldmsd_store *s, const char *container, const char *schema,
 	si->container = strdup(container);
 	if (!si->container)
 		goto err1;
+	if (strlen(schema) >= PATH_MAX) {
+		errno = E2BIG;
+		goto err2;
+	}
 	si->schema_name = strdup(schema);
 	if (!si->schema_name)
 		goto err2;
+	strcpy(schema_name, si->schema_name);
 	size_t pathlen =
 		strlen(root_path) + strlen(si->container) + 4;
 	si->path = malloc(pathlen);
