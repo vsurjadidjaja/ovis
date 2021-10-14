@@ -8,10 +8,6 @@ sbin_PROGRAMS += test_sps
 AM_LDFLAGS = @OVIS_LIB_ABS@
 AM_CPPFLAGS = @OVIS_INCLUDE_ABS@
 
-if ENABLE_SOS
-sbin_PROGRAMS += ldmsd_sos_init
-endif
-
 AM_CFLAGS = \
 "-DLDMS_SRCDIR=\"$(abs_top_srcdir)\"" \
 "-DLDMS_BUILDDIR=\"$(abs_top_builddir)\""
@@ -38,7 +34,6 @@ ldms_ls_LDADD = ../core/libldms.la $(LZAP) $(LMMALLOC) $(LOVIS_UTIL) $(LCOLL) \
 lib_LTLIBRARIES += libldmsd_stream.la
 libldmsd_stream_la_SOURCES = ldmsd_stream.c ldmsd_stream.h ldmsd_request_util.c
 libldmsd_stream_la_LIBADD = ../core/libldms.la
-
 
 lib_LTLIBRARIES += libldms_sps.la
 libldms_sps_la_SOURCES = ldms_sps.c ldms_sps.h
@@ -69,10 +64,6 @@ ldmsctl_SOURCES = ldmsctl.c
 ldmsctl_LDADD = ../core/libldms.la libldmsd_request.la \
 		$(LOVIS_CTRL) $(LOVIS_UTIL) $(LMMALLOC) $(LCOLL) $(LZAP) $(LJSON_UTIL) \
 		-lm -lpthread @LDFLAGS_GETTIME@ @LDFLAGS_READLINE@
-
-ldmsd_sos_init_SOURCES = ldmsd_sos_init.c
-ldmsd_sos_init_CFLAGS = @SOS_INCDIR_FLAG@ $(AM_CFLAGS)
-ldmsd_sos_init_LDADD = -lsos -lods -lpthread @SOS_LIBDIR_FLAG@ @SOS_LIB64DIR_FLAG@
 
 lib_LTLIBRARIES += libldmsd_plugattr.la
 libldmsd_plugattr_la_SOURCES = ldmsd_plugattr.c ldmsd_plugattr.h
