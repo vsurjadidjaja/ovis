@@ -1061,6 +1061,7 @@ ldms/src/sampler/kgnilnd/Makefile
 ldms/src/sampler/tx2mon/Makefile
 ldms/src/sampler/msr_interlagos/Makefile
 ldms/src/sampler/meminfo/Makefile
+ldms/src/sampler/gpfs_sampler/Makefile
 ldms/src/contrib/sampler/gpu_metrics_sampler/Makefile
 ldms/src/sampler/procinterrupts/Makefile
 ldms/src/sampler/procnetdev2/Makefile
