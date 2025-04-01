@@ -1,3 +1,5 @@
+#ifndef gpfs_parse_h
+#define gpfs_parse_h
 /* -*- c-basic-offset: 8 -*-
  * Copyright (c) 2021 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
@@ -88,7 +90,7 @@ char *gpfs_set(char *buffer) {
 		args[k] = strdup(token);
                 token = strtok(NULL, " \t");
                 switch(k){
-                case 5  : {
+			case 5  : {
 				data[i] = args[k];
 				break;
 			} case 9  :  {
@@ -134,3 +136,4 @@ char *gpfs_set(char *buffer) {
 
         return data;
 }
+#endif

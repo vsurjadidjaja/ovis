@@ -64,6 +64,7 @@
 #include "ldmsd.h"
 #include "sampler_base.h"
 #include "gpfs.h"
+#include "gpfs_parse.c"
 
 #include <pthread.h>
 
@@ -77,7 +78,7 @@ static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 #define GPFS_FILE "gpfs"
 static char *gpfs_file = GPFS_FILE;
 #define NVARS 15
-static char *varname[] = {"name","ip","node_name","timestamp", "cluster", "filesystem", "disks", "bytes_read",
+static char *varname[] = {"name","ip","node_name","timestamp", "cluster", "filesystem", "disks", "bytes_read",g
 							"bytes_written","opens", "closes", "reads", "writes", "read_dir", "inode_updates"};
 
 struct gpfs {
@@ -433,19 +434,19 @@ static int sample(struct ldmsd_sampler *self)
 				rc = sscanf(buffer, "%s %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64g
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 " %" PRIu64 "\n", curriface, &v[0].v_u64,
-				&v[1].v_u64, &v[2].v_u64, &v[3].v_u64, &v[4].v_u64,
-				&v[5].v_u64, &v[6].v_u64, &v[7].v_u64, &v[8].v_u64,
-				&v[9].v_u64, &v[10].v_u64, &v[11].v_u64, &v[12].v_u64,
-				&v[13].v_u64, &v[14].v_u64, &v[15].v_u64, &v[16].v_u64,
-				&v[17].v_u64, &v[18].v_u64, &v[19].v_u64, &v[20].v_u64,
-				&v[21].v_u64, &v[22].v_u64, &v[23].v_u64, &v[24].v_u64,
-				&v[25].v_u64, &v[26].v_u64, &v[27].v_u64, &v[28].v_u64,
+				" %" PRIu64 " %" PRIu64 "\n", curriface, &v[0].v_u64,g
+				&v[1].v_u64, &v[2].v_u64, &v[3].v_u64, &v[4].v_u64,g
+				&v[5].v_u64, &v[6].v_u64, &v[7].v_u64, &v[8].v_u64,g
+				&v[9].v_u64, &v[10].v_u64, &v[11].v_u64, &v[12].v_u64,g
+				&v[13].v_u64, &v[14].v_u64, &v[15].v_u64, &v[16].v_u64,g
+				&v[17].v_u64, &v[18].v_u64, &v[19].v_u64, &v[20].v_u64,g
+				&v[21].v_u64, &v[22].v_u64, &v[23].v_u64, &v[24].v_u64,g
+				&v[25].v_u64, &v[26].v_u64, &v[27].v_u64, &v[28].v_u64,g
 				&v[29].v_u64, &v[30].v_u64, &v[31].v_u64, &v[32].v_u64);
 
 			}
@@ -511,8 +512,6 @@ int main(void) {
 		strcat(temp,buffer);
         }
 	gpfs_data = gpfs_set(temp);
-
-
 
     return 0;
 }
