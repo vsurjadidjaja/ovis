@@ -1191,7 +1191,7 @@ static zap_err_t z_get_name(zap_ep_t ep, struct sockaddr *local_sa,
 
 static zap_err_t z_ugni_connect(zap_ep_t ep,
 				struct sockaddr *sa, socklen_t sa_len,
-				char *data, size_t data_len)
+				char *data, size_t data_len, int tpi)
 {
 	int rc;
 	zap_err_t zerr;
@@ -1248,7 +1248,7 @@ static zap_err_t z_ugni_connect(zap_ep_t ep,
 	uep->ev.events = EPOLLIN|EPOLLOUT;
 	uep->ev.data.ptr = &uep->sock_epoll_ctxt;
 
-	zerr = zap_io_thread_ep_assign(&uep->ep);
+	zerr = zap_io_thread_ep_assign(&uep->ep, tpi);
 	if (zerr)
 		goto err_1;
 
@@ -1457,13 +1457,22 @@ static void process_uep_msg_connect(struct z_ugni_ep *uep)
 	CONN_LOG("%p sock-recv conn_msg: pe_addr: %#x, inst_id: %#x\n",
 			uep, msg->ep_desc.pe_addr, msg->ep_desc.inst_id);
 
+	void *data = NULL;
+	if (msg->data_len) {
+		data = malloc(msg->data_len);
+		if (!data)
+			return;
+		memcpy(data, msg->data, msg->data_len);
+	}
+
 	struct zap_event ev = {
 		.ep = &uep->ep,
 		.type = ZAP_EVENT_CONNECT_REQUEST,
 		.data_len = msg->data_len,
-		.data = (msg->data_len)?((void*)msg->data):(NULL)
+		.data = data
 	};
 	uep->ep.cb(&uep->ep, &ev);
+	free(data);
 
 	return;
 
@@ -1643,7 +1652,7 @@ static zap_err_t z_ugni_listen(zap_ep_t ep, struct sockaddr *sa,
 	uep->ev.events = EPOLLIN;
 	uep->ev.data.ptr = &uep->sock_epoll_ctxt;
 
-	zerr = zap_io_thread_ep_assign(&uep->ep);
+	zerr = zap_io_thread_ep_assign(&uep->ep, -1);
 	if (zerr)
 		goto err_1;
 
@@ -1689,7 +1698,7 @@ z_ugni_send_mapped(zap_ep_t ep, zap_map_t map, void *buf, size_t len,
 	return zerr;
 }
 
-static zap_err_t z_ugni_send(zap_ep_t ep, char *buf, size_t len)
+static zap_err_t z_ugni_send2(zap_ep_t ep, char *buf, size_t len, void *cb_arg)
 {
 	struct z_ugni_ep *uep = (void*)ep;
 	zap_err_t zerr;
@@ -1711,9 +1720,14 @@ static zap_err_t z_ugni_send(zap_ep_t ep, char *buf, size_t len)
 	}
 	memset(&msg, 0, sizeof(msg));
 	msg.hdr.msg_type = htons(ZAP_UGNI_MSG_REGULAR);
-	zerr = z_ugni_msg_send(uep, &msg, buf, len, NULL);
+	zerr = z_ugni_msg_send(uep, &msg, buf, len, cb_arg);
 	EP_UNLOCK(uep);
 	return zerr;
+}
+
+static zap_err_t z_ugni_send(zap_ep_t ep, char *buf, size_t len)
+{
+	return z_ugni_send2(ep, buf, len, NULL);
 }
 
 static uint8_t __get_ptag()
@@ -2221,6 +2235,9 @@ static void z_ugni_destroy(zap_ep_t ep)
 {
 	struct z_ugni_ep *uep = (void*)ep;
 	CONN_LOG("destroying endpoint %p\n", uep);
+
+	zap_io_thread_ep_remove(ep);
+
 	pthread_mutex_lock(&z_ugni_list_mutex);
 	ZUGNI_LIST_REMOVE(uep, link);
 	pthread_mutex_unlock(&z_ugni_list_mutex);
@@ -2244,7 +2261,7 @@ static void z_ugni_destroy(zap_ep_t ep)
 	free(ep);
 }
 
-zap_err_t z_ugni_accept(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len)
+zap_err_t z_ugni_accept(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len, int tpi)
 {
 	/* ep is the newly created ep from __z_ugni_conn_request */
 	struct z_ugni_ep *uep = (struct z_ugni_ep *)ep;
@@ -2258,6 +2275,13 @@ zap_err_t z_ugni_accept(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len
 
 	if (uep->ep.state != ZAP_EP_ACCEPTING) {
 		zerr = ZAP_ERR_ENDPOINT;
+		EP_UNLOCK(uep);
+		goto out;
+	}
+
+	rc = zap_io_thread_ep_assign(ep, tpi);
+	if (rc) {
+		zerr = ZAP_ERR_RESOURCE;
 		EP_UNLOCK(uep);
 		goto out;
 	}
@@ -2907,7 +2931,7 @@ static void z_ugni_handle_cq_event(struct z_ugni_io_thread *thr)
 }
 
 /* EP_LOCK is NOT held */
-static void z_ugni_sock_conn_request(struct z_ugni_ep *uep)
+static void z_ugni_sock_conn_request(z_ugni_io_thread_t thr, struct z_ugni_ep *uep)
 {
 	int rc;
 	zap_ep_t new_ep;
@@ -2962,12 +2986,7 @@ static void z_ugni_sock_conn_request(struct z_ugni_ep *uep)
 	new_uep->ev.events = EPOLLIN;
 	new_uep->ev.data.ptr = &new_uep->sock_epoll_ctxt;
 
-	rc = zap_io_thread_ep_assign(new_ep);
-	if (rc) {
-		LOG_(new_uep, "thread assignment error: %d\n", rc);
-		zap_free(new_ep);
-		return;
-	}
+	epoll_ctl(thr->efd, EPOLL_CTL_ADD, new_uep->sock, &new_uep->ev);
 
 	/*
 	 * NOTE: At this point, the connection is socket-connected. The next
@@ -3195,7 +3214,7 @@ static int z_ugni_setup_conn(struct z_ugni_ep *uep, struct z_ugni_ep_desc *ep_de
 }
 
 /* EP_LOCK is NOT held */
-static void z_ugni_sock_recv(struct z_ugni_ep *uep)
+static void z_ugni_sock_recv(z_ugni_io_thread_t thr, struct z_ugni_ep *uep)
 {
 	int n, mlen;
 	struct zap_ugni_msg *msg;
@@ -3238,6 +3257,11 @@ static void z_ugni_sock_recv(struct z_ugni_ep *uep)
 	uep->sock_off = 0;
 
 	msg = &uep->mbuf.msg;
+
+	if (uep->ep.state == ZAP_EP_ACCEPTING && uep->ep.thread == NULL) {
+		struct epoll_event ignore;
+		epoll_ctl(thr->efd, EPOLL_CTL_DEL, uep->sock, &ignore);
+	}
 
 	/* network-to-host */
 	msg->hdr.msg_len = ntohl(msg->hdr.msg_len);
@@ -3393,7 +3417,7 @@ static void z_ugni_process_sock_send_comp(z_ugni_ep_t uep)
 	}
 }
 
-static void z_ugni_handle_sock_event(struct z_ugni_ep *uep, int events)
+static void z_ugni_handle_sock_event(z_ugni_io_thread_t thr, struct z_ugni_ep *uep, int events)
 {
 	__get_ep(&uep->ep, "sock_event");
 	EP_LOCK(uep);
@@ -3405,7 +3429,7 @@ static void z_ugni_handle_sock_event(struct z_ugni_ep *uep, int events)
 			    "but got: %d\n", EPOLLIN, events);
 			goto out;
 		}
-		z_ugni_sock_conn_request(uep);
+		z_ugni_sock_conn_request(thr, uep);
 		goto out;
 	}
 	if (events & EPOLLHUP) {
@@ -3436,7 +3460,7 @@ static void z_ugni_handle_sock_event(struct z_ugni_ep *uep, int events)
 	EP_UNLOCK(uep);
 	if ((events & EPOLLIN) && uep->sock >= 0) {
 		/* NOTE: sock may be disabled by z_ugni_sock_XXX(uep) above */
-		z_ugni_sock_recv(uep);
+		z_ugni_sock_recv(thr, uep);
 	}
  out:
 	__put_ep(&uep->ep, "sock_event");
@@ -3589,6 +3613,8 @@ static void *z_ugni_io_thread_proc(void *arg)
 	struct epoll_event ev[N_EV];
 	int was_not_empty;
 
+	thr->zap_io_thread.stat->tid = syscall(SYS_gettid);
+
 	pthread_cleanup_push(z_ugni_io_thread_cleanup, thr);
 
  loop:
@@ -3610,7 +3636,7 @@ static void *z_ugni_io_thread_proc(void *arg)
 			break;
 		case Z_UGNI_SOCK_EVENT:
 			uep = container_of(ctxt, struct z_ugni_ep, sock_epoll_ctxt);
-			z_ugni_handle_sock_event(uep, ev[i].events);
+			z_ugni_handle_sock_event(thr, uep, ev[i].events);
 			break;
 		case Z_UGNI_ZQ_EVENT:
 			z_ugni_handle_zq_events(thr, ev[i].events);
@@ -3917,6 +3943,7 @@ zap_err_t zap_transport_get(zap_t *pz, zap_mem_info_fn_t mem_info_fn)
 	z->listen = z_ugni_listen;
 	z->close = z_ugni_close;
 	z->send = z_ugni_send;
+	z->send2 = z_ugni_send2;
 	z->send_mapped = z_ugni_send_mapped;
 	z->read = z_ugni_read;
 	z->write = z_ugni_write;

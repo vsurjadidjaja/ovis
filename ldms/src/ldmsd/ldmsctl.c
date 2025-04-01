@@ -67,6 +67,7 @@
 #include <time.h>
 #include <ctype.h>
 #include "ovis_json/ovis_json.h"
+#include "ovis_log/ovis_log.h"
 #include "ldms.h"
 #include "ldmsd_request.h"
 #include "config.h"
@@ -103,8 +104,6 @@ extern int read_history ();
 
 #define FMT "h:p:a:A:S:x:s:X:i"
 #define ARRAY_SIZE(a)  (sizeof(a) / sizeof(a[0]))
-
-#define LDMSD_SOCKPATH_ENV "LDMSD_SOCKPATH"
 
 static char *linebuf;
 static size_t linebuf_len;
@@ -206,14 +205,6 @@ static void ldmsctl_recv_buf_new(void *data, size_t data_len)
 #define LDMSCTL_QUIT LDMSD_NOTSUPPORT_REQ + 2
 #define LDMSCTL_SCRIPT LDMSD_NOTSUPPORT_REQ + 3
 #define LDMSCTL_SOURCE LDMSD_NOTSUPPORT_REQ + 4
-
-static void ldmsctl_log(enum ldmsd_loglevel level, const char *fmt, ...)
-{
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(stdout, fmt, ap);
-	va_end(ap);
-}
 
 static void usage(char *argv[])
 {
@@ -418,11 +409,31 @@ static void help_oneshot()
 		"                 the second= from now.\n");
 }
 
-static void help_loglevel()
+static void help_log_level()
 {
 	printf( "\nChange the verbosity level of ldmsd\n\n"
 		"Parameters:\n"
-		"	level=	levels [DEBUG, INFO, ERROR, CRITICAL, QUIET]\n");
+		"	level=	  The valid choices are 'default', 'quiet',\n"
+		"                 or a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL.\n"
+		"                 It is case insensitive.\n"
+		"                 \n"
+		"                 Note that '<level>,' and '<level>' give different results.\n"
+		"                 '<level>' -- a single level name -- set the log level\n"
+		"                 to the given level and all the more severity levels.\n"
+		"                 In contrast, '<level>,' -- a level name followed by a comma --\n"
+		"                 set the log level to only the given level.\n"
+		"       [name=]   A logger name\n"
+		"       [regex=]  A regular expression matching logger names,\n"
+		"                 e.g., xprt.* to change the transport-related log levels.\n");
+}
+
+static void help_dump_cfg()
+{
+	printf( "\nDump the ldmsd's currently running configuration to path\n\n"
+		"Parameters:\n"
+		"    path=        Path to directory where ldmsd should write the running configuration.\n"
+		"                 LDMSD will write to file matching LDMSD's <hostname>-<port> used in\n"
+		"                 configuration request.\n");
 }
 
 static void help_metric_sets_default_authz()
@@ -447,10 +458,26 @@ static void help_prdcr_add()
 		"     name=     A unique name for this Producer\n"
 		"     xprt=     The transport name [sock, rdma, ugni]\n"
 		"     host=     The hostname of the host\n"
-		"     port=     The port number on which the LDMS is listening\n"
-		"     type=     The connection type [active, passive]\n"
-		"     interval= The connection retry interval (us)\n"
-		"     [perm=]   The permission to modify the producer in the future.\n");
+		"     [port=]   The port number on which the LDMS is listening.\n"
+		"               It is not required if type is PASSIVE.\n"
+		"     type=     The connection type [active, passive, bridge]\n"
+		"               Active -- A connection is initiated with the peer and\n"
+		"                         its metric sets will be queried.\n"
+		"               Passive - A connect request is expected from the specified producer.\n"
+		"                         After the connection is established, the peer's metric sets\n"
+		"                         will be queried\n"
+		"               Bridge -- A connection is initiated to the remote peer,\n"
+		"                         but its metric sets are not queried.\n"
+		"                         This is the active side of the passive-mode producer.\n"
+		"     reconnect= The connection retry interval (us)\n"
+		"     interval= The connection retry interval (us). Deprecated, please use 'reconnect'.\n"
+		"     [perm=]   The permission to modify the producer in the future.\n"
+		"     [rail=]   The number of rail endpooints for the prdcr (default: 1).\n"
+		"     [quota=]  The recv quota our ldmsd (the one we are controlling)\n"
+		"                advertises to the prdcr (default: value from ldmsd --quota\n"
+		"                option). This limits how much outstanding data our ldmsd\n"
+		"                holds for the prdcr.\n"
+		);
 }
 
 static void help_prdcr_del()
@@ -466,9 +493,11 @@ static void help_prdcr_start()
 	printf( "\nStart the specified producer.\n\n"
 		"Parameters:\n"
 		"     name=       The name of the producer\n"
-		"     [interval=] The connection retry interval in micro-seconds.\n"
-		"                 If this is not specified, the previously\n"
-		"                 configured value will be used.\n");
+		"     [reconnect=] The connection retry interval in micro-seconds.\n"
+		"                  If this is not specified, the previously\n"
+		"                  configured value will be used.\n"
+		"     [interval=]  The same as 'reconnect'. It is being deprecated. "
+		"                  Please use 'reconnect' in the future.\n");
 }
 
 static void help_prdcr_stop()
@@ -482,10 +511,12 @@ static void help_prdcr_start_regex()
 {
 	printf( "\nStart all producers matching a regular expression.\n\n"
 		"Parameters:\n\n"
-		"     regex=        A regular expression\n"
-		"     [interval=]   The connection retry interval in micro-seconds.\n"
-		"                   If this is not specified, the previously configured\n"
-		"                   value will be used.\n");
+		"     regex=         A regular expression\n"
+		"     [reconnect=]   The connection retry interval in micro-seconds.\n"
+		"                    If this is not specified, the previously configured\n"
+		"                    value will be used.\n"
+		"     [interval=]    The same as 'reconnect'. It is being deprecated. "
+		"                    Please use 'reconnect' in the future.\n");
 }
 
 static void help_prdcr_stop_regex()
@@ -1262,7 +1293,8 @@ static void help_strgp_add()
 		"     name=        The unique storage policy name.\n"
 		"     plugin=      The name of the storage backend.\n"
 		"     container=   The storage backend container name.\n"
-		"     schema=      The schema name of the metric set to store.\n"
+		"     [schema=]    The schema name of the metric set to store. If 'schema' is given, 'regex' is ignored.\n"
+		"     [regex=]     The regular expression to match set schema. It must be used to decomposition.\n"
 		"     [flush=]     The interval between calls to the storage plugin flush method.\n"
 		"                  By default, the flush method is not called.\n"
 		"     [perm=]      The permission to modify the storage policy in the future.\n"
@@ -1331,25 +1363,29 @@ void __print_strgp_status(json_entity_t strgp)
 	if (strgp->type != JSON_DICT_VALUE)
 		goto invalid_result_format;
 
-	json_entity_t name, container, schema, plugin, state, flush;
+	json_entity_t name, container, schema, regex, plugin, state, flush, decomp;
 
 	name = json_value_find(strgp, "name");
 	container = json_value_find(strgp, "container");
 	schema = json_value_find(strgp, "schema");
+	regex = json_value_find(strgp, "regex");
 	plugin = json_value_find(strgp, "plugin");
 	state = json_value_find(strgp, "state");
 	flush = json_value_find(strgp, "flush");
+	decomp = json_value_find(strgp, "decomp");
 
-	if (!name || !container || !schema || !plugin || !state || !flush)
+	if (!name || !container || !plugin || !state || !flush || !regex || !decomp)
 		goto invalid_result_format;
 
-	printf("%-16s %-16s %-16s %-16s %-16s %s\n",
+	printf("%-16s %-16s %-16s %-16s %-16s %-12s %-10s %s\n",
 			json_value_str(name)->str,
 			json_value_str(container)->str,
 			json_value_str(schema)->str,
+			json_value_str(regex)->str,
 			json_value_str(plugin)->str,
 			json_value_str(flush)->str,
-			json_value_str(state)->str);
+			json_value_str(state)->str,
+			json_value_str(decomp)->str);
 
 	json_entity_t prdcrs, metrics;
 	prdcrs = json_value_find(strgp, "producers");
@@ -1416,8 +1452,8 @@ static void resp_strgp_status(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err
 		printf("Unrecognized producer status format\n");
 		goto out;
 	}
-	printf("Name             Container        Schema           Plugin           Flush(sec)       State\n");
-	printf("---------------- ---------------- ---------------- ---------------- ------------ ------------\n");
+	printf("Name             Container        Schema           Regex            Plugin           Flush(sec)   State      Decomposition\n");
+	printf("---------------- ---------------- ---------------- ---------------- ---------------- ------------ ---------- --------------------- \n");
 
 	for (strgp = json_item_first(json); strgp; strgp = json_item_next(strgp)) {
 		__print_strgp_status(strgp);
@@ -1504,142 +1540,6 @@ static void help_plugn_sets()
 static void help_version()
 {
 	printf( "\nGet the LDMS version.\n");
-}
-
-static void help_set_route()
-{
-	printf("\nDisplay the route of the set from aggregators to the sampler daemon.\n"
-	       "Parameters:\n"
-	       "     instance=   Set instance name\n");
-}
-
-static void resp_set_route(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
-{
-	if (rsp_err) {
-		resp_generic(resp, len, rsp_err);
-		return;
-	}
-
-	ldmsd_req_attr_t attr = ldmsd_first_attr(resp);
-	if (!attr->discrim || (attr->attr_id != LDMSD_ATTR_JSON))
-		return;
-
-	json_parser_t parser;
-	json_entity_t json, route, hop, hinfo;;
-	json_entity_t inst_name, schema_name;
-	int rc;
-
-	parser = json_parser_new(0);
-	if (!parser) {
-		printf("Error creating a JSON parser.\n");
-		return;
-	}
-	json = NULL;
-	rc = json_parse_buffer(parser, (char*)attr->attr_value, len, &json);
-	if (rc) {
-		printf("syntax error parsing JSON string\n");
-		json_parser_free(parser);
-		return;
-	}
-	json_parser_free(parser);
-
-	if (json->type != JSON_DICT_VALUE) {
-		printf("---Invalid result format---\n");
-		goto out;
-	}
-
-	inst_name = json_value_find(json, "instance");
-	schema_name = json_value_find(json, "schema");
-
-	if (!inst_name || !schema_name)
-		goto invalid_result_format;
-
-	printf("-----------------------------\n");
-	printf("instance: %s\n", json_value_str(inst_name)->str);
-	printf("schema_name: %s\n", json_value_str(schema_name)->str);
-	printf("=============================\n");
-	printf("%20s %15s %15s %15s %10s %10s %5s %25s %25s\n",
-			"host", "type", "name", "prdcr_host",
-			"interval", "offset", "sync", "start", "end");
-	printf("-------------------- --------------- --------------- --------------- "
-		"---------- ---------- ----- ------------------------- -------------------------\n");
-	route = json_value_find(json, "route");
-	if (!route || (route->type != JSON_LIST_VALUE))
-		goto invalid_result_format;
-
-	json_entity_t host, type, name, prdcr_host, intrvl, offset, is_sync;
-	json_entity_t start_sec, start_usec, end_sec, end_usec;
-	char *prdcr_host_s, *type_s, *start, *end;
-	uint32_t sec, usec;
-
-	for (hop = json_item_first(route); hop; hop = json_item_next(hop)) {
-		hinfo = json_value_find(hop, "detail");
-		if (!hinfo || (hinfo->type != JSON_DICT_VALUE))
-			goto invalid_result_format;
-		type = json_value_find(hop, "type");
-		host = json_value_find(hop, "host");
-		name = json_value_find(hinfo, "name");
-
-		if (!type || !host || !name)
-			goto invalid_result_format;
-		type_s = json_value_str(type)->str;
-
-		if (0 == strcmp(type_s, "producer")) {
-			prdcr_host = json_value_find(hinfo, "host");
-			if (!prdcr_host)
-				goto invalid_result_format;
-			else
-				prdcr_host_s = json_value_str(prdcr_host)->str;
-			intrvl = json_value_find(hinfo, "update_int");
-			offset = json_value_find(hinfo, "update_off");
-			is_sync = json_value_find(hinfo, "update_sync");
-			start_sec = json_value_find(hinfo, "last_start_sec");
-			start_usec = json_value_find(hinfo, "last_start_usec");
-			end_sec = json_value_find(hinfo, "last_end_sec");
-			end_usec = json_value_find(hinfo, "last_end_usec");
-		} else {
-			prdcr_host_s = "---";
-			intrvl = json_value_find(hinfo, "interval_us");
-			offset = json_value_find(hinfo, "offset_us");
-			is_sync = json_value_find(hinfo, "sync");
-			start_sec = json_value_find(hinfo, "trans_start_sec");
-			start_usec = json_value_find(hinfo, "trans_start_usec");
-			end_sec = json_value_find(hinfo, "trans_end_sec");
-			end_usec = json_value_find(hinfo, "trans_end_usec");
-		}
-		if (!intrvl || !offset || ! is_sync ||
-			!start_sec || !start_usec || !end_sec || !end_usec) {
-			goto invalid_result_format;
-		}
-
-		sec = strtoul(json_value_str(start_sec)->str, NULL, 0);
-		usec = strtoul(json_value_str(start_usec)->str, NULL, 0);
-		start = ldmsctl_ts_str(sec, usec);
-		sec = strtoul(json_value_str(end_sec)->str, NULL, 0);
-		usec = strtoul(json_value_str(end_usec)->str, NULL, 0);
-		end = ldmsctl_ts_str(sec, usec);
-		printf("%20s %15s %15s %15s %10s %10s %5s %25s %25s\n",
-					json_value_str(host)->str,
-					json_value_str(type)->str,
-					json_value_str(name)->str,
-					prdcr_host_s,
-					json_value_str(intrvl)->str,
-					json_value_str(offset)->str,
-					json_value_str(is_sync)->str,
-					start,
-					end);
-		free(start);
-		free(end);
-	}
-	return;
-
-
-invalid_result_format:
-	printf("---Invalid result format---\n");
-out:
-	if (json)
-		json_entity_free(json);
-	return;
 }
 
 /* failover related functions */
@@ -1876,7 +1776,10 @@ static void resp_stream_client_dump(ldmsd_req_hdr_t resp, size_t len,
 
 static void help_stream_status()
 {
-	printf("Dump the stream information\n");
+	printf( "\nDump the stream information\n\n"
+		"Parameters:\n"
+		"   [reset=]     If true, reset the statistics of all streams after returning the values.\n"
+		"                The default is false.\n");
 }
 
 static double __info_rate(json_entity_t info)
@@ -1960,8 +1863,8 @@ static void resp_stream_status(ldmsd_req_hdr_t resp, size_t len,
 	for (stream = json_attr_first(json); stream; stream = json_attr_next(stream)) {
 		name = json_attr_name(stream)->str;
 		if (0 == strcmp(name, "_OVERALL_")) {
-			mode = "";
-			printf("%s\n", name);
+			/* Skip the _OVERALL_ because it is confusing */
+			continue;
 		} else {
 			mode = (char *)__json_str_find(json_attr_value(stream), "mode");
 			printf("%s (%s)\n", name, mode);
@@ -2090,7 +1993,10 @@ static void resp_xprt_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
 
 static void help_thread_stats()
 {
-	printf("\nQuery the daemon's thread utilization statistics\n\n");
+	printf( "\nQuery the daemon's thread utilization statistics\n\n"
+		"Parameter:\n"
+		"[reset=]   If true, reset the statistics after returning the values.\n"
+		"           The default is false.\n");
 }
 
 static void resp_thread_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
@@ -2214,6 +2120,7 @@ static void resp_set_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
 	int rc;
 	json_parser_t parser;
 	json_entity_t stats, a;
+	int num_attr;
 
 	ldmsd_req_attr_t attr = ldmsd_first_attr(resp);
 	if (!attr->discrim || (attr->attr_id != LDMSD_ATTR_JSON))
@@ -2242,16 +2149,27 @@ static void resp_set_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
 	else
 		printf("Set Stats - N/A\n");
 
-	printf("%-20s %-16s\n", "Name", "Count");
-	printf("-------------------- ----------------\n");
-
 	char *names[5] = { "active_count", "deleting_count",
 			   "mem_total_kb", "mem_used_kb",
 			   "mem_free_kb"
 	};
+
+	a = json_value_find(stats, "summary");
+	if (a) {
+		/*
+		 * Only report the active and deleting counts
+		 */
+		num_attr = 2;
+	} else {
+		num_attr = 5;
+	}
+	printf("%-20s %-16s\n", "Name", "Count");
+	printf("-------------------- ----------------\n");
+
+
 	int i;
 
-	for (i = 0; i < 5; i ++) {
+	for (i = 0; i < num_attr; i ++) {
 		a = json_attr_find(stats, names[i]);
 		if (a)
 			printf("%-20s %-16ld\n", names[i],
@@ -2370,6 +2288,87 @@ static void help_set_sec_mod()
 		"     [perm=]     Octal number representing the permission bits\n");
 }
 
+static void help_log_status()
+{
+	printf( "\nReturn the name, log level, and description of loggers\n\n"
+		"Parameters:\n"
+		"     [name=]    A logger name\n");
+}
+
+static int __print_log_status(json_entity_t logger)
+{
+	json_entity_t name, level, desc;
+
+	if (logger->type != JSON_DICT_VALUE) {
+		printf("--- Unrecognized log status format----\n");
+		return EINVAL;
+	}
+
+	name = json_value_find(logger, "name");
+	level = json_value_find(logger, "level");
+	desc = json_value_find(logger, "desc");
+
+	if (!name || !level || !desc) {
+		printf("--- At least one of the 'name', 'level', 'desc' is missing from the response.----\n");
+		return EINVAL;
+	}
+
+	printf("%-20s %-30s %s\n",
+			json_value_str(name)->str,
+			json_value_str(level)->str,
+			json_value_str(desc)->str);
+	return 0;
+}
+
+static void resp_log_status(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
+{
+	int rc;
+	json_parser_t parser;
+	json_entity_t loggers, l;
+
+	if (rsp_err) {
+		resp_generic(resp, len, rsp_err);
+		return;
+	}
+
+	ldmsd_req_attr_t attr = ldmsd_first_attr(resp);
+	if (!attr->discrim || (attr->attr_id != LDMSD_ATTR_JSON)) {
+		printf("Receiving an unrecognized response format.\n");
+		return;
+	}
+
+	parser = json_parser_new(0);
+	if (!parser) {
+		printf("Error creating a JSON parser.\n");
+		return;
+	}
+
+	rc = json_parse_buffer(parser, (char *)attr->attr_value, len, &loggers);
+	if (rc) {
+		printf("Syntax error parsing JSON string.\n");
+		json_parser_free(parser);
+		return;
+	}
+	json_parser_free(parser);
+
+	if (loggers->type != JSON_LIST_VALUE) {
+		printf("Unrecognized JSON log status format\n");
+		goto out;
+	}
+
+	printf("Name                 Levels                         Description\n");
+	printf("-------------------- ------------------------------ ------------------------------\n");
+	for (l = json_item_first(loggers); l; l = json_item_next(l)) {
+		__print_log_status(l);
+	}
+	printf("----------------------------------------------------------------------------------\n");
+	printf("The loggers with the Log Level as 'default' use the same "
+	       "log level as the default logger (ldmsd). When the default log "
+	       "level changes, their log levels change accordingly.\n");
+out:
+	json_entity_free(loggers);
+}
+
 static int handle_help(struct ldmsctl_ctrl *ctrl, char *args);
 static int handle_source(struct ldmsctl_ctrl *ctrl, char *path);
 static int handle_script(struct ldmsctl_ctrl *ctrl, char *cmd);
@@ -2380,6 +2379,7 @@ static struct command command_tbl[] = {
 	{ "config", LDMSD_PLUGN_CONFIG_REQ, NULL, help_config, resp_generic },
 	{ "daemon_exit", LDMSD_EXIT_DAEMON_REQ, NULL, help_daemon_exit, resp_daemon_exit },
 	{ "daemon_status", LDMSD_DAEMON_STATUS_REQ, NULL, help_daemon_status, resp_daemon_status },
+	{ "dump_cfg", LDMSD_DUMP_CFG_REQ, NULL, help_dump_cfg, resp_generic },
 	{ "failover_config", LDMSD_FAILOVER_CONFIG_REQ, NULL,
 			     help_failover_config, resp_generic },
 	{ "failover_peercfg_start", LDMSD_FAILOVER_PEERCFG_START_REQ, NULL,
@@ -2394,9 +2394,12 @@ static struct command command_tbl[] = {
 			     help_failover_stop, resp_generic },
 	{ "greeting", LDMSD_GREETING_REQ, NULL, help_greeting, resp_greeting },
 	{ "help", LDMSCTL_HELP, handle_help, NULL, NULL },
+	{ "help", LDMSCTL_HELP, handle_help, NULL, NULL },
 	{ "listen", LDMSD_LISTEN_REQ, NULL, help_listen, resp_generic },
 	{ "load", LDMSD_PLUGN_LOAD_REQ, NULL, help_load, resp_generic },
-	{ "loglevel", LDMSD_VERBOSE_REQ, NULL, help_loglevel, resp_generic },
+	{ "log_level", LDMSD_VERBOSE_REQ, NULL, help_log_level, resp_generic },
+	{ "log_status", LDMSD_LOG_STATUS_REQ, NULL, help_log_status, resp_log_status },
+	{ "loglevel", LDMSD_VERBOSE_REQ, NULL, help_log_level, resp_generic }, /* It is being deprecated. */
 	{ "metric_sets_default_authz", LDMSD_SET_DEFAULT_AUTHZ_REQ, NULL,
 			help_metric_sets_default_authz, resp_generic },
 	{ "oneshot", LDMSD_ONESHOT_REQ, NULL, help_oneshot, resp_generic },
@@ -2416,7 +2419,6 @@ static struct command command_tbl[] = {
 	{ "prdcr_unsubscribe", LDMSD_PRDCR_UNSUBSCRIBE_REQ, NULL, help_prdcr_unsubscribe_regex, resp_generic },
 	{ "quit", LDMSCTL_QUIT, handle_quit, help_quit, resp_generic },
 	{ "script", LDMSCTL_SCRIPT, handle_script, help_script, resp_generic },
-	{ "set_route", LDMSD_SET_ROUTE_REQ, NULL, help_set_route, resp_set_route },
 	{ "set_sec_mod", LDMSD_SET_SEC_MOD_REQ, NULL, help_set_sec_mod, resp_generic },
 	{ "set_stats", LDMSD_SET_STATS_REQ, NULL, help_set_stats, resp_set_stats },
 	{ "setgroup_add", LDMSD_SETGROUP_ADD_REQ, NULL, help_setgroup_add, resp_generic },
@@ -2454,7 +2456,7 @@ static struct command command_tbl[] = {
 	{ "updtr_status", LDMSD_UPDTR_STATUS_REQ, NULL, help_updtr_status, resp_updtr_status },
 	{ "updtr_stop", LDMSD_UPDTR_STOP_REQ, NULL, help_updtr_stop, resp_generic },
 	{ "updtr_task", LDMSD_UPDTR_TASK_REQ, NULL, help_updtr_task, resp_updtr_task },
-	{ "usage", LDMSD_PLUGN_LIST_REQ, NULL, help_usage, resp_usage },
+	{ "usage", LDMSD_PLUGN_USAGE_REQ, NULL, help_usage, resp_usage },
 	{ "version", LDMSD_VERSION_REQ, NULL, help_version , resp_generic },
 	{ "xprt_stats", LDMSD_XPRT_STATS_REQ, NULL, help_xprt_stats, resp_xprt_stats },
 };
@@ -2564,6 +2566,17 @@ static int __handle_cmd(struct ldmsctl_ctrl *ctrl, char *cmd_str)
 		return 0;
 	}
 
+	if (0 == strcasecmp("loglevel", key.token)) {
+		printf("`loglevel` is being depreated. Please use `log_level` in the future.\n");
+	}
+
+	if ((0 == strcmp(key.token, "prdcr_add")) ||
+			(0 == strncmp(key.token, "prdcr_start", 11))) {
+		if (strstr(cmd_str, "interval")) {
+			printf("'interval' is begin deprecated. Please use 'reconnect' in the future.\n");
+		}
+	}
+
 	if (cmd->action) {
 		(void)cmd->action(ctrl, args);
 		free(dummy);
@@ -2572,8 +2585,7 @@ static int __handle_cmd(struct ldmsctl_ctrl *ctrl, char *cmd_str)
 	free(dummy);
 
 	req_array = ldmsd_parse_config_str(cmd_str, msg_no,
-					   ldms_xprt_msg_max(ctrl->ldms_xprt.x),
-					   ldmsctl_log);
+					   ldms_xprt_msg_max(ctrl->ldms_xprt.x));
 	if (!req_array) {
 		printf("Failed to process the request. ");
 		if (errno == ENOMEM)
@@ -2774,7 +2786,7 @@ int main(int argc, char *argv[])
 	host = port = sockname = xprt = NULL;
 	char *source, *script;
 	source = script = NULL;
-	int rc, is_inband = 1;
+	int is_inband = 1;
 	struct attr_value_list *auth_opt = NULL;
 	const int AUTH_OPT_MAX = 128;
 	ssize_t cnt;
@@ -2916,9 +2928,7 @@ int main(int argc, char *argv[])
 		add_history(linebuf);
 #endif /* HAVE_READLINE_HISTORY */
 
-		rc = __handle_cmd(ctrl, linebuf);
-		if (rc)
-			break;
+		(void) __handle_cmd(ctrl, linebuf);
 	} while (linebuf);
 
 	ctrl->close(ctrl);

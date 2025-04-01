@@ -1,5 +1,5 @@
-# Copyright (c) 2020 Open Grid Computing, Inc. All rights reserved.
-# Copyright (c) 2020 NTESS Corporation. All rights reserved.
+# Copyright (c) 2020-2023 Open Grid Computing, Inc. All rights reserved.
+# Copyright (c) 2020-2023 NTESS Corporation. All rights reserved.
 # Under the terms of Contract DE-AC04-94AL85000, there is a non-exclusive
 # license for use of this work by or on behalf of the U.S. Government.
 # Export of this program may require a license from the United States
@@ -51,6 +51,8 @@ from cpython cimport PyObject, Py_INCREF, Py_DECREF, PyGILState_Ensure, \
 
 from libc.stdint cimport *
 from libc.stdlib cimport calloc, malloc, free, realloc
+from posix.unistd cimport geteuid, getegid
+from collections import namedtuple
 import datetime as dt
 import struct
 import io
@@ -58,9 +60,14 @@ import os
 import sys
 import copy
 import json
-from queue import Queue
+import socket
+import threading
+from queue import Queue, Empty
 cimport cython
 cimport ldms
+
+from pwd import getpwnam
+from grp import getgrnam
 
 __doc__ = """Lighweight Distibuted Metric Service (LDMS) for Python
 
@@ -260,8 +267,33 @@ cdef extern from *:
         /* no-op */
         #endif
     }
+
+    #define ldms_stream_src_stats_s_from_rbn(r) \
+                container_of((r), struct ldms_stream_src_stats_s, rbn)
+
+    #define __STREAM_CLIENT_PAIR_STATS_TQ_FIRST(tq) TAILQ_FIRST(tq)
+    #define __STREAM_CLIENT_PAIR_STATS_NEXT(ps) TAILQ_NEXT(ps, entry)
+
+    #define __STREAM_STATS_TQ_FIRST(tq) TAILQ_FIRST(tq)
+    #define __STREAM_STATS_NEXT(s) TAILQ_NEXT(s, entry)
+
+    #define __STREAM_CLIENT_STATS_TQ_FIRST(tq) TAILQ_FIRST(tq)
+    #define __STREAM_CLIENT_STATS_NEXT(cs) TAILQ_NEXT(cs, entry)
+
     """
     cdef void __init_threads()
+    cdef ldms_stream_src_stats_s *ldms_stream_src_stats_s_from_rbn(rbn *rbn)
+    cdef ldms_stream_client_pair_stats_s * \
+    __STREAM_CLIENT_PAIR_STATS_TQ_FIRST(ldms_stream_client_pair_stats_tq_s *tq)
+    cdef ldms_stream_client_pair_stats_s * \
+    __STREAM_CLIENT_PAIR_STATS_NEXT(ldms_stream_client_pair_stats_s *ps)
+
+    cdef ldms_stream_stats_s *__STREAM_STATS_TQ_FIRST(ldms_stream_stats_tq_s *tq)
+    cdef ldms_stream_stats_s * __STREAM_STATS_NEXT(ldms_stream_stats_s *s)
+
+    cdef ldms_stream_client_stats_s *__STREAM_CLIENT_STATS_TQ_FIRST(ldms_stream_client_stats_tq_s *tq)
+    cdef ldms_stream_client_stats_s * __STREAM_CLIENT_STATS_NEXT(ldms_stream_client_stats_s *s)
+
 __init_threads()
 
 
@@ -390,6 +422,9 @@ cdef Ptr PTR(void *ptr):
     po.c_ptr = ptr
     return po
 
+def type_is_array(ldms_value_type t):
+    return bool(ldms_type_is_array(t))
+
 def JSON_OBJ(o):
     t = type(o)
     if t in (int, float, str):
@@ -398,6 +433,140 @@ def JSON_OBJ(o):
         return o.decode()
     # otherwise, the object is expected to have `.json_obj()` function
     return o.json_obj()
+
+def __avro_stream_data(sr_cli, sch_def, obj):
+    import avro.schema
+    import avro.io
+    import confluent_kafka.schema_registry as sr
+
+    # Resolving Schema (Avro and SchemaRegistry)
+    sr_sch = None
+    if type(sch_def) == avro.schema.Schema:
+        av_sch = sch_def
+    elif type(sch_def) == sr.Schema:
+        av_sch = avro.schema.parse(sch_def.schema_str)
+        sr_sch = sch_def
+    elif type(sch_def) == dict:
+        av_sch = avro.schema.make_avsc_object(sch_def)
+    elif type(sch_def) == str:
+        av_sch = avro.schema.parse(sch_def)
+    else:
+        raise ValueError("Unsupported `sch_def` type")
+    if sr_sch is None:
+        sr_sch = sr.Schema(json.dumps(av_sch.to_json()), 'AVRO')
+    sch_id = sr_cli.register_schema(av_sch.name, sr_sch)
+
+    # framing
+    framing = struct.pack(">bI", 0, sch_id)
+    buff = io.BytesIO()
+    buff.write(framing)
+    # avro payload
+    dw = avro.io.DatumWriter(av_sch)
+    dw.write(obj, avro.io.BinaryEncoder(buff))
+    data = buff.getvalue()
+    return data
+
+def __stream_publish(Ptr x_ptr, name, stream_data, stream_type=None,
+                     perm=0o444, uid=None, gid=None,
+                     sr_client=None, schema_def=None):
+    cdef int rc
+    cdef ldms_cred cred
+    cdef ldms_t c_xprt
+
+    c_xprt = NULL if x_ptr is None else <ldms_t>x_ptr.c_ptr
+
+    _t = type(stream_data)
+    # stream type
+    if stream_type is None:
+        if _t is dict:
+            # JSON
+            stream_type = ldms.LDMS_STREAM_JSON
+        elif _t in (str, bytes):
+            stream_type = ldms.LDMS_STREAM_STRING
+        else:
+            raise TypeError(f"Cannot infer stream_type from the type of stream_data ({type(stream_data)})")
+    # Avro/Serdes
+    if stream_type == ldms.LDMS_STREAM_AVRO_SER:
+        if not sr_client:
+            raise ValueError(f"LDMS_STREAM_AVRO_SER requires `sr_client`")
+        if not schema_def:
+            raise ValueError(f"LDMS_STREAM_AVRO_SER requires `schema_def`")
+        stream_data = __avro_stream_data(sr_client, schema_def, stream_data)
+    # Json
+    if stream_type == ldms.LDMS_STREAM_JSON and _t is dict:
+        stream_data = json.dumps(stream_data)
+
+    # uid
+    if type(uid) is str:
+        o = getpwnam(uid)
+        cred.uid = o.pw_uid
+    elif type(uid) is int:
+        cred.uid = uid
+    elif uid is None:
+        cred.uid = geteuid()
+    else:
+        raise TypeError(f"Type '{type(uid)}' is not supported for `uid`")
+
+    # gid
+    if type(gid) is str:
+        o = getgrnam(gid)
+        cred.gid = o.gr_gid
+    elif type(gid) is int:
+        cred.gid = gid
+    elif gid is None:
+        cred.gid = getegid()
+    else:
+        raise TypeError(f"Type '{type(gid)}' is not supported for `gid`")
+
+    rc = ldms_stream_publish(c_xprt, BYTES(name), stream_type, &cred, perm,
+                             BYTES(stream_data), len(stream_data))
+    if rc:
+        raise RuntimeError(f"ldms_stream_publish() failed, rc: {rc}")
+
+
+def stream_publish(name, stream_data, stream_type=None, perm=0o444,
+                   uid=None, gid=None, sr_client=None, schema_def=None):
+    """stream_publish(name, stream_data, stream_type=None, perm=0o444, uid=None,
+                   gid=None, sr_client=None, schema_def=None)
+
+    Publish a stream locally. If the remote peer subscribe to the stream, it
+    will also receive the data.
+
+    For LDMS_STREAM_AVRO_SER type, SchemaRegistryClient `sr_client` and schema
+    definition `schema_def` is required. The `stream_data` object will be
+    serialized by Avro using `schema_def` (see parameter description below). The
+    `schema_def` is also registered to the Schema Registry with `sr_client`.
+
+    Arguments:
+    - name (str): The name of the stream being published.
+    - stream_data (bytes, str, dict):
+            The data being published. If it is `dict` and stream_type is
+            LDMS_STREAM_JSON or None, the stream_data is converted into JSON
+            string representation with `json.dumps(stream_data)`.
+    - stream_type (enum):
+            LDMS_STREAM_JSON or LDMS_STREAM_STRING or LDMS_STREAM_AVRO_SER or
+            None.  If the type is `None`, it is inferred from the
+            `type(stream_data)`: LDMS_STREAM_STRING for `str` and `bytes` types,
+            and LDMS_STREAM_JSON for `dict` type. If `type(stream_data)` is
+            something else, TypeError is raised.
+    - perm (int): The file-system-style permission bits (e.g. 0o444).
+    - uid (int or str): Publish as the given uid; None for euid.
+    - gid (int or str): Publish as the given gid; None for egid.
+    - sr_client (SchemaRegistryClient):
+            required if `stream_type` is `LDMS_STREAM_AVRO_SER`. In this case,
+            the stream data is encoded in Avro format, and the schema is
+            registered to SchemaRegistry.
+    - schema_def (object): The Schema definition, required for
+            LDMS_STREAM_AVRO_SER stream_type. This can be of type:
+            `dict`, `str` (JSON formatted), `avro.Schema`, or
+            `confluent_kafka.schema_registry.Schema`. The `dict` and `str`
+            (JSON) must follow Apache Avro Schema specification:
+            https://avro.apache.org/docs/1.11.1/specification/
+    """
+
+    return __stream_publish(None, name, stream_data, stream_type, perm, uid,
+                            gid, sr_client = sr_client, schema_def = schema_def)
+
 
 # ============================ #
 # == metric getter wrappers == #
@@ -481,10 +650,21 @@ cdef py_ldms_metric_get_list(Set s, int m_idx):
 
 cdef py_ldms_metric_get_record_type(Set s, int m_idx):
     cdef ldms_mval_t lt = ldms_metric_get(s.rbd, m_idx)
-    return RecordType(s, PTR(lt))
+    cdef const char *name = ldms_metric_name_get(s.rbd, m_idx)
+    return RecordType(s, PTR(lt), name = STR(name))
 
 cdef py_ldms_metric_get_record_array(Set s, int m_idx):
     return RecordArray(s, m_idx)
+
+cdef char * CSTR(object obj):
+    if obj is None:
+        return NULL
+    return obj
+
+cdef bytes CBYTES(const char *s):
+    if s == NULL:
+        return None
+    return bytes(s)
 
 METRIC_GETTER_TBL = {
         LDMS_V_CHAR : py_ldms_metric_get_char,
@@ -1139,8 +1319,10 @@ LDMS_VALUE_TYPE_TBL = {
         "double[]" : LDMS_V_D64_ARRAY,
         "d[]"      : LDMS_V_D64_ARRAY,
         "d64[]"    : LDMS_V_D64_ARRAY,
+        "record[]" : LDMS_V_RECORD_ARRAY,
 
         "list"     : LDMS_V_LIST,
+        "list<>"   : LDMS_V_LIST,
 
         "char_array"   : LDMS_V_CHAR_ARRAY,
         "s8_array"     : LDMS_V_S8_ARRAY,
@@ -1165,6 +1347,7 @@ LDMS_VALUE_TYPE_TBL = {
         "double_array" : LDMS_V_D64_ARRAY,
         "d_array"      : LDMS_V_D64_ARRAY,
         "d64_array"    : LDMS_V_D64_ARRAY,
+        "record_array" : LDMS_V_RECORD_ARRAY,
 
         LDMS_V_CHAR : LDMS_V_CHAR,
         LDMS_V_S8   : LDMS_V_S8,
@@ -1216,8 +1399,7 @@ LDMS_VALUE_TYPE_TBL = {
 
         LDMS_V_LIST       : LDMS_V_LIST,
 
-        LDMS_V_RECORD_ARRAY : LDMS_V_RECORD_ARRAY,
-        "record_array"      : LDMS_V_RECORD_ARRAY,
+        LDMS_V_RECORD_ARRAY : LDMS_V_RECORD_ARRAY
     }
 
 cdef ldms_value_type LDMS_VALUE_TYPE(t):
@@ -1226,6 +1408,8 @@ cdef ldms_value_type LDMS_VALUE_TYPE(t):
 cdef bytes BYTES(o):
     """Convert Python object `s` to `bytes` (c-string compatible)"""
     # a wrapper to solve the annoying bytes vs str in python3
+    if o is None:
+        return None
     if type(o) == bytes:
         return o
     return str(o).encode()
@@ -1238,6 +1422,34 @@ cdef str STR(o):
     if type(o) == bytes:
         return o.decode()
     return str(o)
+
+cdef class QuotaEventData(object):
+    cdef readonly uint64_t quota
+    cdef readonly int      ep_idx
+    """Data of a quota deposit event"""
+    def __cinit__(self, uint64_t quota, int ep_idx):
+        self.quota = quota
+        self.ep_idx = ep_idx
+
+    def __str__(self):
+        return f"({self.quota}, {self.ep_idx})"
+
+    def __repr__(self):
+        return str(self)
+
+cdef class SetDeleteEventData(object):
+    cdef readonly str name
+    cdef readonly Set set
+
+    def __cinit__(self, Set _lset, str _name):
+        self.set = _lset
+        self.name = _name
+
+    def __str__(self):
+        return f"({self.set}, {self.name})"
+
+    def __repr__(self):
+        return str(self)
 
 
 cdef class XprtEvent(object):
@@ -1253,6 +1465,7 @@ cdef class XprtEvent(object):
               - EVENT_DISCONNECTED
               - EVENT_RECV
               - EVENT_SEND_COMPLETE
+              - EVENT_SEND_QUOTA_DEPOSITED
     - `data`: a byte array containing event data
     """
 
@@ -1262,6 +1475,11 @@ cdef class XprtEvent(object):
     cdef readonly bytes data
     """A `bytes` containing event data"""
 
+    cdef readonly QuotaEventData quota
+    """Current send quota (for the EVENT_SEND_QUOTA_DEPOSITED"""
+
+    cdef readonly SetDeleteEventData set_delete
+
     # NOTE: This is a Python object wrapper of `struct ldms_xprt_event`.
     #
     #       The values of the attributes are also new Python objects. So, we
@@ -1269,8 +1487,16 @@ cdef class XprtEvent(object):
     #       destroyed in the C level after the callback.
     def __cinit__(self, Ptr ptr):
         cdef ldms_xprt_event_t e = <ldms_xprt_event_t>ptr.c_ptr
+        cdef ldms_set_t cset
         self.type = ldms_xprt_event_type(e.type)
-        self.data = e.data[:e.data_len]
+        if self.type == ldms.LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED:
+            self.quota = QuotaEventData(e.quota.quota, e.quota.ep_idx)
+        elif self.type == ldms.LDMS_XPRT_EVENT_SET_DELETE:
+            cset = <ldms_set_t>e.set_delete.set
+            lset = Set(None, None, set_ptr=PTR(cset)) if cset else None
+            self.set_delete = SetDeleteEventData(lset, STR(e.set_delete.name))
+        else:
+            self.data = e.data[:e.data_len]
 
 
 # This is the C callback function for active xprt (the one initiating connect).
@@ -1279,6 +1505,14 @@ cdef class XprtEvent(object):
 cdef void xprt_cb(ldms_t _x, ldms_xprt_event *e, void *arg) with gil:
     cdef Xprt x = <Xprt>arg
     cdef bytes b
+    if x.xprt:
+        if e.type == EVENT_DISCONNECTED or \
+           e.type == EVENT_REJECTED or \
+           e.type == EVENT_ERROR:
+            if x.xprt:
+                _xprt = x.xprt
+                x.xprt = NULL
+                ldms_xprt_put(_xprt)
     if x._conn_cb:
         # Call the callback
         x._conn_cb(x, XprtEvent(PTR(e)), x._conn_cb_arg)
@@ -1306,6 +1540,12 @@ cdef void xprt_cb(ldms_t _x, ldms_xprt_event *e, void *arg) with gil:
     elif e.type == EVENT_SEND_COMPLETE:
         # do NOT sem_post()
         return
+    elif e.type == EVENT_SEND_QUOTA_DEPOSITED:
+        # do NOT sem_post()
+        return
+    elif e.type == EVENT_SET_DELETE:
+        # do NOT sem_post()
+        return
     else:
         raise OSError(EINVAL, "Unknown LDMS event type {}".format(e.type))
     sem_post(&x._conn_sem)
@@ -1325,9 +1565,12 @@ cdef void passive_xprt_cb(ldms_t _x, ldms_xprt_event *e, void *arg) with gil:
         x._conn_cb_arg = lx._conn_cb_arg
         lx._psv_xprts[<uint64_t>_x] = x
     if e.type == EVENT_DISCONNECTED or \
-       e.type == EVENT_REJECTED or \
        e.type == EVENT_ERROR:
         lx._psv_xprts.pop(<uint64_t>_x, None)
+        if x.xprt:
+            _xprt = x.xprt
+            x.xprt = NULL
+            ldms_xprt_put(_xprt)
     if x._conn_cb:
         # Call the callback
         x._conn_cb(x, XprtEvent(PTR(e)), x._conn_cb_arg)
@@ -1508,6 +1751,34 @@ cdef void update_cb(ldms_t _t, ldms_set_t _s, int flags, void *arg) with gil:
     if 0 == (flags & LDMS_UPD_F_MORE):
         sem_post(&s._sem)
 
+cdef void push_cb(ldms_t _t, ldms_set_t _s, int flags, void *arg) with gil:
+    cdef int rc = LDMS_UPD_ERROR(flags)
+    s = <Set>arg
+    s._update_rc = rc
+    if s._push_cb:
+        s._push_cb(s, flags, s._push_cb_arg)
+
+
+MetricTemplateBase = namedtuple('MetricTemplateBase',
+                                [ 'name', 'type', 'count', 'flags',
+                                  'units', 'rec_def' ])
+class MetricTemplate(MetricTemplateBase):
+    def __new__(_cls, name, metric_type, count = 1, flags = 0, units = None,
+                 rec_def = None):
+        return super().__new__(_cls, name, ldms_value_type(metric_type), count,
+                               flags, units, rec_def)
+
+    @property
+    def is_meta(self):
+        return bool( self.flags & LDMS_MDESC_F_META )
+
+    @classmethod
+    def from_ptr(cls, Ptr ptr):
+        cdef ldms_metric_template_t t = <ldms_metric_template_t>ptr.c_ptr
+        rec_def = RecordDef.from_ptr(PTR(t.rec_def)) if t.rec_def else None
+        return MetricTemplate(STR(t.name), t.type, t.len, t.flags,
+                              STR(CBYTES(t.unit)), rec_def)
+
 
 cdef class RecordDef(object):
     """Record Definition
@@ -1542,12 +1813,14 @@ cdef class RecordDef(object):
     """
     cdef str _name
     cdef list metric_list
+    cdef dict metric_dict
     cdef ldms_record_t _rec_def
 
     def __init__(self, name, metric_list = list()):
         self._name = name
         self._rec_def = ldms_record_create(BYTES(name))
         self.metric_list = list()
+        self.metric_dict = dict()
         self.add_metrics(metric_list)
 
     @property
@@ -1564,12 +1837,16 @@ cdef class RecordDef(object):
         t = LDMS_VALUE_TYPE(metric_type)
         if t < LDMS_V_CHAR or LDMS_V_D64_ARRAY < t:
             raise TypeError("{} is not supported in a record".format(metric_type))
-        idx = ldms_record_metric_add(self._rec_def, BYTES(name), BYTES(units),
+        idx = ldms_record_metric_add(self._rec_def, CSTR(BYTES(name)),
+                                     CSTR(BYTES(units)),
                                      t, count)
         if idx < 0:
             raise RuntimeError("ldms_record_metric_add() error: {}" \
                                .format(ERRNO_SYM(-idx)))
-        self.metric_list.append((name, t, count, units))
+        mt = MetricTemplate(name, ldms_value_type(t), count,
+                                LDMS_MDESC_F_DATA|LDMS_MDESC_F_RECORD, units)
+        self.metric_list.append(mt)
+        self.metric_dict[name] = mt
 
     def add_metrics(self, metrics):
         """Batch-add metrics to the record definition.
@@ -1587,9 +1864,12 @@ cdef class RecordDef(object):
             if type(o) in (list, tuple):
                 self.add_metric(*o)
             elif type(o) == dict:
+                metric_type = o.get("type", o.get("metric_type"))
+                if metric_type is None:
+                    raise KeyError(f"'type' or 'metric_type' not found")
                 self.add_metric(
                             name = o["name"],
-                            metric_type = o["type"],
+                            metric_type = metric_type,
                             count = o.get("count", 1),
                             units = o.get("units"),
                         )
@@ -1603,6 +1883,38 @@ cdef class RecordDef(object):
     def heap_size(self):
         """Determine the size of a record in the LDMS heap"""
         return ldms_record_heap_size_get(self._rec_def)
+
+    @classmethod
+    def from_ptr(cls, Ptr p):
+        cdef int n
+        cdef ldms_record_t r = <ldms_record_t>p.c_ptr
+        cdef ldms_metric_template_s _t[1024]
+        cdef const char *name
+        n = ldms_record_bulk_template_get(r, 1024, _t)
+        assert(n <= 1024)
+        mlist = list( ( _t[i].name, ldms_value_type(_t[i].type),
+                        _t[i].len, STR(CBYTES(_t[i].unit))) \
+                                                        for i in range(0, n) )
+        name = ldms_record_name_get(r)
+        return RecordDef(STR(name), mlist)
+
+    @classmethod
+    def from_rec_type(cls, RecordType rec_type):
+        rec_def = RecordDef(rec_type.name)
+        for mt in rec_type:
+            rec_def.add_metric(name = mt.name, metric_type = mt.type,
+                               count = mt.count, units = mt.units)
+        return rec_def
+
+    def __getitem__(self, key):
+        typ = type(key)
+        if typ == int:
+            return self.metric_list[key]
+        if typ == slice:
+            return self.metric_list[key]
+        if typ == str:
+            return self.metric_dict[key]
+        raise KeyError(f"Unsupported key type '{typ}'")
 
 
 cdef class Schema(object):
@@ -1690,6 +2002,10 @@ cdef class Schema(object):
     cdef ldms_schema_t _schema
     cdef dict rec_defs
 
+    # maintain list of metrics for easy access
+    cdef list metric_list
+    cdef dict metric_dict
+
     def __init__(self, name, array_card=1, metric_list = list()):
         """S.__init__(name, array_card=1, metric_list=list())"""
         self._schema = ldms_schema_new(BYTES(name))
@@ -1697,6 +2013,8 @@ cdef class Schema(object):
             raise OSError(errno, "ldms_schema_new() error: {}" \
                                  .format(ERRNO_SYM(errno)))
         self.rec_defs = dict() # rec_defs[ "name" or id ] = Ptr(ldms_record_t)
+        self.metric_list = list()
+        self.metric_dict = dict()
         if metric_list:
             self.add_metrics(metric_list)
         self.set_array_card(array_card)
@@ -1723,6 +2041,10 @@ cdef class Schema(object):
                                .format(ERRNO_SYM(-_id)))
         self.rec_defs[_id] = rec_def
         self.rec_defs[rec_def.name] = rec_def
+        flags = LDMS_MDESC_F_META|LDMS_MDESC_F_RECORD # recrod type is in metadata part
+        mt = MetricTemplate(rec_def.name, LDMS_V_RECORD_TYPE, 1, flags, None, rec_def)
+        self.metric_list.append(mt)
+        self.metric_dict[rec_def.name] = mt
 
     def add_metric(self, name, metric_type, count=1, meta=False, units=None,
                          rec_def=None):
@@ -1733,8 +2055,6 @@ cdef class Schema(object):
         NOTE: If metric_type is LDMS_V_LIST, the count is the heap size in bytes.
         """
         cdef int idx
-        cdef char *u = NULL
-        cdef bytes b
         cdef RecordDef _rec_def
 
         if type(metric_type) == RecordDef:
@@ -1743,33 +2063,38 @@ cdef class Schema(object):
         if type(metric_type) == str:
             metric_type = metric_type.lower()
         t = LDMS_VALUE_TYPE(metric_type)
+        flags = LDMS_MDESC_F_DATA if not meta else LDMS_MDESC_F_META
+        mt = MetricTemplate(name, t, count, flags, units, rec_def)
         if t == LDMS_V_RECORD_ARRAY:
             if type(rec_def) != RecordDef:
                 raise TypeError("Expecting RecordRef `rec_def`")
             _rec_def = <RecordDef>rec_def
-            idx = ldms_schema_record_array_add(self._schema, BYTES(name),
-                    _rec_def._rec_def, count)
+            idx = ldms_schema_record_array_add(self._schema,
+                                CSTR(BYTES(name)), _rec_def._rec_def, count)
         elif t == LDMS_V_LIST:
-            if units is not None:
-                b = BYTES(units)
-                u = b
-            idx = ldms_schema_metric_list_add(self._schema, BYTES(name), u, count)
+            idx = ldms_schema_metric_list_add(self._schema,
+                                              CSTR(BYTES(name)),
+                                              CSTR(BYTES(units)), count)
         elif ldms_type_is_array(t):
             if meta:
-                idx = ldms_schema_meta_array_add(self._schema, BYTES(name), t,
-                                                 count)
+                idx = ldms_schema_meta_array_add_with_unit( self._schema,
+                                CSTR(BYTES(name)), CSTR(BYTES(units)), t, count)
             else:
-                idx = ldms_schema_metric_array_add(self._schema, BYTES(name), t,
-                                                   count)
+                idx = ldms_schema_metric_array_add_with_unit(self._schema,
+                                CSTR(BYTES(name)), CSTR(BYTES(units)), t, count)
         else:
             if meta:
-                idx = ldms_schema_meta_add(self._schema, BYTES(name), t)
+                idx = ldms_schema_meta_add_with_unit(self._schema,
+                                CSTR(BYTES(name)), CSTR(BYTES(units)), t)
             else:
-                idx = ldms_schema_metric_add(self._schema, BYTES(name), t)
+                idx = ldms_schema_metric_add_with_unit(self._schema,
+                                CSTR(BYTES(name)), CSTR(BYTES(units)), t)
         if idx < 0:
             # error = -idx
             raise OSError(-idx, "Adding metric to schema failed: {}" \
                                 .format(ERRNO_SYM(-idx)))
+        self.metric_list.append(mt)
+        self.metric_dict[name] = mt
 
     @cython.binding(True)
     def add_metrics(self, list mlist):
@@ -1795,6 +2120,18 @@ cdef class Schema(object):
                         )
             elif type(o) == RecordDef:
                 self.add_record(o)
+
+    def __getitem__(self, key):
+        typ = type(key)
+        if typ in (int, slice):
+            return self.metric_list[key]
+        if typ is str:
+            return self.metric_dict[key]
+        if hasattr(key, "__iter__"):
+            return [ self.metric_list[k] for k in key ]
+
+    def get_metric_info(self, key):
+        return self[key]
 
 
 cdef class MetricArray(list):
@@ -2339,20 +2676,20 @@ cdef class RecordInstance(MVal):
         """Get metric name of the i_th member of the record"""
         cdef const char *c_str
         c_str = ldms_record_metric_name_get(self.rec_inst, i)
-        return STR(c_str)
+        return STR(CBYTES(c_str))
 
     def get_metric_unit(self, i):
         """Get metric unit of the i_th member of the record"""
         cdef const char *c_str
         c_str = ldms_record_metric_unit_get(self.rec_inst, i)
-        return STR(c_str)
+        return STR(CBYTES(c_str))
 
     def keys(self):
         """Generator yielding the names of the metrics in the record"""
         cdef const char *c_str
         for i in range(len(self)):
             c_str = ldms_record_metric_name_get(self.rec_inst, i)
-            s = STR(c_str)
+            s = STR(CBYTES(c_str))
             yield s
 
     def items(self):
@@ -2373,9 +2710,9 @@ cdef class RecordInstance(MVal):
             self.set_metric(idx, val)
 
     def get_metric_info(self, key):
-        """Returns (name, type, count, unit) of the metric by `key`
+        """Returns (name, type, count, units) of the metric by `key`
 
-        The `key` can be `str` or `int`.
+        The `key` can be `str`, `int` or list of int.
         """
         cdef size_t count
         cdef int t
@@ -2387,7 +2724,9 @@ cdef class RecordInstance(MVal):
             name = self.get_metric_name(key)
             unit = self.get_metric_unit(key)
             t = ldms_record_metric_type_get(self.rec_inst, key, &count)
-            return (name, ldms_value_type(t), count, unit)
+            return MetricTemplate(name = name, metric_type = t,
+                                  flags = LDMS_MDESC_F_RECORD|LDMS_MDESC_F_DATA,
+                                  count = count, units = unit)
         if hasattr(key, "__iter__"):
             return [ self.get_metric_info(k) for k in key ]
         raise TypeError("Unsupported `key` type; {}".format(type(key)))
@@ -2428,8 +2767,13 @@ cdef class RecordType(MVal):
 
     Record Type is meant to be used internally only.
     """
-    def __init__(self, Set lset, Ptr mval):
+    cdef ldms_mval_t rec_type
+    cdef str _name
+
+    def __init__(self, Set lset, Ptr mval, name):
         super().__init__(lset, mval, LDMS_V_RECORD_TYPE, 1)
+        self.rec_type = <ldms_mval_t>mval.c_ptr
+        self._name = STR(name)
 
     def get(self):
         return self
@@ -2442,6 +2786,81 @@ cdef class RecordType(MVal):
 
     def json_obj(self):
         return "__record_type__"
+
+    @property
+    def name(self):
+        return self._name
+
+    def _metric_by_name(self, name):
+        cdef int idx = ldms_record_metric_find(self.rec_type, BYTES(name))
+        if idx < 0:
+            raise KeyError("'{}' not found in the record".format(name))
+        return idx
+
+    def get_metric_name(self, i):
+        """Get metric name of the i_th member of the record"""
+        cdef const char *c_str
+        c_str = ldms_record_metric_name_get(self.rec_type, i)
+        return STR(CBYTES(c_str))
+
+    def get_metric_unit(self, i):
+        """Get metric unit of the i_th member of the record"""
+        cdef const char *c_str
+        c_str = ldms_record_metric_unit_get(self.rec_type, i)
+        return STR(CBYTES(c_str))
+
+    def get_metric_type(self, key):
+        """Get the type of `rec_type[key]`"""
+        cdef int idx
+        cdef size_t count
+        ktype = type(key)
+        if ktype in (str, bytes):
+            key = self._metric_by_name(key)
+            ktype = int
+        if ktype == int:
+            return ldms_value_type(ldms_record_metric_type_get(self.rec_type, key, &count))
+        if hasattr(key, "__iter__"):
+            return [ self.get_metric_type(k) for k in key ]
+        raise TypeError("Unsupported `key` type; {}".format(type(key)))
+
+    def __iter__(self):
+        for i in range(0, len(self)):
+            yield self[i]
+
+    def __len__(self):
+        return ldms_record_card(self.rec_type)
+
+    def __getitem__(self, key):
+        return self.get_metric_info(key)
+
+    def get_metric_info(self, key):
+        """Returns (name, flag, type, unit, count) of the metric by `key`
+
+        The `key` can be `str`, `int` or list of int.
+        """
+        cdef size_t count
+        cdef int t, _id
+        cdef const char *c_name
+        cdef const char *c_unit
+        ktype = type(key)
+        if ktype in (str, bytes):
+            idx = ldms_record_metric_find(self.rec_type, BYTES(key))
+            ktype = int
+            if idx < 0:
+                raise KeyError(f"Cannot find key '{key}' (error: {-idx}")
+            key = idx
+        if ktype == int:
+            if key < 0: # support Python negative indexing
+                key %= len(self)
+            name = self.get_metric_name(key)
+            unit = self.get_metric_unit(key)
+            t = ldms_record_metric_type_get(self.rec_type, key, &count)
+            return MetricTemplate(name, t, count,
+                                  flags = LDMS_MDESC_F_RECORD|LDMS_MDESC_F_DATA,
+                                  units = unit, rec_def = None)
+        if hasattr(key, "__iter__"):
+            return [ self.get_metric_info(k) for k in key ]
+        raise TypeError("Unsupported `key` type; {}".format(type(key)))
 
 
 cdef class Set(object):
@@ -2495,6 +2914,8 @@ cdef class Set(object):
     cdef list _getter
     cdef list _setter
     cdef Schema schema
+    cdef object _push_cb
+    cdef object _push_cb_arg
 
     def __cinit__(self, *args, **kwargs):
         self.rbd = NULL
@@ -2792,11 +3213,84 @@ cdef class Set(object):
 
     def get_metric_name(self, key):
         """Get the name of `ldms_set[key]`"""
-        pass
+        cdef const char *c_str
+        cdef int i
+        if type(key) in [str, bytes]:
+            i = self._metric_by_name(key)
+            if i < 0:
+                raise RuntimeError(f"`{key}` metric not found")
+        else:
+            i = int(key)
+        c_str = ldms_metric_name_get(self.rbd, i)
+        return STR(CBYTES(c_str))
 
     def get_metric_unit(self, key):
         """Get the unit of `ldms_set[key]`"""
-        pass
+        cdef const char *c_str
+        cdef int i
+        if type(key) in [str, bytes]:
+            i = self._metric_by_name(key)
+            if i < 0:
+                raise RuntimeError(f"`{key}` metric not found")
+        else:
+            i = int(key)
+        c_str = ldms_metric_unit_get(self.rbd, i)
+        return STR(CBYTES(c_str))
+
+    def _get_rec_type(self, idx):
+        cdef ldms_mval_t mval
+        cdef const char *cname
+        mval = ldms_metric_get(self.rbd, idx)
+        cname = ldms_metric_name_get(self.rbd, idx)
+        name = STR(CBYTES(cname))
+        assert(name != None)
+        return RecordType(self, PTR(mval), name = name)
+
+    def _get_rec_def(self, idx):
+        rec_type = self._get_rec_type(idx)
+        rec_def = RecordDef.from_rec_type(rec_type)
+        return rec_def
+
+    def get_metric_info(self, key):
+        """Returns (name, type, count, unit) of the metric by `key`
+
+        The `key` can be `str` or `int`.
+        """
+        cdef size_t count
+        cdef ldms_value_type t
+        cdef ldms_mval_t mval, mrec, mrectype
+        cdef int rec_type_idx
+        ktype = type(key)
+        if ktype in (str, bytes):
+            key = self._metric_by_name(key)
+            ktype = int
+        if ktype == int:
+            mval = ldms_metric_get(self.rbd, key)
+            name = self.get_metric_name(key)
+            unit = self.get_metric_unit(key)
+            flags = ldms_metric_flags_get(self.rbd, key)
+            t = ldms_metric_type_get(self.rbd, key)
+            if ldms_type_is_array(t):
+                count = ldms_metric_array_get_len(self.rbd, key)
+            elif t == LDMS_V_LIST:
+                count = ldms_list_len(self.rbd, mval)
+            else:
+                count = 1
+            # handling rec_def
+            if t == LDMS_V_RECORD_TYPE:
+                rec_def = self._get_rec_def(key)
+            elif t == LDMS_V_RECORD_ARRAY:
+                mrec = ldms_record_array_get_inst(mval, 0)
+                count = ldms_record_array_len(mval)
+                rec_type_idx = ldms_record_type_get(mrec)
+                rec_def = self._get_rec_def(rec_type_idx)
+            else:
+                rec_def = None
+            return MetricTemplate(name, ldms_value_type(t), count,
+                                  flags = flags, units = unit, rec_def = rec_def)
+        if hasattr(key, "__iter__"):
+            return [ self.get_metric_info(k) for k in key ]
+        raise TypeError("Unsupported `key` type; {}".format(type(key)))
 
     def get_metric(self, int idx):
         """S.get_metric(idx) - equivalent to S[idx]"""
@@ -2864,6 +3358,7 @@ cdef class Set(object):
 
     def json_obj(self):
         """Return dict/list values appropriate for json.dumps()"""
+        cdef const char *tmp
         ret = dict()
         meta_lst = [ 'name', 'schema_name', 'transaction_timestamp',
                      'transaction_duration', 'card', 'data_gn', 'data_sz',
@@ -2872,9 +3367,13 @@ cdef class Set(object):
         for k in meta_lst:
             ret[k] = getattr(self, k)
         data = dict()
+        meta = dict()
         for k, v in self.items():
             data[k] = JSON_OBJ(v)
+            tmp = ldms_metric_type_to_str(self.get_metric_type(k))
+            meta[k] = {'type' : STR(tmp)}
         ret['data'] = data
+        ret['meta'] = meta
         return ret
 
     def json(self, indent=None):
@@ -2882,6 +3381,24 @@ cdef class Set(object):
         obj = self.json_obj()
         return json.dumps(obj, indent=indent)
 
+    def register_push(self, flag = LDMS_XPRT_PUSH_F_CHANGE, cb=None, cb_arg=None):
+        cdef int rc
+        self._push_cb = cb
+        self._push_cb_arg = cb_arg
+        rc = ldms_xprt_register_push(self.rbd, flag, push_cb, <void*>self)
+        if rc: # synchronous error
+            raise RuntimeError(f"ldms_xprt_register_push() error: {rc}")
+
+    def cancel_push(self):
+        cdef int rc
+        rc = ldms_xprt_cancel_push(self.rbd)
+        if rc: # synchronous error
+            raise RuntimeError(f"ldms_xprt_cancel_push() error: {rc}")
+
+cdef void __xprt_free_cb(void* p) with gil:
+    cdef Xprt x = <Xprt>p
+    x._xprt_free_cb(x)
+    Py_DECREF(x)
 
 cdef class Xprt(object):
     """LDMS transport
@@ -2895,6 +3412,9 @@ cdef class Xprt(object):
             - "munge" for munge
     - auth_opts: A dictionary containing LDMS authentication plugin options.
                  Please consult the plugin manuals for their options.
+    - rail_recv_quota:
+            The amount (bytes) of outstanding stream recv buffer we will hold.
+            The peer will respect our recv_quota.
 
     Passive-side simple example:
     >>> x = ldms.Xprt()
@@ -2942,19 +3462,31 @@ cdef class Xprt(object):
     cdef public object _recv_queue
     cdef public object _accept_queue
 
+    cdef object _xprt_free_cb
+
     cdef public object _psv_xprts
     # _psv_xprts is a dict(ldms_t :-> Xprt). This is a work around as the newly
     # created passive endpoint inherited callback function and argument from the
     # listening endpoint and LDMS does not have a way (e.g.
     # `ldms_xprt_accept()`) to change the callback function and argument yet.
 
+    cdef int rail_eps
+
     def __init__(self, name="sock", auth="none", auth_opts=None,
-                       Ptr xprt_ptr=None):
+                       rail_eps = 1, rail_recv_quota = ldms.RAIL_UNLIMITED,
+                       rail_rate_limit = ldms.RAIL_UNLIMITED,
+                       Ptr xprt_ptr=None,
+                       rail_recv_limit = None # alias of rail_recv_quota
+                       ):
         cdef attr_value_list *avl = NULL;
         cdef int rc;
+        if rail_eps < 1:
+            raise ValueError("rail_eps must be greater than 0")
         if auth is None:
             auth = "none"
         self.ctxt = None
+        if rail_recv_limit: # alias
+            rail_recv_quota = rail_recv_limit
         # conn
         sem_init(&self._conn_sem, 0, 0)
         self._conn_rc = 0
@@ -2978,6 +3510,7 @@ cdef class Xprt(object):
         if xprt_ptr:
             # wrap the existing ldms_t and done
             self.xprt = <ldms_t>xprt_ptr.c_ptr
+            self.rail_eps = ldms_xprt_rail_eps(self.xprt)
             return
         # otherwise create new xprt with the supplied options
         if auth_opts:
@@ -2985,12 +3518,15 @@ cdef class Xprt(object):
                 raise TypeError("auth_opts must be a dictionary")
             avl = av_new(len(auth_opts))
             for k, v in auth_opts.items():
-                rc = av_add(avl, BYTES(k), BYTES(v))
+                rc = av_add(avl, CSTR(BYTES(k)), CSTR(BYTES(v)))
                 if rc:
                     av_free(avl)
                     raise OSError(rc, "av_add() error: {}"\
                                   .format(ERRNO_SYM(rc)))
-        self.xprt = ldms_xprt_new_with_auth(BYTES(name), BYTES(auth), avl)
+        self.rail_eps = rail_eps
+        self.xprt = ldms_xprt_rail_new(CSTR(BYTES(name)), rail_eps,
+                                        rail_recv_quota, rail_rate_limit,
+                                        CSTR(BYTES(auth)), avl)
         av_free(avl)
         if not self.xprt:
             raise ConnectionError(errno, "Error creating transport, errno: {}"\
@@ -3029,7 +3565,7 @@ cdef class Xprt(object):
         import types
         cdef int rc
         cdef timespec ts
-        if not isinstance(cb, types.FunctionType) and cb is not None:
+        if cb is not None and not callable(cb):
             raise TypeError("Callback argument must be callable")
         self._conn_cb = cb
         self._conn_cb_arg = cb_arg
@@ -3114,6 +3650,7 @@ cdef class Xprt(object):
         cdef timespec ts
         if self.xprt:
             ldms_xprt_close(self.xprt)
+            ldms_xprt_put(self.xprt)
             self.xprt = NULL
             if self._conn_cb: # has `cb` ==> asynchronous/non-blocking mode
                 return
@@ -3241,8 +3778,10 @@ cdef class Xprt(object):
         cdef int rc
         cdef int data_len = len(data)
         cdef char *c_data = data
+        rc = 0
         with nogil:
-            rc = ldms_xprt_send(self.xprt, c_data, data_len)
+            if self.xprt:
+                rc = ldms_xprt_send(self.xprt, c_data, data_len)
         if rc:
             raise ConnectionError(rc, "ldms_xprt_send() error: {}" \
                                       .format(ERRNO_SYM(rc)))
@@ -3272,4 +3811,981 @@ cdef class Xprt(object):
     @property
     def msg_max(self):
         """Maximum length of send/recv message"""
-        return ldms_xprt_msg_max(self.xprt)
+        if self.xprt:
+            return ldms_xprt_msg_max(self.xprt)
+        return 0
+
+    def get_threads(self):
+        """Get the threads associated to the endpoint"""
+        cdef pthread_t *out
+        cdef int n, rc
+        assert(self.rail_eps > 0)
+        out = <pthread_t*>calloc(self.rail_eps, sizeof(pthread_t))
+        if not out:
+            raise RuntimeError(f"calloc() error: {errno}")
+        n = self.rail_eps
+        rc = ldms_xprt_get_threads(self.xprt, out, n)
+        if rc < 0:
+            free(out)
+            raise RuntimeError(f"ldms_xprt_get_threads() error: {rc}")
+        lst = list()
+        for i in range(0, n):
+            lst.append(int(out[i]))
+        free(out)
+        return lst
+
+    def set_xprt_free_cb(self, cb = None):
+        """Set a callback function in the event of the underlying transport is freed
+
+        This is used primarily for testing purposes.
+        """
+        if self._xprt_free_cb:
+            self._xprt_free_cb = None
+            Py_DECREF(self)
+        if cb is not None:
+            self._xprt_free_cb = cb
+            Py_INCREF(self)
+            ldms_xprt_ctxt_set(self.xprt, <void*>self, __xprt_free_cb)
+        else:
+            ldms_xprt_ctxt_set(self.xprt, NULL, NULL)
+
+    def get_send_quota(self):
+        assert(self.rail_eps > 0)
+        cdef uint64_t *tmp = <uint64_t*>calloc(self.rail_eps, sizeof(uint64_t))
+        cdef int rc, i
+        if not tmp:
+            raise RuntimeError("Not enough memory")
+        rc = ldms_xprt_rail_send_quota_get(self.xprt, tmp, self.rail_eps)
+        if rc:
+            free(tmp)
+            raise RuntimeError(f"ldms_xprt_rail_send_quota_get() error: {rc}")
+        lst = list()
+        for i in range(0, self.rail_eps):
+            lst.append(tmp[i])
+        free(tmp)
+        return lst
+
+    @property
+    def send_quota(self):
+        return self.get_send_quota()
+
+    @property
+    def pending_ret_quota(self):
+        assert(self.rail_eps > 0)
+        cdef uint64_t *tmp = <uint64_t*>calloc(self.rail_eps, sizeof(uint64_t))
+        cdef int rc, i
+        if not tmp:
+            raise RuntimeError("Not enough memory")
+        rc = ldms_xprt_rail_pending_ret_quota_get(self.xprt, tmp, self.rail_eps)
+        if rc:
+            free(tmp)
+            raise RuntimeError(f"ldms_xprt_rail_pending_ret_quota_get() error: {rc}")
+        lst = list()
+        for i in range(0, self.rail_eps):
+            lst.append(tmp[i])
+        free(tmp)
+        return lst
+
+    def get_recv_quota(self):
+        cdef int64_t q
+        q = ldms_xprt_rail_recv_quota_get(self.xprt)
+        if q < 0:
+            if q == ldms.LDMS_UNLIMITED:
+                return ldms.LDMS_UNLIMITED
+            else:
+                err = -q
+                raise RuntimeError(f"ldms_xprt_rail_recv_quota_set() error: {-err}")
+        return q
+
+    def set_recv_quota(self, q:uint64_t):
+        cdef int rc
+        rc = ldms_xprt_rail_recv_quota_set(self.xprt, q)
+        if rc:
+            raise RuntimeError(f"ldms_xprt_rail_recv_quota_set() error: {rc}")
+
+    @property
+    def recv_quota(self):
+        return self.get_recv_quota()
+
+    @recv_quota.setter
+    def recv_quota(self, q:uint64_t):
+        self.set_recv_quota(q)
+
+    def get_send_rate_limit(self):
+        cdef int64_t rate = ldms_xprt_rail_send_rate_limit_get(self.xprt)
+        if rate == ldms.LDMS_UNLIMITED:
+            return ldms.LDMS_UNLIMITED
+        if rate < 0:
+            raise RuntimeError(f"ldms_xprt_rail_send_rate_limit_get() error: {-rate}")
+        return rate
+
+    @property
+    def send_rate_limit(self):
+        return self.get_send_rate_limit()
+
+    def get_recv_rate_limit(self):
+        cdef int64_t rate = ldms_xprt_rail_recv_rate_limit_get(self.xprt)
+        if rate == ldms.LDMS_UNLIMITED:
+            return ldms.LDMS_UNLIMITED
+        if rate < 0:
+            raise RuntimeError(f"ldms_xprt_rail_recv_rate_limit_get() error: {-rate}")
+        return rate
+
+    def set_recv_rate_limit(self, rate:uint64_t):
+        cdef int rc
+        rc = ldms_xprt_rail_recv_rate_limit_set(self.xprt, rate)
+        if rc:
+            raise RuntimeError(f"ldms_xprt_rail_recv_rate_limit_set() error: {rc}")
+
+    @property
+    def recv_rate_limit(self):
+        return self.get_recv_rate_limit()
+
+    @recv_rate_limit.setter
+    def recv_rate_limit(self, rate:uint64_t):
+        self.set_recv_rate_limit(rate)
+
+    @property
+    def in_eps_stq(self):
+        assert(self.rail_eps > 0)
+        cdef uint64_t *tmp = <uint64_t*>calloc(self.rail_eps, sizeof(uint64_t))
+        cdef int rc, i
+        if not tmp:
+            raise RuntimeError("Not enough memory")
+        rc = ldms_xprt_rail_in_eps_stq_get(self.xprt, tmp, self.rail_eps)
+        if rc:
+            free(tmp)
+            raise RuntimeError(f"ldms_xprt_rail_pending_ret_quota_get() error: {rc}")
+        lst = list()
+        for i in range(0, self.rail_eps):
+            lst.append(tmp[i])
+        free(tmp)
+        return lst
+
+    def stream_publish(self, name, stream_data, stream_type=None,
+                       perm=0o444, uid=None, gid=None,
+                       sr_client=None, schema_def=None):
+        """x.stream_publish(name, stream_data, stream_type=None, perm=0o444,
+                         uid=None, gid=None, sr_client=None, schema_def=None)
+
+        Publish a stream directly to the remote peer. The local stream client
+        will NOT get the stream data.
+
+        For LDMS_STREAM_AVRO_SER type, SchemaRegistryClient `sr_client` and
+        schema definition `schema_def` is required. The `stream_data` object
+        will be serialized by Avro using `schema_def` (see parameter description
+        below). The `schema_def` is also registered to the Schema Registry with
+        `sr_client`.
+
+        Arguments:
+        - name (str): The name of the stream being published.
+        - stream_data (bytes, str, dict):
+                The data being published. If it is `dict` and stream_type is
+                LDMS_STREAM_JSON or None, the stream_data is converted into JSON
+                string representation with `json.dumps(stream_data)`.
+        - stream_type (enum):
+                LDMS_STREAM_JSON or LDMS_STREAM_STRING or LDMS_STREAM_AVRO_SER
+                or None.  If the type is `None`, it is inferred from the
+                `type(stream_data)`: LDMS_STREAM_STRING for `str` and `bytes`
+                types, and LDMS_STREAM_JSON for `dict` type. If
+                `type(stream_data)` is something else, TypeError is raised.
+        - perm (int): The file-system-style permission bits (e.g. 0o444).
+        - uid (int or str): Publish as the given uid; None for euid.
+        - gid (int or str): Publish as the given gid; None for egid.
+        - sr_client (SchemaRegistryClient):
+                required if `stream_type` is `LDMS_STREAM_AVRO_SER`. In this
+                case, the stream data is encoded in Avro format, and the schema
+                is registered to SchemaRegistry.
+        - schema_def (object): The Schema definition, required for
+                LDMS_STREAM_AVRO_SER stream_type. This can be of type:
+                `dict`, `str` (JSON formatted), `avro.Schema`, or
+                `confluent_kafka.schema_registry.Schema`. The `dict` and `str`
+                (JSON) must follow Apache Avro Schema specification:
+                https://avro.apache.org/docs/1.11.1/specification/
+
+        """
+        return __stream_publish(PTR(self.xprt), name, stream_data, stream_type,
+                perm, uid, gid, sr_client = sr_client, schema_def = schema_def)
+
+    def stream_subscribe(self, match, is_regex, cb=None, cb_arg=None, rx_rate=-1):
+        """x.stream_subscribe(match, is_regex, cb=None, cb_arg=None)
+
+        `cb()` signature: `cb(StreamStatusEvent ev, object cb_arg)`
+
+        Send a subscription request to the remote peer. If `cb` is `None`,
+        this function will block and wait for the peer to reply the subscription
+        result. In this case, if the subscription is a success, the function
+        simply returned (no return code); otherwise, a StreamSubscribeError is
+        raised.
+
+        If the callback function `cb` is given, it will be called when the
+        remote process sends back the stream subscription request results.
+        The callback signature is `cb(StreamStatusEvent ev, object cb_arg)`.
+        - `ev.name` (str) is the stream name or stream matching regex value.
+        - `ev.is_regex` (int) 1 if `ev.name` is a regex; otherwise 0.
+        - `ev.status` (int) is the returned status for the submitted request.
+
+        Arguments:
+        - match (str): the name or the matching regular expression.
+        - is_regex (int): 1 if `match` is a regex; otherwise 0.
+        - cb (callable(StreamStatusEvent, object)):
+                a callback function to report the result of the request.
+        - cb_arg (object): the application-supplied callback argument.
+
+        Returns:
+        None; This method does not return any value.
+
+        """
+        cdef int rc
+        cdef sem_t sem
+        cdef ldms_stream_event_cb_t _cb
+        cdef _StreamSubCtxt ctxt = _StreamSubCtxt()
+        cdef const char *c_match
+        cdef int c_is_regex
+        cdef int64_t c_rx_rate = rx_rate
+        cdef bytes tmp
+        ctxt.cb = cb
+        ctxt.cb_arg = cb_arg
+
+        tmp = BYTES(match)
+        c_match = <const char*>tmp
+        c_is_regex = <int>is_regex
+        if cb is None:
+            sem_init(&ctxt.sem, 0, 0)
+            with nogil:
+                rc = ldms_stream_remote_subscribe(self.xprt, c_match, c_is_regex,
+                        __stream_block_cb, <void*>ctxt, c_rx_rate)
+                if rc:
+                    with gil:
+                        raise StreamSubscribeError(f"ldms_stream_remote_subscribe() error, rc: {rc}")
+                sem_wait(&ctxt.sem)
+            if ctxt.rc:
+                raise StreamSubscribeError(f"stream remote subscription error: {ctxt.rc}")
+        else:
+            Py_INCREF(ctxt)
+            with nogil:
+                rc = ldms_stream_remote_subscribe(self.xprt, c_match, c_is_regex,
+                        __stream_wrap_cb, <void*>ctxt, c_rx_rate)
+            if rc:
+                raise StreamSubscribeError(f"ldms_stream_remote_subscribe() error, rc: {rc}")
+
+    def stream_unsubscribe(self, match, is_regex, cb=None, cb_arg=None):
+        """Send an unsubscription request to the remote peer"""
+        cdef int rc
+        cdef sem_t sem
+        cdef ldms_stream_event_cb_t _cb
+        cdef _StreamSubCtxt ctxt = _StreamSubCtxt()
+        cdef char *c_match
+        cdef int c_is_regex
+        ctxt.cb = cb
+        ctxt.cb_arg = cb_arg
+        match = BYTES(match)
+        c_match = match
+        c_is_regex = is_regex
+
+        with nogil:
+            if cb is None:
+                sem_init(&ctxt.sem, 0, 0)
+                rc = ldms_stream_remote_unsubscribe(self.xprt, c_match, c_is_regex,
+                        __stream_block_cb, <void*>ctxt)
+                if rc:
+                    with gil:
+                        raise StreamSubscribeError(f"ldms_stream_remote_unsubscribe() error, rc: {rc}")
+                sem_wait(&ctxt.sem)
+                if ctxt.rc:
+                    with gil:
+                        raise StreamSubscribeError(f"stream remote unsubscription error: {ctxt.rc}")
+            else:
+                with gil:
+                    Py_INCREF(ctxt)
+                rc = ldms_stream_remote_unsubscribe(self.xprt, c_match, c_is_regex,
+                        __stream_wrap_cb, <void*>ctxt)
+                if rc:
+                    with gil:
+                        raise StreamSubscribeError(f"ldms_stream_remote_unsubscribe() error, rc: {rc}")
+
+    def get_addr(self):
+        """Get the local socket Internet address in ((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))"""
+        cdef sockaddr_storage lcl, rmt
+        cdef socklen_t slen = sizeof(lcl)
+        cdef int rc
+        rc = ldms_xprt_sockaddr(self.xprt, <sockaddr*>&lcl, <sockaddr*>&rmt, &slen)
+        if rc:
+            raise RuntimeError(f"ldms_xprt_sockaddr() error, rc: {rc}")
+        return ( LdmsAddr.from_sockaddr(PTR(&lcl)),
+                 LdmsAddr.from_sockaddr(PTR(&rmt)) )
+
+    @property
+    def is_rail(self):
+        """True if this is a rail transport"""
+        cdef int rc
+        rc = ldms_xprt_is_rail(self.xprt)
+        return bool(rc)
+
+    @property
+    def is_remote_rail(self):
+        """True if the remote peer is a rail"""
+        cdef int rc
+        rc = ldms_xprt_is_remote_rail(self.xprt)
+        return bool(rc)
+
+
+cdef class _StreamSubCtxt(object):
+    """For internal use"""
+    cdef object cb
+    cdef object cb_arg
+    cdef sem_t sem
+    cdef int rc
+
+cdef int __stream_block_cb(ldms_stream_event_t ev, void *cb_arg) with gil:
+    cdef _StreamSubCtxt ctxt = <_StreamSubCtxt>cb_arg
+    try:
+        ctxt.rc = ev.status.status
+    except:
+        sem_post(&ctxt.sem)
+        raise
+    sem_post(&ctxt.sem)
+
+cdef int __stream_wrap_cb(ldms_stream_event_t ev, void *cb_arg) with gil:
+    cdef _StreamSubCtxt ctxt = <_StreamSubCtxt>cb_arg
+    py_ev = StreamStatusEvent(ev.status.match, ev.status.is_regex,
+                                             ev.status.status)
+    ctxt.cb(py_ev, ctxt.cb_arg)
+    Py_DECREF(ctxt)
+
+cdef class StreamStatusEvent(object):
+    cdef public str match
+    cdef public int is_regex
+    cdef public int status
+    def __cinit__(self, const char *match, int is_regex, int status):
+        self.match = str(match)
+        self.is_regex = is_regex
+        self.status = status
+
+class StreamSubscribeError(Exception):
+    def __init__(self, rc, text):
+        self.rc = rc
+        self.text = text
+
+    def __str__(self):
+        return f"StreamSubscribeError: {self.rc}, {self.text}"
+
+    def __repr__(self):
+        return f"StreamSubscribeError( {self.rc}, '{self.text}' )"
+
+StreamDataAttrs = [ "raw_data", "data", "src", "name", "is_json", "uid", "gid", "perm", "tid" ]
+
+cdef class LdmsAddr(object):
+    cdef public int   family
+    cdef public int   port
+    cdef public bytes addr
+
+    def __init__(self, family = 0, port = 0, addr = b'\x00'*16):
+        self.family = family
+        self.addr = addr
+        self.port = port
+
+    def __repr__(self):
+        return f"LdmsAddr( {self.family}, {self.port}, {self.addr} )"
+
+    def __str__(self):
+        cdef char buff[128]
+        if self.family in [ AF_INET, AF_INET6 ]:
+            addr = socket.inet_ntop(self.family, self.addr)
+        else:
+            addr = "UNSUPPORTED"
+        return f"[{addr}]:{self.port}"
+
+    @classmethod
+    def from_ldms_addr(cls, Ptr addr_ptr):
+        cdef ldms_addr *addr = <ldms_addr*>addr_ptr.c_ptr
+        if addr.sa_family == AF_INET:
+            addr_bytes = addr.addr[:4]
+        elif addr.sa_family == AF_INET6:
+            addr_bytes = addr.addr[:16]
+        elif addr.sa_family == 0:
+            addr_bytes = b'\x00'*16
+        else:
+            raise RuntimeError(f"Unsupported address family: {addr.sa_family}")
+        return LdmsAddr(addr.sa_family, be16toh(addr.sin_port), addr_bytes)
+
+    @classmethod
+    def from_sockaddr(cls, Ptr addr_ptr):
+        cdef sockaddr *sa = <sockaddr*>addr_ptr.c_ptr
+        cdef sockaddr_in *sin = <sockaddr_in*>addr_ptr.c_ptr
+        cdef sockaddr_in6 *sin6 = <sockaddr_in6*>addr_ptr.c_ptr
+        cdef char *addr
+        if sa.sa_family == AF_INET:
+            addr = <char*>&sin.sin_addr
+            return LdmsAddr(AF_INET, be16toh(sin.sin_port), addr[:4])
+        elif sa.sa_family == AF_INET6:
+            addr = <char*>&sin6.sin6_addr
+            return LdmsAddr(AF_INET6, be16toh(sin6.sin6_port), addr[:16])
+        elif sa.sa_family == 0:
+            return LdmsAddr(0, 0, b'\x00'*16)
+        else:
+            raise RuntimeError(f"Unsupported address family: {sa.sa_family}")
+
+    def as_tuple(self):
+        return ( self.family, self.port, self.addr )
+
+    def __iter__(self):
+        yield self.family
+        yield self.port
+        yield self.addr
+
+    def __eq__(self, other):
+        for a, b in zip(self, other):
+            if a != b:
+                return False
+        return True
+
+    def __lt__(self, other):
+        for a, b in zip(self, other):
+            if a is None:
+                if b is None:
+                    continue
+                return True
+            if b is None:
+                return False
+            if a < b:
+                return True
+            if a > b:
+                return False
+        return False
+
+SD_FRAME_FMT = ">bI"
+
+cdef object __deserialize_avro_ser(Ptr ev_ptr, StreamClient c):
+    cdef ldms_stream_event_t ev = <ldms_stream_event_t>ev_ptr.c_ptr
+
+    import avro.io
+    import avro.schema
+
+    # unframe
+    cdef int magic, schema_id
+    raw_data = ev.recv.data[:ev.recv.data_len]
+    sd_frame = raw_data[:5]
+    av_data = raw_data[5:]
+
+    # get schema
+    magic, schema_id = struct.unpack(SD_FRAME_FMT, sd_frame)
+    sr_sch = c.sr_client.get_schema(schema_id)
+    av_sch = avro.schema.parse(sr_sch.schema_str)
+
+    # parse data
+    dr = avro.io.DatumReader(av_sch)
+    de = avro.io.BinaryDecoder(io.BytesIO(av_data))
+    obj = dr.read(de)
+    return obj
+
+cdef class StreamData(object):
+    """Stream Data"""
+    cdef public bytes    raw_data # bytes raw data
+    cdef public object   data     # `str` (for STRING) or `dict` (for JSON)
+    cdef public LdmsAddr src      # stream originator
+    cdef public str      name     # stream name
+    cdef public int      is_json  # data is JSON
+    cdef public int      uid      # uid of the original publisher
+    cdef public int      gid      # gid of the original publisher
+    cdef public int      perm     # the permission of the data
+    cdef public uint64_t tid      # the thread ID creating the StreamData
+    cdef public object   type     # stream type
+
+    def __init__(self, name=None, src=None, tid=None, uid=None, gid=None,
+                       perm=None, is_json=None, data=None, raw_data=None,
+                       _type=None):
+        self.name = name
+        self.src = src
+        self.tid = tid
+        self.uid = uid
+        self.gid = gid
+        self.perm = perm
+        self.is_json = is_json
+        self.data = data
+        self.raw_data = raw_data
+        self.type = _type
+
+    def __str__(self):
+        return str(self.data)
+
+    def __repr__(self):
+        return f"StreamData('{self.name}', {repr(self.src)}, " \
+               f"{self.tid}, {self.uid}, {self.gid}, {oct(self.perm)}, " \
+               f"{self.is_json}, {repr(self.data)})"
+
+    def __eq__(self, other):
+        if type(other) != StreamData:
+            return False
+        for k in StreamDataAttrs:
+            v0 = getattr(self, k)
+            v1 = getattr(other, k)
+            if v0 != v1:
+                return False
+        return True
+
+    @classmethod
+    def from_ldms_stream_event(cls, Ptr ev_ptr, StreamClient c = None):
+        cdef ldms_stream_event_t ev = <ldms_stream_event_t>ev_ptr.c_ptr
+        assert( ev.type == LDMS_STREAM_EVENT_RECV )
+        raw_data = ev.recv.data[:ev.recv.data_len]
+        if ev.recv.type == LDMS_STREAM_STRING:
+            is_json = False
+            data = raw_data.decode()
+        elif ev.recv.type == LDMS_STREAM_JSON:
+            is_json = True
+            data = json.loads(raw_data.strip(b'\x00').strip())
+        elif ev.recv.type == LDMS_STREAM_AVRO_SER:
+            is_json = False
+            data = __deserialize_avro_ser(ev_ptr, c)
+        else:
+            # no data decode
+            is_json = False
+            data = raw_data
+        name = ev.recv.name.decode()
+        src = LdmsAddr.from_ldms_addr(PTR(&ev.recv.src))
+        uid = ev.recv.cred.uid
+        gid = ev.recv.cred.gid
+        perm = ev.recv.perm
+        tid = threading.get_native_id()
+        obj = StreamData(name, src, tid, uid, gid, perm, is_json, data,
+                         raw_data,
+                         ldms.ldms_stream_type_e(ev.recv.type))
+        return obj
+
+cdef int __stream_client_cb(ldms_stream_event_t ev, void *arg) with gil:
+    cdef StreamClient c = <StreamClient>arg
+    cdef StreamData sdata
+
+    if ev.type != LDMS_STREAM_EVENT_RECV:
+        return 0
+
+    sdata = StreamData.from_ldms_stream_event(PTR(ev), c)
+    if c.cb:
+        c.cb(c, sdata, c.cb_arg)
+    else:
+        c.data_q.put(sdata)
+    return 0
+
+TimeSpec = namedtuple('TimeSpec', [ 'tv_sec', 'tv_nsec' ])
+def _from_ptr(cls, Ptr ptr):
+    cdef timespec *ts = <timespec*>ptr.c_ptr
+    return cls(ts.tv_sec, ts.tv_nsec)
+TimeSpec.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+StreamCounters = namedtuple('StreamCounters', [
+        'first_ts', 'last_ts', 'count', 'bytes'
+    ])
+def _from_ptr(cls, Ptr ptr):
+    cdef ldms_stream_counters_s *ctr = <ldms_stream_counters_s *>ptr.c_ptr
+    first_ts = TimeSpec.from_ptr(PTR(&ctr.first_ts))
+    last_ts = TimeSpec.from_ptr(PTR(&ctr.last_ts))
+    return cls(first_ts, last_ts, ctr.count, ctr.bytes)
+StreamCounters.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+StreamSrcStats = namedtuple('StreamSrcStats', ['src', 'rx'])
+def _from_ptr(cls, Ptr ptr):
+    cdef ldms_stream_src_stats_s *ss = <ldms_stream_src_stats_s *>ptr.c_ptr
+    src = LdmsAddr.from_ldms_addr(PTR(&ss.src))
+    rx = StreamCounters.from_ptr(PTR(&ss.rx))
+    return cls(src, rx)
+StreamSrcStats.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+StreamClientPairStats = namedtuple('StreamClientPairStats', [
+        'stream_name', 'client_match', 'client_desc', 'is_regex', 'tx', 'drops'
+    ])
+def _from_ptr(cls, Ptr ptr):
+    cdef ldms_stream_client_pair_stats_s *ps = <ldms_stream_client_pair_stats_s *>ptr.c_ptr
+    tx = StreamCounters.from_ptr(PTR(&ps.tx))
+    drops = StreamCounters.from_ptr(PTR(&ps.drops))
+    return cls(STR(ps.stream_name), STR(ps.client_match), STR(ps.client_desc),
+               ps.is_regex, tx, drops)
+StreamClientPairStats.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+StreamStats = namedtuple('StreamStats', ['rx', 'sources', 'clients', 'name'])
+def _from_ptr(cls, Ptr ptr):
+    cdef ldms_stream_stats_s *s = <ldms_stream_stats_s *>ptr.c_ptr
+    cdef ldms_stream_src_stats_s *ss
+    cdef ldms_stream_client_pair_stats_s *ps
+    cdef rbn *rbn
+    rx = StreamCounters.from_ptr(PTR(&s.rx))
+    sources = list()
+    clients = list()
+    rbn = rbt_min(&s.src_stats_rbt)
+    while rbn:
+        ss = ldms_stream_src_stats_s_from_rbn(rbn)
+        obj = StreamSrcStats.from_ptr(PTR(ss))
+        sources.append(obj)
+        rbn = rbn_succ(rbn)
+    ps = __STREAM_CLIENT_PAIR_STATS_TQ_FIRST(&s.pair_tq)
+    while ps:
+        obj = StreamClientPairStats.from_ptr(PTR(ps))
+        clients.append(obj)
+        ps = __STREAM_CLIENT_PAIR_STATS_NEXT(ps)
+    ret = StreamStats(rx, sources, clients, STR(s.name))
+    return ret
+StreamStats.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+StreamClientStats = namedtuple('StreamClientStats', [
+        'tx', 'drops', 'streams', 'dest', 'is_regex', 'match', 'desc'
+    ])
+def _from_ptr(cls, Ptr ptr):
+    cdef ldms_stream_client_stats_s *cs = <ldms_stream_client_stats_s*>ptr.c_ptr
+    cdef ldms_stream_client_pair_stats_s *ps
+    tx = StreamCounters.from_ptr(PTR(&cs.tx))
+    drops = StreamCounters.from_ptr(PTR(&cs.drops))
+    dest = LdmsAddr.from_ldms_addr(PTR(&cs.dest))
+    ps = __STREAM_CLIENT_PAIR_STATS_TQ_FIRST(&cs.pair_tq)
+    streams = list()
+    while ps:
+        obj = StreamClientPairStats.from_ptr(PTR(ps))
+        streams.append(obj)
+        ps = __STREAM_CLIENT_PAIR_STATS_NEXT(ps)
+    ret = cls(tx, drops, streams, dest, cs.is_regex, STR(cs.match), STR(cs.desc))
+    return ret
+StreamClientStats.from_ptr = classmethod(_from_ptr)
+del _from_ptr
+
+def stream_stats_level_set(lvl):
+    ldms_stream_stats_level_set(lvl)
+
+def stream_stats_level_get():
+    return ldms_stream_stats_level_get()
+
+def stream_stats_get(stream_match=None, is_regex=0, is_reset=0):
+    """Get a collection of stats of the streams in this process that match `stream_match`
+
+    stream_match(str) - the stream name or a regular expression
+    is_regex(int) - 1 if `stream_match` is a regular expression; otherwise, 0
+    """
+    cdef const char *m = NULL
+    cdef ldms_stream_stats_tq_s *tq
+    cdef ldms_stream_stats_s *s
+    if stream_match:
+        stream_match = BYTES(stream_match)
+        m = stream_match
+    tq = ldms_stream_stats_tq_get(m, is_regex, is_reset)
+    ret = list()
+    if not tq:
+        if errno == ENOENT:
+            return ret
+        else:
+            raise RuntimeError(f"ldms_stream_stats_tq_get error: {ERRNO_SYM(errno)}({errno})")
+    try:
+        s = __STREAM_STATS_TQ_FIRST(tq)
+        while s:
+            obj = StreamStats.from_ptr(PTR(s))
+            ret.append(obj)
+            s = __STREAM_STATS_NEXT(s)
+    except:
+        ldms_stream_stats_tq_free(tq)
+        raise
+    ldms_stream_stats_tq_free(tq)
+    return ret
+
+def stream_client_stats_get(is_reset=0):
+    """Get a collection of stats of stream clients in this process"""
+    cdef ldms_stream_client_stats_tq_s *tq
+    cdef ldms_stream_client_stats_s *cs
+    tq = ldms_stream_client_stats_tq_get(is_reset)
+    ret = list()
+    if not tq:
+        if errno == ENOENT:
+            return ret
+        else:
+            raise RuntimeError(f"ldms_stream_client_stats_tq_get error: {ERRNO_SYM(errno)}({errno})")
+    try:
+        cs = __STREAM_CLIENT_STATS_TQ_FIRST(tq)
+        while cs:
+            obj = StreamClientStats.from_ptr(PTR(cs))
+            ret.append(obj)
+            cs = __STREAM_CLIENT_STATS_NEXT(cs)
+    except:
+        ldms_stream_client_stats_tq_free(tq)
+        raise
+    ldms_stream_client_stats_tq_free(tq)
+    return ret
+
+cdef class StreamClient(object):
+    """StreamClient(match, is_regex, cb=None, cb_arg=None)
+
+    Arguments:
+    - match (str): The name of the stream, or a regular expression
+    - is_regex (int): 1 if `match` is a regular expression;
+                      0 otherwise, and the `match` is treated as an exact match
+                      to the stream name
+    - cb (callable): an optional callback function to deliver the stream data
+                        with the following signature
+                          `def cb(StreamClient client, StreamData data, object cb_arg)`
+    - cb_arg (object):  an optional application callback argument.
+    - desc (str): a short description of the client.
+    - sr_client (SchemaRegistryClient): a Confluent Kafka Client object,
+                                        required for processing AVRO_SER stream
+                                        data.
+    """
+
+    cdef ldms_stream_client_t c
+    cdef object cb  # optional application callback
+    cdef object cb_arg # optional application callback argument
+    cdef object data_q
+    cdef object sr_client
+
+    def __init__(self, match, is_regex, cb=None, cb_arg=None, desc=None,
+                 sr_client=None):
+        self.data_q = Queue()
+        self.cb = cb
+        self.cb_arg = cb_arg
+        self.sr_client = sr_client
+        if desc is None:
+            desc = ""
+        self.c = ldms_stream_subscribe(BYTES(match), is_regex,
+                                       __stream_client_cb, <void*>self,
+                                       CSTR(BYTES(desc)))
+        if not self.c:
+            raise RuntimeError(f"ldms_stream_subscribe() error, errno: {errno}")
+
+    def close(self):
+        if not self.c:
+            return
+        ldms_stream_close(self.c)
+        self.c = NULL
+
+    def get_data(self):
+        """Get the stream data (None if no data)"""
+        try:
+            return self.data_q.get_nowait()
+        except Empty as e:
+            return None
+
+    def stats(self, is_reset=0):
+        """Get the client stats"""
+        cdef ldms_stream_client_stats_s *cs;
+        if not self.c:
+            raise RuntimeError("client has been closed")
+        cs = ldms_stream_client_get_stats(self.c, is_reset)
+        if not cs:
+            raise RuntimeError(f"error: {ERRNO_SYM(errno)}({errno})")
+        try:
+            obj = StreamClientStats.from_ptr(PTR(cs))
+        except:
+            # cleanup before raising the error
+            ldms_stream_client_stats_free(cs)
+            raise
+        ldms_stream_client_stats_free(cs)
+        return obj
+
+
+cdef class ZapThrStat(object):
+    """Zap thread statistics information.
+
+    This is a zap_thrstat structure wrapper. To get statistics of all zap
+    threads, please call `ZapThrStat.get_result()` class method.
+    """
+    cdef readonly str      name
+    cdef readonly double   sample_count
+    cdef readonly double   sample_rate
+    cdef readonly double   utilization
+    cdef readonly int      pool_idx
+    cdef readonly uint64_t thread_id
+
+    def __cinit__(self, Ptr ptr):
+        cdef zap_thrstat_result_entry *e = <zap_thrstat_result_entry*>ptr.c_ptr
+        self.name         = STR(e.name)
+        self.sample_count = e.sample_count
+        self.sample_rate  = e.sample_rate
+        self.utilization  = e.utilization
+        self.pool_idx     = e.pool_idx
+        self.thread_id    = e.thread_id
+
+    @classmethod
+    def get_result(cls):
+        cdef int i
+        cdef zap_thrstat_result *r = zap_thrstat_get_result()
+        cdef list lst = list()
+        for i in range(0, r.count):
+            e = ZapThrStat(PTR(&r.entries[i]))
+            lst.append(e)
+        return lst
+
+    def as_list(self):
+        return (self.name, self.thread_id, self.pool_idx,
+                self.sample_count, self.sample_rate, self.utilization)
+
+    def as_dict(self):
+        keys = [ 'name', 'sample_count', 'sample_rate', 'utilization',
+                 'pool_idx', 'thread_id' ]
+        return { k : getattr(self, k) for k in keys }
+
+    def __str__(self):
+        return f"('{self.name}'" \
+               f", {hex(self.thread_id)}" \
+               f", {self.pool_idx}" \
+               f", {self.sample_count}" \
+               f", {self.sample_rate}" \
+               f", {self.utilization}" \
+               f")"
+
+    def __repr__(self):
+        return str(self)
+
+
+cdef class QGroup(object):
+    """QGroup - collection of methods to interact with the quota group
+
+    Application can use the pre-created object `qgroup` in this module to
+    interact with the LDMS quota group mechanism, e.g.
+    >>> from ovis_ldms import ldms
+    >>> ldms.qgroup.quota = 1000000000
+    >>> ldms.qgroup.ask_mark = 500000
+    >>> ldms.qgroup.ask_usec = 1500000
+    >>> ldms.qgroup.ask_amount = 500000
+    >>> ldms.qgroup.reset_usec = 1500000
+    >>> ldms.qgroup.start()
+    """
+
+    def __init__(self):
+        pass
+
+    def member_add(self, xprt, host, port=411, auth=None, auth_opts=None):
+        """Add a peer into the quota group"""
+        cdef int rc
+        cdef attr_value_list *avl = NULL
+        if auth is None:
+            auth = "none"
+        if auth_opts:
+            if type(auth_opts) != dict:
+                raise TypeError("auth_opts must be a dictionary")
+            avl = av_new(len(auth_opts))
+            for k, v in auth_opts.items():
+                rc = av_add(avl, BYTES(k), BYTES(v))
+                if rc:
+                    av_free(avl)
+                    raise OSError(rc, "av_add() error: {}"\
+                                  .format(ERRNO_SYM(rc)))
+        xprt = BYTES(xprt)
+        port = BYTES(port)
+        host = BYTES(host)
+        auth = BYTES(auth)
+        rc = ldms_qgroup_member_add(xprt, host, port, auth, avl)
+        av_free(avl)
+        if rc:
+            raise RuntimeError(f"ldms_qgroup_member_add() error: {ERRNO_SYM(rc)}")
+
+    @property
+    def cfg_quota(self):
+        cdef ldms_qgroup_cfg_s cfg
+        cfg = ldms_qgroup_cfg_get()
+        return cfg.quota
+
+    @cfg_quota.setter
+    def cfg_quota(self, long q):
+        cdef int rc
+        rc = ldms_qgroup_cfg_quota_set(q)
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    @property
+    def cfg_ask_mark(self):
+        cdef ldms_qgroup_cfg_s cfg
+        cfg = ldms_qgroup_cfg_get()
+        return cfg.ask_mark
+
+    @cfg_ask_mark.setter
+    def cfg_ask_mark(self, long v):
+        cdef int rc
+        rc = ldms_qgroup_cfg_ask_mark_set(v)
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    @property
+    def cfg_ask_amount(self):
+        cdef ldms_qgroup_cfg_s cfg
+        cfg = ldms_qgroup_cfg_get()
+        return cfg.ask_amount
+
+    @cfg_ask_amount.setter
+    def cfg_ask_amount(self, long v):
+        cdef int rc
+        rc = ldms_qgroup_cfg_ask_amount_set(v)
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    @property
+    def cfg_ask_usec(self):
+        cdef ldms_qgroup_cfg_s cfg
+        cfg = ldms_qgroup_cfg_get()
+        return cfg.ask_usec
+
+    @cfg_ask_usec.setter
+    def cfg_ask_usec(self, long v):
+        cdef int rc
+        rc = ldms_qgroup_cfg_ask_usec_set(v)
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    @property
+    def cfg_reset_usec(self):
+        cdef ldms_qgroup_cfg_s cfg
+        cfg = ldms_qgroup_cfg_get()
+        return cfg.reset_usec
+
+    @cfg_reset_usec.setter
+    def cfg_reset_usec(self, long v):
+        cdef int rc
+        rc = ldms_qgroup_cfg_reset_usec_set(v)
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    def start(self):
+        cdef int rc
+        rc = ldms_qgroup_start()
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    def stop(self):
+        cdef int rc
+        rc = ldms_qgroup_stop()
+        if rc:
+            raise RuntimeError(f"Error {ERRNO_SYM(rc)}")
+
+    @property
+    def quota_probe(self):
+        return ldms_qgroup_quota_probe()
+
+    def __del__(self):
+        pass
+
+qgroup = QGroup()
+
+LOG_LEVEL_MAP = {
+        "LDEFAULT":  LDEFAULT,
+        "LQUIET":    LQUIET,
+        "LDEBUG":    LDEBUG,
+        "LINFO":     LINFO,
+        "LWARN":     LWARN,
+        "LWARNING":  LWARNING,
+        "LERROR":    LERROR,
+        "LCRITICAL": LCRITICAL,
+        "LCRIT":     LCRIT,
+
+        "DEFAULT":  LDEFAULT,
+        "QUIET":    LQUIET,
+        "DEBUG":    LDEBUG,
+        "INFO":     LINFO,
+        "WARN":     LWARN,
+        "WARNING":  LWARNING,
+        "ERROR":    LERROR,
+        "CRITICAL": LCRITICAL,
+        "CRIT":     LCRIT,
+        }
+
+def ovis_log_set_level_by_name(str subsys_name, level):
+    """ovis_log_set_level_by_name(str subsys_name, level)"""
+    if type(level) is str:
+        level = LOG_LEVEL_MAP[level.upper()]
+    ldms.ovis_log_set_level_by_name(CSTR(BYTES(subsys_name)), level)

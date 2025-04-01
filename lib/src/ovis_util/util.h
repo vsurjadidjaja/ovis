@@ -194,6 +194,42 @@ int av_check_expansion(printf_t log, const char *name, const char *value);
 size_t ovis_get_mem_size(const char *s);
 
 /**
+ * \brief Convert a time-interval string to microseconds
+ *
+ * A time-interval string is an integer followed by a unit string.
+ * A unit string is one of the following:
+ *
+ *   'us'       - microseconds
+ *   'ms'       - milliseconds
+ *   's'        - seconds
+ *   'm'        - minutes
+ *   'h'        - hours
+ *   'd'        - days
+ *
+ * If no unit string is given, the default unit is microseconds.
+ *
+ * \param s  a string to be converted. The valid format is <time><unit>.
+ * \oaram v  a resulting integer in microseconds.
+ *
+ * \return 0 on success. Otherwise, an errno is returned.
+ */
+int ovis_time_str2us(const char *s, long *v);
+
+/**
+ * \brief Converts time in microseconds to a human-readable string format.
+ *
+ * This function takes a time value in microseconds and converts it to a
+ * human-readable string format. The output string represents the time in
+ * one of the following units seconds (s), milliseconds (ms), minutes (m),
+ * hours (h), days (d), and microseconds (µs).
+ *
+ * \param time_us   The input time value in microseconds.
+ * \param output    A pointer to the buffer where the output string will be stored.
+ * \param output_sz The size of the output buffer.
+ */
+void ovis_time_us2str(long time_us, char *output, size_t output_sz);
+
+/**
  * \brief Fork and exec the given command with /bin/sh.
  *
  * This function call will fork and execute the given command with bash. It is
@@ -401,5 +437,60 @@ ovis_pgrep_array_t ovis_pgrep(const char *text);
  * \brief Free the \c array created by \c ovis_pgrep().
  */
 void ovis_pgrep_free(ovis_pgrep_array_t array);
+
+typedef struct ovis_buff_entry_s {
+	TAILQ_ENTRY(ovis_buff_entry_s) entry;
+	size_t buff_len;
+	size_t avail_len;
+	off_t  off;
+	char buff[OVIS_FLEX];
+} *ovis_buff_entry_t;
+TAILQ_HEAD(ovis_buff_entry_tq_s, ovis_buff_entry_s);
+
+typedef struct ovis_buff_s {
+	struct ovis_buff_entry_tq_s tq;
+	int grain;
+} *ovis_buff_t;
+
+/**
+ * Create a new ovis_buff object.
+ *
+ * \param grain The buffer is allocated in the multiples of grain.
+ */
+ovis_buff_t ovis_buff_new(size_t grain);
+
+/**
+ * Free the buffer object.
+ */
+void ovis_buff_free(ovis_buff_t buff);
+
+/**
+ * Initialize the ovis buffer structure.
+ */
+void ovis_buff_init(struct ovis_buff_s *buff, size_t grain);
+
+/**
+ * Purge the buffer contents, but does not free the \c buff.
+ */
+void ovis_buff_purge(struct ovis_buff_s *buff);
+
+/**
+ * Append \c buff with Formatted print (\c printf()).
+ *
+ * \retval 0      Success.
+ * \retval ENOMEM Cannot allocate more memory.
+ */
+__attribute__((format(printf, 2, 3)))
+int ovis_buff_appendf(ovis_buff_t buff, const char *fmt, ...);
+
+/**
+ * Get a copy of the string value of \c buff.
+ *
+ * \retval str  If succeeded.
+ * \retval NULL If error. \c errno is set to describe the error.
+ *
+ * \remarks The caller is responsible to free the returned string.
+ */
+char *ovis_buff_str(ovis_buff_t buff);
 
 #endif /* OVIS_UTIL_H_ */

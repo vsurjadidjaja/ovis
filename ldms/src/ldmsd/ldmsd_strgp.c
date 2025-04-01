@@ -59,8 +59,10 @@
 #include <ovis_util/util.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldms_xprt.h"
 #include "config.h"
+
+/* Defined in ldmsd.c */
+extern ovis_log_t store_log;
 
 void ldmsd_strgp___del(ldmsd_cfgobj_t obj)
 {
@@ -72,6 +74,7 @@ void ldmsd_strgp___del(ldmsd_cfgobj_t obj)
 		free(strgp->container);
 	if (strgp->metric_arry)
 		free(strgp->metric_arry);
+	free(strgp->regex_s);
 
 	struct ldmsd_strgp_metric *metric;
 	while (!TAILQ_EMPTY(&strgp->metric_list) ) {
@@ -90,10 +93,8 @@ void ldmsd_strgp___del(ldmsd_cfgobj_t obj)
 		LIST_REMOVE(match, entry);
 		free(match);
 	}
-	if (strgp->plugin_name)
-		free(strgp->plugin_name);
-	if (strgp->decomp_name)
-		free(strgp->decomp_name);
+	if (strgp->decomp_path)
+		free(strgp->decomp_path);
 	free(strgp->digest);
 	ldmsd_cfgobj___del(obj);
 }
@@ -175,47 +176,43 @@ out:
 	return rc;
 }
 
-static void strgp_decompose(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
+static void strgp_decompose(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set, void **ctxt)
 {
 	struct ldmsd_row_list_s row_list = TAILQ_HEAD_INITIALIZER(row_list);
 	int row_count, rc;
-	rc = strgp->decomp->decompose(strgp, prd_set->set, &row_list, &row_count);
+	rc = strgp->decomp->decompose(strgp, prd_set->set, &row_list, &row_count, ctxt);
 	if (rc) {
-		ldmsd_log(LDMSD_LERROR, "strgp decompose error: %d\n", rc);
+		ovis_log(store_log, OVIS_LERROR, "strgp decompose error: %d\n", rc);
 		return;
 	}
-	rc = strgp->store->commit(strgp, prd_set->set, &row_list, row_count);
+	rc = strgp->store->api->commit(strgp, prd_set->set, &row_list, row_count);
 	if (rc) {
-		ldmsd_log(LDMSD_LERROR, "strgp row commit error: %d\n", rc);
+		ovis_log(store_log, OVIS_LERROR, "strgp row commit error: %d\n", rc);
 	}
 	strgp->decomp->release_rows(strgp, &row_list);
 }
 
 /* protected by strgp lock */
-static void strgp_update_fn(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
+static void strgp_update_fn(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set, void **ctxt)
 {
 	if (strgp->state != LDMSD_STRGP_STATE_RUNNING)
 		return;
-	if (!strgp->decomp_name)
-		goto store_routine;
 
-	/* decomp() interface routine */
-	if (!strgp->decomp) {
-		strgp->state = LDMSD_STRGP_STATE_STOPPED;
+	if (strgp->decomp_path) {
+		if (!strgp->decomp) {
+			strgp->state = LDMSD_STRGP_STATE_STOPPED;
+			return;
+		}
+		strgp_decompose(strgp, prd_set, ctxt);
 		return;
 	}
-	strgp_decompose(strgp, prd_set);
-	goto out;
 
-	/* store() interface routine */
- store_routine:
 	if (!strgp->store_handle) {
 		strgp->state = LDMSD_STRGP_STATE_STOPPED;
 		return;
 	}
-	strgp->store->store(strgp->store_handle, prd_set->set,
+	strgp->store->api->store(strgp->store_handle, prd_set->set,
 			    strgp->metric_arry, strgp->metric_count);
- out:
 	if (strgp->flush_interval.tv_sec || strgp->flush_interval.tv_nsec) {
 		struct timespec expiry;
 		struct timespec now;
@@ -223,7 +220,7 @@ static void strgp_update_fn(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 		clock_gettime(CLOCK_REALTIME, &now);
 		if (ldmsd_timespec_cmp(&now, &expiry) >= 0) {
 			clock_gettime(CLOCK_REALTIME, &strgp->last_flush);
-			strgp->store->flush(strgp->store_handle);
+			strgp->store->api->flush(strgp->store_handle);
 		}
 	}
 }
@@ -249,6 +246,9 @@ ldmsd_strgp_new_with_auth(const char *name, uid_t uid, gid_t gid, int perm)
 	LIST_INIT(&strgp->prdcr_list);
 	TAILQ_INIT(&strgp->metric_list);
 	ldmsd_task_init(&strgp->task);
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&strgp->obj.ref, strgp->obj.name, stderr);
+#endif
 	ldmsd_cfgobj_unlock(&strgp->obj);
 	return strgp;
 }
@@ -363,7 +363,7 @@ out_2:
 	free(match);
 out_1:
 	ldmsd_strgp_unlock(strgp);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
@@ -394,7 +394,7 @@ int ldmsd_strgp_prdcr_del(const char *strgp_name, const char *regex_str,
 	free(match);
 out_1:
 	ldmsd_strgp_unlock(strgp);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
@@ -449,7 +449,7 @@ int ldmsd_strgp_metric_add(const char *strgp_name, const char *metric_name,
 	TAILQ_INSERT_TAIL(&strgp->metric_list, metric, entry);
 out_1:
 	ldmsd_strgp_unlock(strgp);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
@@ -478,7 +478,7 @@ int ldmsd_strgp_metric_del(const char *strgp_name, const char *metric_name,
 	free(metric);
 out_1:
 	ldmsd_strgp_unlock(strgp);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
@@ -486,7 +486,7 @@ static ldmsd_strgp_ref_t strgp_ref_new(ldmsd_strgp_t strgp)
 {
 	ldmsd_strgp_ref_t ref = calloc(1, sizeof *ref);
 	if (ref)
-		ref->strgp = ldmsd_strgp_get(strgp);
+		ref->strgp = ldmsd_strgp_get(strgp, "prdset_strgp_ref");
 	return ref;
 }
 
@@ -517,18 +517,12 @@ static int strgp_open(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 	int i, idx, rc;
 	const char *name;
 	ldmsd_strgp_metric_t metric;
-	struct ldmsd_plugin_cfg *store;
 	int alloc_digest = 0;
 
 	if (!prd_set->set)
 		return ENOENT;
 
-	if (!strgp->store) {
-		store = ldmsd_get_plugin(strgp->plugin_name);
-		if (!store)
-			return ENOENT;
-		strgp->store = store->store;
-	}
+	assert(strgp->store);
 	/* Build metric list from the schema in the producer set */
 	strgp->metric_count = 0;
 	strgp->metric_arry = calloc(ldms_set_card_get(prd_set->set), sizeof(int));
@@ -554,7 +548,7 @@ static int strgp_open(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 		 * the schema of the same digest.
 		 */
 		if (0 != ldms_digest_cmp(strgp->digest, ldms_set_digest_get(prd_set->set))) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(store_log, OVIS_LERROR,
 				  "strgp '%s' ignores set '%s' because "
 				  "the metric lists are mismatched.\n",
 				  strgp->obj.name, prd_set->inst_name);
@@ -603,22 +597,6 @@ err:
 	return rc;
 }
 
-/* protected by strgp lock */
-int strgp_decomp_init(ldmsd_strgp_t strgp, ldmsd_req_ctxt_t reqc)
-{
-
-	if (!strgp->store) {
-		/* load store */
-		struct ldmsd_plugin_cfg *store;
-		store = ldmsd_get_plugin(strgp->plugin_name);
-		if (!store)
-			return ENOENT;
-		strgp->store = store->store;
-	}
-	assert(!strgp->decomp);
-	return ldmsd_decomp_config(strgp, strgp->decomp_name, reqc);
-}
-
 /** Must be called with the producer set lock and the strgp config lock held and in this order*/
 int ldmsd_strgp_update_prdcr_set(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 {
@@ -640,7 +618,7 @@ int ldmsd_strgp_update_prdcr_set(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 	case LDMSD_STRGP_STATE_STOPPED:
 		if (ref) {
 			LIST_REMOVE(ref, entry);
-			ldmsd_strgp_put(ref->strgp);
+			ldmsd_strgp_put(ref->strgp, "prdset_strgp_ref");
 			ref->strgp = NULL;
 			free(ref);
 		}
@@ -648,25 +626,20 @@ int ldmsd_strgp_update_prdcr_set(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 	case LDMSD_STRGP_STATE_RUNNING:
 		rc = EEXIST;
 		if (ref)
+			/* strgp has already been initialized for this producer set */
 			break;
-		if (strgp->decomp_name) {
-			if (!strgp->decomp) {
-				rc = strgp_decomp_init(strgp, NULL);
-				if (rc)
-					break;
-			}
-		} else {
+		if (!strgp->decomp_path) {
 			/* legacy store path */
 			if (strgp->digest) {
 				/*
-				 * The strgp has cached a digest and been restarted.
-				 */
+					* The strgp has cached a digest and been restarted.
+					*/
 				if (0 != ldms_digest_cmp(strgp->digest,
 						ldms_set_digest_get(prd_set->set))) {
-					ldmsd_log(LDMSD_LERROR,
-						  "strgp '%s' ignores set '%s' because "
-						  "the metric lists are mismatched.\n",
-						  strgp->obj.name, prd_set->inst_name);
+					ovis_log(store_log, OVIS_LERROR,
+							"strgp '%s' ignores set '%s' because "
+							"the metric lists are mismatched.\n",
+							strgp->obj.name, prd_set->inst_name);
 					break;
 				}
 			}
@@ -681,6 +654,7 @@ int ldmsd_strgp_update_prdcr_set(ldmsd_strgp_t strgp, ldmsd_prdcr_set_t prd_set)
 		if (!ref)
 			break;
 		LIST_INSERT_HEAD(&prd_set->strgp_list, ref, entry);
+		__atomic_fetch_add(&strgp->prdset_cnt, 1, __ATOMIC_SEQ_CST);
 		rc = 0;
 		break;
 	default:
@@ -747,7 +721,7 @@ int ldmsd_strgp_start(const char *name, ldmsd_sec_ctxt_t ctxt)
 		return ENOENT;
 	}
 	rc = __ldmsd_strgp_start(strgp, ctxt);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
@@ -769,6 +743,9 @@ int __ldmsd_strgp_stop(ldmsd_strgp_t strgp, ldmsd_sec_ctxt_t ctxt)
 	strgp->obj.perm &= ~LDMSD_PERM_DSTART;
 	ldmsd_prdcr_update(strgp);
 out:
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&strgp->obj.ref, strgp->obj.name, stderr);
+#endif
 	ldmsd_strgp_unlock(strgp);
 	return rc;
 }
@@ -780,27 +757,24 @@ int ldmsd_strgp_stop(const char *strgp_name, ldmsd_sec_ctxt_t ctxt)
 	if (!strgp)
 		return ENOENT;
 	rc = __ldmsd_strgp_stop(strgp, ctxt);
-	ldmsd_strgp_put(strgp);
+	ldmsd_strgp_put(strgp, "find");
 	return rc;
 }
 
 extern struct rbt *cfgobj_trees[];
-extern pthread_mutex_t *cfgobj_locks[];
 ldmsd_cfgobj_t __cfgobj_find(const char *name, ldmsd_cfgobj_type_t type);
 
 int ldmsd_strgp_del(const char *strgp_name, ldmsd_sec_ctxt_t ctxt)
 {
 	int rc = 0;
 	ldmsd_strgp_t strgp;
-	struct ldmsd_plugin_cfg *pi;
 
-	pthread_mutex_lock(cfgobj_locks[LDMSD_CFGOBJ_STRGP]);
+	ldmsd_cfg_lock(LDMSD_CFGOBJ_STRGP);
 	strgp = (ldmsd_strgp_t)__cfgobj_find(strgp_name, LDMSD_CFGOBJ_STRGP);
 	if (!strgp) {
 		rc = ENOENT;
 		goto out_0;
 	}
-
 	ldmsd_strgp_lock(strgp);
 	rc = ldmsd_cfgobj_access_check(&strgp->obj, 0222, ctxt);
 	if (rc)
@@ -809,29 +783,27 @@ int ldmsd_strgp_del(const char *strgp_name, ldmsd_sec_ctxt_t ctxt)
 		rc = EBUSY;
 		goto out_1;
 	}
-	if (ldmsd_cfgobj_refcount(&strgp->obj) > 2) {
+	/*
+	 * Check that we only have 'find', 'cfgobj_tree', and 'init'
+	 * references remaining.
+	 */
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&strgp->obj.ref, strgp->obj.name, stderr);
+#endif
+	if (ldmsd_cfgobj_refcount(&strgp->obj) > 3) {
 		rc = EBUSY;
 		goto out_1;
 	}
-
-	/* Put back the reference taken when linking the plugin to the strgp. */
-	pi = strgp->store->base.pi;
-	__atomic_sub_fetch(&pi->ref_count, 1, __ATOMIC_SEQ_CST);
-
-	rbt_del(cfgobj_trees[LDMSD_CFGOBJ_STRGP], &strgp->obj.rbn);
-	ldmsd_strgp_put(strgp); /* tree reference */
-
-	if (strgp->decomp) {
+	if (strgp->decomp)
 		strgp->decomp->release_decomp(strgp);
-	}
-
-	/* let through */
+	rbt_del(cfgobj_trees[LDMSD_CFGOBJ_STRGP], &strgp->obj.rbn);
+	ldmsd_cfgobj_put(&strgp->obj, "cfgobj_tree"); /* tree reference */
+	ldmsd_cfgobj_put(&strgp->obj, "init");	      /* create reference */
 out_1:
 	ldmsd_strgp_unlock(strgp);
 out_0:
-	pthread_mutex_unlock(cfgobj_locks[LDMSD_CFGOBJ_STRGP]);
-	if (strgp)
-		ldmsd_strgp_put(strgp); /* `find` reference */
+	ldmsd_cfg_unlock(LDMSD_CFGOBJ_STRGP);
+	ldmsd_strgp_put(strgp, "find"); /* __cfgobj_find reference */
 	return rc;
 }
 

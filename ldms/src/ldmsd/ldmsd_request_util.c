@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2017-2018 National Technology & Engineering Solutions
+ * Copyright (c) 2017-2018,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2017-2018 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2017-2018,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -61,14 +61,27 @@ struct req_str_id {
 	uint32_t id;
 };
 
-const struct req_str_id req_str_id_table[] = {
+struct req_str_id req_str_id_table[] = {
 	/* This table need to be sorted by keyword for bsearch() */
+	{  "advertiser_add",      LDMSD_ADVERTISER_ADD_REQ  },
+	{  "advertiser_del",      LDMSD_ADVERTISER_DEL_REQ  },
+	{  "advertiser_start",    LDMSD_ADVERTISER_START_REQ  },
+	{  "advertiser_stop",     LDMSD_ADVERTISER_STOP_REQ  },
 	{  "auth_add",           LDMSD_AUTH_ADD_REQ  },
 	{  "auth_del",           LDMSD_AUTH_DEL_REQ  },
+	{  "banner",             LDMSD_BANNER_MODE_REQ  },
+	{  "bridge_add",         LDMSD_BRIDGE_ADD_REQ },
+	{  "bridge_del",         LDMSD_PRDCR_DEL_REQ },
+	{  "bridge_start",       LDMSD_PRDCR_START_REQ },
+	{  "bridge_stop",        LDMSD_PRDCR_STOP_REQ },
 	{  "config",             LDMSD_PLUGN_CONFIG_REQ  },
 	{  "daemon",             LDMSD_DAEMON_STATUS_REQ  },
 	{  "daemon_exit",        LDMSD_EXIT_DAEMON_REQ  },
+	{  "daemon_name",        LDMSD_DAEMON_NAME_SET_REQ  },
 	{  "daemon_status",      LDMSD_DAEMON_STATUS_REQ  },
+	{  "default_auth",       LDMSD_DEFAULT_AUTH_REQ  },
+	{  "default_quota",      LDMSD_DEFAULT_QUOTA_REQ  },
+	{  "dump_cfg",           LDMSD_DUMP_CFG_REQ },
 	{  "env",                LDMSD_ENV_REQ  },
 	{  "exit",               LDMSD_EXIT_DAEMON_REQ  },
 	{  "failover_config",    LDMSD_FAILOVER_CONFIG_REQ  },
@@ -81,16 +94,25 @@ const struct req_str_id req_str_id_table[] = {
 	{  "include",            LDMSD_INCLUDE_REQ  },
 	{  "listen",             LDMSD_LISTEN_REQ },
 	{  "load",               LDMSD_PLUGN_LOAD_REQ  },
-	{  "loglevel",           LDMSD_VERBOSE_REQ  },
+	{  "log_file",           LDMSD_LOG_FILE_REQ  },
+	{  "log_level",          LDMSD_VERBOSE_REQ  },
+	{  "log_status",         LDMSD_LOG_STATUS_REQ  },
+	{  "loglevel",           LDMSD_VERBOSE_REQ  }, /* It is being deprecated. */
 	{  "logrotate",          LDMSD_LOGROTATE_REQ  },
+	{  "memory",             LDMSD_MEMORY_REQ  },
 	{  "metric_sets_default_authz", LDMSD_SET_DEFAULT_AUTHZ_REQ  },
 	{  "oneshot",            LDMSD_ONESHOT_REQ  },
 	{  "option",             LDMSD_CMDLINE_OPTIONS_SET_REQ  },
+	{  "pid_file",           LDMSD_PID_FILE_REQ  },
 	{  "plugn_sets",         LDMSD_PLUGN_SETS_REQ  },
 	{  "plugn_status",       LDMSD_PLUGN_STATUS_REQ  },
 	{  "prdcr_add",          LDMSD_PRDCR_ADD_REQ  },
 	{  "prdcr_del",          LDMSD_PRDCR_DEL_REQ  },
 	{  "prdcr_hint_tree",    LDMSD_PRDCR_HINT_TREE_REQ  },
+	{  "prdcr_listen_add",   LDMSD_PRDCR_LISTEN_ADD_REQ  },
+	{  "prdcr_listen_del",   LDMSD_PRDCR_LISTEN_DEL_REQ  },
+	{  "prdcr_listen_start", LDMSD_PRDCR_LISTEN_START_REQ  },
+	{  "prdcr_listen_stop",  LDMSD_PRDCR_LISTEN_STOP_REQ  },
 	{  "prdcr_set_status",   LDMSD_PRDCR_SET_REQ  },
 	{  "prdcr_start",        LDMSD_PRDCR_START_REQ  },
 	{  "prdcr_start_regex",  LDMSD_PRDCR_START_REGEX_REQ  },
@@ -101,7 +123,15 @@ const struct req_str_id req_str_id_table[] = {
 	{  "prdcr_stream_status",LDMSD_PRDCR_STREAM_STATUS_REQ  },
 	{  "prdcr_subscribe",    LDMSD_PRDCR_SUBSCRIBE_REQ },
 	{  "prdcr_unsubscribe",  LDMSD_PRDCR_UNSUBSCRIBE_REQ },
-	{  "set_route",          LDMSD_SET_ROUTE_REQ  },
+	{  "profiling",          LDMSD_PROFILING_REQ },
+	{  "publish_kernel",     LDMSD_PUBLISH_KERNEL_REQ  },
+	{  "qgroup_config",      LDMSD_QGROUP_CONFIG_REQ },
+	{  "qgroup_info",        LDMSD_QGROUP_INFO_REQ },
+	{  "qgroup_member_add",  LDMSD_QGROUP_MEMBER_ADD_REQ  },
+	{  "qgroup_member_del",  LDMSD_QGROUP_MEMBER_DEL_REQ },
+	{  "qgroup_start",       LDMSD_QGROUP_START_REQ },
+	{  "qgroup_stop",        LDMSD_QGROUP_STOP_REQ },
+	{  "set_memory",         LDMSD_MEMORY_REQ },
 	{  "set_sec_mod",        LDMSD_SET_SEC_MOD_REQ  },
 	{  "set_stats",          LDMSD_SET_STATS_REQ  },
 	{  "setgroup_add",       LDMSD_SETGROUP_ADD_REQ  },
@@ -138,30 +168,43 @@ const struct req_str_id req_str_id_table[] = {
 	{  "updtr_status",       LDMSD_UPDTR_STATUS_REQ  },
 	{  "updtr_stop",         LDMSD_UPDTR_STOP_REQ  },
 	{  "updtr_task",         LDMSD_UPDTR_TASK_REQ  },
-	{  "usage",              LDMSD_PLUGN_LIST_REQ  },
+	{  "usage",              LDMSD_PLUGN_USAGE_REQ  },
 	{  "version",            LDMSD_VERSION_REQ  },
+	{  "worker_threads",     LDMSD_WORKER_THR_SET_REQ  },
 	{  "xprt_stats",         LDMSD_XPRT_STATS_REQ  },
 };
 
 /* This table need to be sorted by keyword for bsearch() */
-const struct req_str_id attr_str_id_table[] = {
+struct req_str_id attr_str_id_table[] = {
+	{  "advertiser_auth",   LDMSD_ATTR_AUTH  },
+	{  "advertiser_port",   LDMSD_ATTR_PORT  },
+	{  "advertiser_xprt",   LDMSD_ATTR_XPRT  },
+	{  "ask_amount",        LDMSD_ATTR_ASK_AMOUNT },
+	{  "ask_interval",      LDMSD_ATTR_ASK_INTERVAL },
+	{  "ask_mark",          LDMSD_ATTR_ASK_MARK },
 	{  "auth",              LDMSD_ATTR_AUTH  },
 	{  "auto_interval",     LDMSD_ATTR_AUTO_INTERVAL  },
 	{  "auto_switch",       LDMSD_ATTR_AUTO_SWITCH  },
 	{  "base",              LDMSD_ATTR_BASE  },
+	{  "cache_ip",          LDMSD_ATTR_IP  },
 	{  "container",         LDMSD_ATTR_CONTAINER  },
 	{  "decomposition",     LDMSD_ATTR_DECOMP  },
-	{  "flush",		LDMSD_ATTR_INTERVAL },
+	{  "disable_start",     LDMSD_ATTR_AUTO_INTERVAL  },
+	{  "exclusive_thread",  LDMSD_ATTR_XTHREAD  },
+	{  "flush",             LDMSD_ATTR_INTERVAL },
 	{  "gid",               LDMSD_ATTR_GID  },
 	{  "host",              LDMSD_ATTR_HOST  },
 	{  "incr",              LDMSD_ATTR_INCREMENT  },
 	{  "instance",          LDMSD_ATTR_INSTANCE  },
 	{  "interval",          LDMSD_ATTR_INTERVAL  },
 	{  "interval_us",       LDMSD_ATTR_INTERVAL  },
+	{  "ip",                LDMSD_ATTR_IP  },
 	{  "level",             LDMSD_ATTR_LEVEL  },
 	{  "match",             LDMSD_ATTR_MATCH  },
 	{  "metric",            LDMSD_ATTR_METRIC  },
+	{  "mode",              LDMSD_ATTR_LEVEL  },
 	{  "name",              LDMSD_ATTR_NAME  },
+	{  "num",               LDMSD_ATTR_SIZE  },
 	{  "offset",            LDMSD_ATTR_OFFSET  },
 	{  "path",              LDMSD_ATTR_PATH  },
 	{  "peer_name",         LDMSD_ATTR_PEER_NAME },
@@ -170,10 +213,18 @@ const struct req_str_id attr_str_id_table[] = {
 	{  "port",              LDMSD_ATTR_PORT  },
 	{  "producer",          LDMSD_ATTR_PRODUCER  },
 	{  "push",              LDMSD_ATTR_PUSH  },
+	{  "quota",             LDMSD_ATTR_QUOTA  },
+	{  "rail",              LDMSD_ATTR_RAIL  },
+	{  "reconnect",         LDMSD_ATTR_INTERVAL  },
 	{  "regex",             LDMSD_ATTR_REGEX  },
+	{  "reset",             LDMSD_ATTR_RESET  },
+	{  "reset_interval",    LDMSD_ATTR_RESET_INTERVAL },
+	{  "rx_rate",           LDMSD_ATTR_RX_RATE  },
 	{  "schema",            LDMSD_ATTR_SCHEMA  },
+	{  "size",              LDMSD_ATTR_SIZE  },
 	{  "stream",            LDMSD_ATTR_STREAM  },
 	{  "string",            LDMSD_ATTR_STRING  },
+	{  "summary",           LDMSD_ATTR_SUMMARY  },
 	{  "test",              LDMSD_ATTR_TEST  },
 	{  "time",              LDMSD_ATTR_TIME  },
 	{  "timeout_factor",    LDMSD_ATTR_TIMEOUT_FACTOR  },
@@ -215,6 +266,7 @@ const char *ldmsd_req_id2str(enum ldmsd_request req_id)
 	switch (req_id) {
 	case LDMSD_EXAMPLE_REQ  : return "EXAMPLE_REQ";
 	case LDMSD_GREETING_REQ : return "GREETING_REQ";
+	case LDMSD_DUMP_CFG_REQ : return "DUMP_CFG_REQ";
 
 	case LDMSD_PRDCR_ADD_REQ         : return "PRDCR_ADD_REQ";
 	case LDMSD_PRDCR_DEL_REQ         : return "PRDCR_DEL_REQ";
@@ -227,6 +279,7 @@ const char *ldmsd_req_id2str(enum ldmsd_request req_id)
 	case LDMSD_PRDCR_HINT_TREE_REQ   : return "PRDCR_HINT_TREE_REQ";
 	case LDMSD_PRDCR_SUBSCRIBE_REQ   : return "PRDCR_SUBSCRIBE_REQ";
 	case LDMSD_PRDCR_UNSUBSCRIBE_REQ : return "PRDCR_UNSUBSCRIBE_REQ";
+	case LDMSD_PRDCR_LISTEN_ADD_REQ      : return "PRDCR_LISTEN_REQ";
 
 	case LDMSD_STRGP_ADD_REQ        : return "STRGP_ADD_REQ";
 	case LDMSD_STRGP_DEL_REQ        : return "STRGP_DEL_REQ";
@@ -263,7 +316,7 @@ const char *ldmsd_req_id2str(enum ldmsd_request req_id)
 	case LDMSD_PLUGN_LOAD_REQ   : return "PLUGN_LOAD_REQ";
 	case LDMSD_PLUGN_TERM_REQ   : return "PLUGN_TERM_REQ";
 	case LDMSD_PLUGN_CONFIG_REQ : return "PLUGN_CONFIG_REQ";
-	case LDMSD_PLUGN_LIST_REQ   : return "PLUGN_LIST_REQ";
+	case LDMSD_PLUGN_USAGE_REQ   : return "PLUGN_USAGE_REQ";
 	case LDMSD_PLUGN_SETS_REQ   : return "PLUGN_SETS_REQ";
 
 	case LDMSD_SET_UDATA_REQ         : return "SET_UDATA_REQ";
@@ -277,8 +330,10 @@ const char *ldmsd_req_id2str(enum ldmsd_request req_id)
 	case LDMSD_LOGROTATE_REQ         : return "LOGROTATE_REQ";
 	case LDMSD_EXIT_DAEMON_REQ       : return "EXIT_DAEMON_REQ";
 	case LDMSD_RECORD_LEN_ADVICE_REQ : return "RECORD_LEN_ADVICE_REQ";
-	case LDMSD_SET_ROUTE_REQ         : return "SET_ROUTE_REQ";
 	case LDMSD_CMDLINE_OPTIONS_SET_REQ : return "CMDLINE_OPTION_SET_REQ";
+	case LDMSD_SET_SEC_MOD_REQ       : return "SET_SEC_REQ";
+	case LDMSD_LOG_STATUS_REQ        : return "LOG_STATUS_REQ";
+	case LDMSD_PROFILING_REQ         : return "PROFILING_REQ";
 
 	/* failover requests by user */
 	case LDMSD_FAILOVER_CONFIG_REQ        : return "FAILOVER_CONFIG_REQ";
@@ -328,8 +383,7 @@ const char *ldmsd_req_id2str(enum ldmsd_request req_id)
  * \c request_sz, ENOMEM is returned.
  */
 static int add_attr_from_attr_str(const char *name, const char *value,
-				  ldmsd_req_hdr_t *request, size_t *_req_sz,
-				  ldmsd_msg_log_f msglog)
+				  ldmsd_req_hdr_t *request, size_t *_req_sz)
 {
 	ldmsd_req_attr_t attr;
 	size_t attr_sz, val_sz;
@@ -358,7 +412,7 @@ static int add_attr_from_attr_str(const char *name, const char *value,
 	while (req_sz - req->rec_len < attr_sz) {
 		char *tmp = realloc(buf, req_sz * 2);
 		if (!tmp) {
-			msglog(LDMSD_LERROR, "Out of memory\n", name);
+			ovis_log(NULL, OVIS_LCRITICAL, "Out of memory\n");
 			return ENOMEM;
 		}
 		buf = tmp;
@@ -376,7 +430,7 @@ static int add_attr_from_attr_str(const char *name, const char *value,
 		} else {
 			attr->attr_id = ldmsd_req_attr_str2id(name);
 			if ((int)attr->attr_id < 0) {
-				msglog(LDMSD_LERROR, "Invalid attribute: %s\n", name);
+				ovis_log(NULL, OVIS_LERROR, "Invalid attribute: %s\n", name);
 				return EINVAL;
 			}
 		}
@@ -421,7 +475,6 @@ struct ldmsd_parse_ctxt {
 	char *av;
 	int line_no;
 	uint32_t msg_no;
-	ldmsd_msg_log_f msglog;
 };
 
 #define LDMSD_REQ_ARRAY_CARD_INIT 5
@@ -447,8 +500,7 @@ int __ldmsd_parse_generic(struct ldmsd_parse_ctxt *ctxt)
 		}
 		rc = add_attr_from_attr_str(name, value,
 					    &ctxt->request,
-					    &ctxt->request_sz,
-					    ctxt->msglog);
+					    &ctxt->request_sz);
 		if (rc)
 			goto out;
 		av = strtok_r(NULL, __ldmsd_cfg_delim, &ptr);
@@ -494,8 +546,7 @@ int __ldmsd_parse_plugin_config(struct ldmsd_parse_ctxt *ctxt)
 			/* Find the name attribute */
 			rc = add_attr_from_attr_str(name, value,
 						    &ctxt->request,
-						    &ctxt->request_sz,
-						    ctxt->msglog);
+						    &ctxt->request_sz);
 			if (rc)
 				goto out;
 		} else {
@@ -516,8 +567,7 @@ int __ldmsd_parse_plugin_config(struct ldmsd_parse_ctxt *ctxt)
 	/* Add an attribute of type 'STRING' */
 	rc = add_attr_from_attr_str(NULL, tmp,
 				    &ctxt->request,
-				    &ctxt->request_sz,
-				    ctxt->msglog);
+				    &ctxt->request_sz);
 out:
 	if (tmp)
 		free(tmp);
@@ -569,8 +619,7 @@ int __ldmsd_parse_env(struct ldmsd_parse_ctxt *ctxt)
 	/* Add an attribute of type 'STRING' */
 	rc = add_attr_from_attr_str(NULL, tmp,
 				    &ctxt->request,
-				    &ctxt->request_sz,
-				    ctxt->msglog);
+				    &ctxt->request_sz);
 out:
 	if (tmp)
 		free(tmp);
@@ -588,12 +637,13 @@ int __parse_xprt_endpoint(struct ldmsd_parse_ctxt *ctxt,
 	if ((0 == strncmp(name, "xprt", 4)) ||
 		(0 == strncmp(name, "port", 4)) ||
 		(0 == strncmp(name, "host", 4)) ||
-		(0 == strncmp(name, "auth", 4))) {
+		(0 == strncmp(name, "auth", 4)) ||
+		(0 == strncmp(name, "quota", 5)) ||
+		(0 == strncmp(name, "rx_rate", 8))) {
 		/* xprt, port, host, auth */
 		rc = add_attr_from_attr_str(name, value,
 					    &ctxt->request,
-					    &ctxt->request_sz,
-					    ctxt->msglog);
+					    &ctxt->request_sz);
 		if (rc)
 			goto out;
 	} else {
@@ -651,8 +701,7 @@ int __ldmsd_parse_listen_req(struct ldmsd_parse_ctxt *ctxt)
 		/* Add an attribute of type 'STRING' */
 		rc = add_attr_from_attr_str(NULL, tmp,
 					    &ctxt->request,
-					    &ctxt->request_sz,
-					    ctxt->msglog);
+					    &ctxt->request_sz);
 	}
 
 out:
@@ -693,8 +742,7 @@ int __ldmsd_parse_auth_add_req(struct ldmsd_parse_ctxt *ctxt)
 		if (0 == strcmp(name, "name") || 0 == strcmp(name, "plugin")) {
 			rc = add_attr_from_attr_str(name, value,
 						    &ctxt->request,
-						    &ctxt->request_sz,
-						    ctxt->msglog);
+						    &ctxt->request_sz);
 			if (rc)
 				goto out;
 		} else {
@@ -710,8 +758,7 @@ int __ldmsd_parse_auth_add_req(struct ldmsd_parse_ctxt *ctxt)
 		/* Add an attribute of type 'STRING' */
 		rc = add_attr_from_attr_str(NULL, tmp,
 					    &ctxt->request,
-					    &ctxt->request_sz,
-					    ctxt->msglog);
+					    &ctxt->request_sz);
 	}
 
 out:
@@ -726,11 +773,191 @@ int __ldmsd_parse_cmdline_req(struct ldmsd_parse_ctxt *ctxt)
 {
 	/* Treat the attribute string as a single STRING attribute value */
 	return add_attr_from_attr_str(NULL, ctxt->av,
-			&ctxt->request, &ctxt->request_sz, ctxt->msglog);
+			&ctxt->request, &ctxt->request_sz);
 }
 
-struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
-					size_t xprt_max_msg, ldmsd_msg_log_f msglog)
+int __ldmsd_parse_bridge_add_req(struct ldmsd_parse_ctxt *ctxt)
+{
+	char *av = ctxt->av;
+	size_t len = strlen(av);
+	size_t cnt = 0;
+	char *tmp, *name, *value, *ptr, *dummy;
+	int rc = 0;
+	dummy = NULL;
+	tmp = malloc(len);
+	if (!tmp) {
+		rc = ENOMEM;
+		goto out;
+	}
+	av = strtok_r(av, __ldmsd_cfg_delim, &ptr);
+	while (av) {
+		ctxt->av = av;
+		dummy = strdup(av);
+		if (!dummy) {
+			rc = ENOMEM;
+			goto out;
+		}
+		__get_attr_name_value(dummy, &name, &value);
+		if (!name) {
+			/* av is neither attribute value nor keyword */
+			rc = EINVAL;
+			goto out;
+		}
+		rc = add_attr_from_attr_str(name, value,
+					    &ctxt->request,
+					    &ctxt->request_sz);
+		if (rc)
+			goto out;
+		av = strtok_r(NULL, __ldmsd_cfg_delim, &ptr);
+		free(dummy);
+		dummy = NULL;
+	}
+	rc = add_attr_from_attr_str("type", "bridge",
+				    &ctxt->request,
+				    &ctxt->request_sz);
+	if (rc)
+		goto out;
+
+	if (cnt) {
+		tmp[cnt-1] = '\0'; /* Replace the last ' ' with '\0' */
+		/* Add an attribute of type 'STRING' */
+		rc = add_attr_from_attr_str(NULL, tmp,
+					    &ctxt->request,
+					    &ctxt->request_sz);
+	}
+
+out:
+	if (tmp)
+		free(tmp);
+	if (dummy)
+		free(dummy);
+	return rc;
+}
+
+int __ldmsd_parse_default_auth_req(struct ldmsd_parse_ctxt *ctxt)
+{
+	char *av = ctxt->av;
+	size_t len = strlen(av);
+	size_t cnt = 0;
+	char *tmp, *name, *value, *ptr, *dummy;
+	int rc;
+	dummy = NULL;
+	tmp = malloc(len);
+	if (!tmp) {
+		rc = ENOMEM;
+		goto out;
+	}
+	av = strtok_r(av, __ldmsd_cfg_delim, &ptr);
+	while (av) {
+		ctxt->av = av;
+		dummy = strdup(av);
+		if (!dummy) {
+			rc = ENOMEM;
+			goto out;
+		}
+		__get_attr_name_value(dummy, &name, &value);
+		if (!name) {
+			/* av is neither attribute value nor keyword */
+			rc = EINVAL;
+			goto out;
+		}
+		if (0 == strncmp(name, "plugin", 4)) {
+			/* Find the name attribute */
+			rc = add_attr_from_attr_str(name, value,
+						    &ctxt->request,
+						    &ctxt->request_sz);
+			if (rc)
+				goto out;
+		} else {
+			/* Construct the other attribute into a ATTR_STRING */
+			if (value) {
+				cnt += snprintf(&tmp[cnt], len - cnt,
+						"%s=%s ", name, value);
+			} else {
+				cnt += snprintf(&tmp[cnt], len - cnt,
+						"%s ", name);
+			}
+		}
+		av = strtok_r(NULL, __ldmsd_cfg_delim, &ptr);
+		free(dummy);
+		dummy = NULL;
+	}
+	tmp[cnt-1] = '\0'; /* Replace the last ' ' with '\0' */
+	if (cnt) {
+		/* Add an attribute of type 'STRING' */
+		rc = add_attr_from_attr_str(NULL, tmp,
+					    &ctxt->request,
+					    &ctxt->request_sz);
+	}
+out:
+	if (tmp)
+		free(tmp);
+	if (dummy)
+		free(dummy);
+	return rc;
+}
+
+/* The function adds the attribute 'type' with the 'advertise' value to the request */
+int __ldmsd_parse_advertiser_add_req(struct ldmsd_parse_ctxt *ctxt)
+{
+	char *av = ctxt->av;
+	size_t len = strlen(av);
+	size_t cnt = 0;
+	char *tmp, *name, *value, *ptr, *dummy;
+	int rc = 0;
+	dummy = NULL;
+	tmp = malloc(len);
+	if (!tmp) {
+		rc = ENOMEM;
+		goto out;
+	}
+	av = strtok_r(av, __ldmsd_cfg_delim, &ptr);
+	while (av) {
+		ctxt->av = av;
+		dummy = strdup(av);
+		if (!dummy) {
+			rc = ENOMEM;
+			goto out;
+		}
+		__get_attr_name_value(dummy, &name, &value);
+		if (!name) {
+			/* av is neither attribute value nor keyword */
+			rc = EINVAL;
+			goto out;
+		}
+		rc = add_attr_from_attr_str(name, value,
+					    &ctxt->request,
+					    &ctxt->request_sz);
+		if (rc)
+			goto out;
+		av = strtok_r(NULL, __ldmsd_cfg_delim, &ptr);
+		free(dummy);
+		dummy = NULL;
+	}
+	rc = add_attr_from_attr_str("type", "advertiser",
+				    &ctxt->request,
+				    &ctxt->request_sz);
+	if (rc)
+		goto out;
+
+	if (cnt) {
+		tmp[cnt-1] = '\0'; /* Replace the last ' ' with '\0' */
+		/* Add an attribute of type 'STRING' */
+		rc = add_attr_from_attr_str(NULL, tmp,
+					    &ctxt->request,
+					    &ctxt->request_sz);
+	}
+
+out:
+	if (tmp)
+		free(tmp);
+	if (dummy)
+		free(dummy);
+	return rc;
+}
+
+struct ldmsd_req_array *
+ldmsd_parse_config_str(const char *cfg, uint32_t msg_no, size_t xprt_max_msg)
 {
 	char *av, *verb, *dummy;
 	struct ldmsd_parse_ctxt ctxt = {0};
@@ -762,7 +989,6 @@ struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
 	}
 
 	ctxt.request_sz = xprt_max_msg;
-	ctxt.msglog = msglog;
 	ctxt.av = av;
 	ctxt.request = calloc(1, ctxt.request_sz);
 	if (!ctxt.request) {
@@ -799,6 +1025,16 @@ struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
 	case LDMSD_CMDLINE_OPTIONS_SET_REQ:
 		rc = __ldmsd_parse_cmdline_req(&ctxt);
 		break;
+	case LDMSD_BRIDGE_ADD_REQ:
+		rc = __ldmsd_parse_bridge_add_req(&ctxt);
+		break;
+	case LDMSD_DEFAULT_AUTH_REQ:
+		rc = __ldmsd_parse_default_auth_req(&ctxt);
+		break;
+	case LDMSD_ADVERTISER_ADD_REQ:
+	case LDMSD_ADVERTISER_START_REQ:
+		rc = __ldmsd_parse_advertiser_add_req(&ctxt);
+		break;
 	default:
 		rc = __ldmsd_parse_generic(&ctxt);
 		break;
@@ -807,8 +1043,7 @@ struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
 		goto err;
 out:
 	/* Add the terminating attribute */
-	rc = add_attr_from_attr_str(NULL, NULL, &ctxt.request,
-				    &ctxt.request_sz, ctxt.msglog);
+	rc = add_attr_from_attr_str(NULL, NULL, &ctxt.request, &ctxt.request_sz);
 	if (rc)
 		goto err;
 	/* Make sure that all records aren't larger than xprt_max_msg. */
@@ -908,6 +1143,14 @@ ldmsd_req_attr_t ldmsd_req_attr_get_by_id(char *request, uint32_t attr_id)
 	return NULL;
 }
 
+char *ldmsd_req_attr_value_by_id(char *request, uint32_t attr_id)
+{
+	ldmsd_req_attr_t attr = ldmsd_req_attr_get_by_id(request, attr_id);
+	if (!attr)
+		return NULL;
+	return str_repl_env_vars((char *)attr->attr_value);
+}
+
 ldmsd_req_attr_t ldmsd_req_attr_get_by_name(char *request, const char *name)
 {
 	int32_t attr_id = ldmsd_req_attr_str2id(name);
@@ -920,6 +1163,8 @@ char *ldmsd_req_attr_str_value_get_by_id(ldmsd_req_ctxt_t req, uint32_t attr_id)
 {
 	ldmsd_req_attr_t attr = ldmsd_req_attr_get_by_id(req->req_buf, attr_id);
 	if (!attr)
+		return NULL;
+	if (attr->attr_value[0] == '\0')
 		return NULL;
 	return str_repl_env_vars((char *)attr->attr_value);
 }
@@ -1137,4 +1382,16 @@ int ldmsd_msg_gather(struct ldmsd_msg_buf *buf, ldmsd_req_hdr_t req)
 	if (flags & LDMSD_REQ_EOM_F)
 		return 0;
 	return EBUSY;
+}
+
+__attribute__((constructor))
+void __ldmsd_request_util_init()
+{
+	/* make sure the tables are sorted */
+	qsort(req_str_id_table,
+	      sizeof(req_str_id_table)/sizeof(req_str_id_table[0]),
+	      sizeof(req_str_id_table[0]), (void*)req_str_id_cmp);
+	qsort(attr_str_id_table,
+	      sizeof(attr_str_id_table)/sizeof(attr_str_id_table[0]),
+	      sizeof(attr_str_id_table[0]), (void*)req_str_id_cmp);
 }

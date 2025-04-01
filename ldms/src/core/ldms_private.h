@@ -149,6 +149,15 @@ struct ldms_set {
 	struct ldms_context *notify_ctxt; /* Notify req context */
 	ldms_heap_t heap;
 	struct ldms_heap_instance heap_inst;
+
+	/*
+	 * Context of the ongoing update operation on the set
+	 *
+	 * This field tracks the context of the current update operation.
+	 * Subsequent updates are blocked until the current operation completes.
+	 * The field is NULL when no update is in progress.
+	 */
+	struct ldms_op_ctxt *curr_updt_ctxt;
 };
 
 /* Convenience macro to roundup a value to a multiple of the _s parameter */
@@ -157,7 +166,8 @@ struct ldms_set {
 extern int __ldms_xprt_push(ldms_set_t s, int push_flags);
 extern int __ldms_remote_lookup(ldms_t _x, const char *path,
 				enum ldms_lookup_flags flags,
-				ldms_lookup_cb_t cb, void *cb_arg);
+				ldms_lookup_cb_t cb, void *cb_arg,
+				struct ldms_op_ctxt *op_ctxt);
 extern int __ldms_remote_dir(ldms_t x, ldms_dir_cb_t cb, void *cb_arg, uint32_t flags);
 extern int __ldms_remote_dir_cancel(ldms_t x);
 extern struct ldms_set *
@@ -238,4 +248,7 @@ void __ldms_xprt_on_set_del(ldms_t xprt, ldms_set_t set);
 void __ldms_set_on_xprt_term(ldms_set_t set, ldms_t xprt);
 void __ldms_set_delete(ldms_set_t s, int notify);
 
+ldms_t __ldms_xprt_new_with_auth(const char *xprt_name,
+			       const char *auth_name,
+			       struct attr_value_list *auth_av_list);
 #endif

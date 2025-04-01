@@ -51,6 +51,9 @@
 
 #include <munge.h>
 #include <assert.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "ovis_log/ovis_log.h"
 #include "../core/ldms_auth.h"
@@ -67,6 +70,10 @@ static ovis_log_t munge_log = NULL;
 
 #define LOG_ERROR(_fmt_, ...) do { \
 	ovis_log(munge_log, OVIS_LERROR, _fmt_, ##__VA_ARGS__); \
+} while (0);
+
+#define LOG_INFO(_fmt_, ...) do { \
+	ovis_log(munge_log, OVIS_LINFO, _fmt_, ##__VA_ARGS__); \
 } while (0);
 
 static
@@ -110,7 +117,7 @@ static
 ldms_auth_t __auth_munge_new(ldms_auth_plugin_t plugin,
 		       struct attr_value_list *av_list)
 {
-	const char *munge_sock;
+	const char *value;
 	struct ldms_auth_munge *a;
 	munge_ctx_t mctx;
 	munge_err_t merr;
@@ -128,9 +135,9 @@ ldms_auth_t __auth_munge_new(ldms_auth_plugin_t plugin,
 		goto err1;
 	}
 
-	munge_sock = av_value(av_list, "socket");
-	if (munge_sock) {
-		merr = munge_ctx_set(mctx, MUNGE_OPT_SOCKET, munge_sock);
+	value = av_value(av_list, "socket");
+	if (value) {
+		merr = munge_ctx_set(mctx, MUNGE_OPT_SOCKET, value);
 		if (merr != EMUNGE_SUCCESS) {
 			LOG_ERROR("Failed to set MUNGE context. %s\n",
 				   munge_strerror(merr));
@@ -197,12 +204,50 @@ int __auth_munge_xprt_bind(ldms_auth_t auth, ldms_t xprt)
 }
 
 static
+void __ipv4_ipv6_xlat(struct sockaddr *sa, socklen_t *len)
+{
+	/*
+	 * NOTE
+	 * ----
+	 * ldmsd and ldms_ls version 4.3.x use IPv4 stack. If our process
+	 * listened on IPv6 address (e.g. '::'), the addresses that were
+	 * returned from the `ldms_xprt_sockaddr()` (which called
+	 * `getsockname()`) are AF_INET6 -- in the form of IPv4-mapped IPv6
+	 * addresses ('::ffff:AA:BB:CC:DD', where 'AA.BB.CC.DD' is the IPv4
+	 * address). Then, our process would send the IPv6 address as the
+	 * payload to the 4.3.x process, which consequently broke munge
+	 * authentication in version 4.3.x as it expected IPv4 address.
+	 * So, to maintain compatibility, we have to translate the IPv4-mapped
+	 * IPv6 addresss to IPv4 address before sending it in the payload or
+	 * payload-data comparison.
+	 */
+	static struct  sockaddr_in6 *sin6, s6 = {
+		.sin6_addr = {{{0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0}}}
+	};
+	struct sockaddr_in sin = {0};
+	if (sa->sa_family != AF_INET6)
+		return;
+	sin6 = (void*)sa;
+	if (memcmp(&sin6->sin6_addr, &s6.sin6_addr, 12))
+		return;
+	/* this is the IPv4-mapped IPv6 address, convert it to ipv4 */
+	sin.sin_family = AF_INET;
+	sin.sin_port = sin6->sin6_port;
+	memcpy(&sin.sin_addr, &sin6->sin6_addr.__in6_u.__u6_addr32[3], 4);
+	*len = sizeof(sin);
+	memcpy(sa, &sin, sizeof(sin));
+}
+
+static
 int __auth_munge_xprt_begin(ldms_auth_t auth, ldms_t xprt)
 {
 	struct ldms_auth_munge *a = (void*)auth;
+	struct sockaddr_storage so;
+	socklen_t slen;
 	munge_err_t merr;
 	int rc;
 	int len;
+
 	a->sin_len = sizeof(a->lsin);
 	rc = ldms_xprt_sockaddr(xprt, (void*)&a->lsin,
 				(void*)&a->rsin, &a->sin_len);
@@ -216,13 +261,17 @@ int __auth_munge_xprt_begin(ldms_auth_t auth, ldms_t xprt)
 	 * swapped address, in order to be compatible with them, we have to send
 	 * the swapped address in the case of rdma transport.
 	 */
-	merr = (strncmp(xprt->name, "rdma", 4) == 0)?
-		munge_encode(&a->local_cred, a->mctx, &a->rsin, a->sin_len):
-		munge_encode(&a->local_cred, a->mctx, &a->lsin, a->sin_len);
-
+	slen = a->sin_len;
+	if (strncmp(xprt->name, "rdma", 4) == 0) {
+		memcpy(&so, &a->rsin, slen);
+	} else {
+		memcpy(&so, &a->lsin, slen);
+	}
+	__ipv4_ipv6_xlat((void*)&so, &slen);
+	merr = munge_encode(&a->local_cred, a->mctx, &so, slen);
 	if (merr) {
 		LOG_ERROR("munge_encode() failed. %s\n", munge_strerror(merr));
-		return EBADR; /* bad request */
+		return EBADR;
 	}
 	len = strlen(a->local_cred);
 	rc = ldms_xprt_auth_send(xprt, a->local_cred, len + 1);
@@ -233,57 +282,64 @@ int __auth_munge_xprt_begin(ldms_auth_t auth, ldms_t xprt)
 	return 0;
 }
 
+const char *sockaddr_ntop(struct sockaddr *sa, char *buff, size_t sz);
+
 static
 int __auth_munge_xprt_recv_cb(ldms_auth_t auth, ldms_t xprt,
 		const char *data, uint32_t data_len)
 {
 	struct ldms_auth_munge *a = (void*)auth;
-	struct sockaddr_in *sin;
+	struct sockaddr *payload_sin;
+	struct sockaddr *xprt_sin;
+	socklen_t slen;
+	struct sockaddr_storage so;
 	void *payload = NULL;
 	uid_t uid;
 	gid_t gid;
+	munge_err_t merr;
 	int len;
 	int cmp;
-	munge_err_t merr;
-	if (data[data_len-1] != 0)
-		goto invalid;
+	int rc = EINVAL;
+
 	merr = munge_decode(data, a->mctx, &payload, &len, &uid, &gid);
 	if (merr != EMUNGE_SUCCESS) {
 		LOG_ERROR("munge_decode() failed. %s\n", munge_strerror(merr));
-		goto invalid;
-	}
-	if (len != sizeof(*sin)) {
-		LOG_ERROR("Bad payload\n");
-		goto invalid; /* bad payload */
+		goto out;
 	}
 
-	/* check if addr match */
-	sin = payload;
+	/* Check the expected peer address (compatability mode) */
+	payload_sin = payload;
 	/*
 	 * zap_rdma from OVIS-4.3.7 and earlier has a bug that swaps
 	 * local/remote addresses. Since the old peers send the swapped
 	 * address, in order to be compatible with them, we have to expect the
 	 * swapped address in the case of rdma transport.
 	 */
-	cmp = (strncmp(xprt->name, "rdma", 4) == 0)?
-			memcmp(sin, &a->lsin, sizeof(*sin)):
-			memcmp(sin, &a->rsin, sizeof(*sin));
-	if (cmp != 0) {
-		LOG_ERROR("bad address.\n");
-		goto invalid; /* bad addr */
+	slen = a->sin_len;
+	if (strncmp(xprt->name, "rdma", 4) == 0) {
+		memcpy(&so, &a->lsin, slen);
+	} else {
+		memcpy(&so, &a->rsin, slen);
 	}
-	/* verified */
-	xprt->ruid = uid;
-	xprt->rgid = gid;
-
+	__ipv4_ipv6_xlat((void*)&so, &slen);
+	xprt_sin = (void*)&so;
+	if (len != slen || (cmp = memcmp(payload_sin, xprt_sin, slen)) != 0) {
+		char ipa[128];
+		char ipb[128];
+		sockaddr_ntop(payload_sin, ipa, sizeof(ipa));
+		sockaddr_ntop(xprt_sin, ipb, sizeof(ipb));
+		LOG_INFO("Unexpected authentication message payload "
+			  "'%s' != '%s'.\n", ipa, ipb);
+	}
+	rc = 0;
+ out:
+	/* Cache the peer's verified uid and gid in the transport handle. */
+	if (!rc) {
+		xprt->ruid = uid;
+		xprt->rgid = gid;
+	}
 	free(payload);
-	ldms_xprt_auth_end(xprt, 0);
-	return 0;
-
-invalid:
-	if (payload)
-		free(payload);
-	ldms_xprt_auth_end(xprt, EINVAL);
+	ldms_xprt_auth_end(xprt, rc);
 	return 0;
 }
 
@@ -310,7 +366,7 @@ int __auth_munge_cred_get(ldms_auth_t auth, ldms_cred_t cred)
 ldms_auth_plugin_t __ldms_auth_plugin_get()
 {
 	if (!munge_log) {
-		munge_log = ovis_log_register("auth_munge",
+		munge_log = ovis_log_register("auth.munge",
 					      "Messages for ldms_auth_munge");
 		if (!munge_log) {
 			LOG_ERROR("Failed to register auth_munge's log. "

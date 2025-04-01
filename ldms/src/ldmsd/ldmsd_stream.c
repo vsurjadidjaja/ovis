@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <semaphore.h>
 #include <ovis_json/ovis_json.h>
+#include "ovis_log/ovis_log.h"
 #include <execinfo.h> /* for backtrace_symbols() */
 #include "ldms.h"
 #include "ldms_xprt.h"
@@ -229,25 +230,6 @@ int ldmsd_stream_new_publish(const char *name, ldms_t xprt)
 	rc = __stream_new_send(xprt, s);
 	pthread_mutex_unlock(&s->s_lock);
 	return rc;
-}
-
-void ldmsd_stream_publisher_remove(const char *name)
-{
-	ldmsd_stream_t s;
-	struct rbn *rbn;
-	ldmsd_stream_publisher_t p;
-	pthread_mutex_lock(&s_tree_lock);
-	RBT_FOREACH(rbn, &s_tree) {
-		s = container_of(rbn, struct ldmsd_stream_s, s_ent);
-		pthread_mutex_lock(&s->s_lock);
-		p = __find_publisher(s, name);
-		if (p) {
-			rbt_del(&s->s_p_tree, &p->p_ent);
-			__free_publisher(p);
-		}
-		pthread_mutex_unlock(&s->s_lock);
-	}
-	pthread_mutex_unlock(&s_tree_lock);
 }
 
 int ldmsd_stream_subscriber_count(const char *stream_name)
@@ -1053,4 +1035,17 @@ free_buf:
 	free(buf.buf);
 	errno = rc;
 	return NULL;
+}
+
+void ldmsd_stream_stats_reset_all()
+{
+	struct rbn *rbn;
+	ldmsd_stream_t s;
+	pthread_mutex_lock(&s_tree_lock);
+	RBT_FOREACH(rbn, &s_tree) {
+		s = container_of(rbn, struct ldmsd_stream_s, s_ent);
+		memset(&s->s_recv_info, 0, sizeof(s->s_recv_info));
+		memset(&s->s_pub_info, 0, sizeof(s->s_pub_info));
+	}
+	pthread_mutex_unlock(&s_tree_lock);
 }

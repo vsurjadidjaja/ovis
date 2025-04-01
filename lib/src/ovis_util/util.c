@@ -90,7 +90,7 @@ static const char *get_env_var(const char *src, size_t start_off, size_t end_off
 	return name;
 }
 
-int _scpy(char **buff, size_t *slen, size_t *alen,
+static int _scpy(char **buff, size_t *slen, size_t *alen,
 	    const char *str, size_t len)
 {
 	size_t xlen;
@@ -597,6 +597,78 @@ size_t ovis_get_mem_size(const char *s)
     }
 }
 
+/*
+ * microseconds:	us
+ * milliseconnds:	ms
+ * seconds:		s
+ * minutes:		m
+ * hours:		h
+ * days:		d
+ */
+int ovis_time_str2us(const char *s, long *v)
+{
+	char *unit;
+	double x;
+
+	x = strtod(s, &unit);
+	if (unit == s)
+		return EINVAL;
+
+	while (unit[0] == ' ')
+		unit++;
+
+	if ((unit[0] == '\0') || (0 == strcmp(unit, "us")) || (0 == strncmp(unit, "micro", 5))) {
+		/* microseconds */
+		*v = (long long)x;
+	} else if ((0 == strcmp(unit, "ms")) || (0 == strncmp(unit, "milli", 5))) {
+		/* milliseconds */
+		*v = x * 1000;
+	} else if (unit[0] == 's') {
+		/* seconds */
+		*v = x * 1000000;
+	} else if (unit[0] == 'm') {
+		/* minutes */
+		*v = x * 1000000 * 60;
+	} else if (unit[0] == 'h') {
+		/* hours */
+		*v = x * 1000000 * 60 * 60;
+	} else if (unit[0] == 'd') {
+		/* days */
+		*v = x * 1000000 * 60 * 60 * 24;
+	} else {
+		return EINVAL;
+	}
+	return 0;
+}
+
+void ovis_time_us2str(long time_us, char *output, size_t output_sz)
+{
+	if (time_us >= 86400000000L) {
+		/* Days */
+		long days = time_us / 86400000000L;
+		snprintf(output, output_sz, "%ldd", days);
+	} else if (time_us >= 3600000000L) {
+		/* Hours */
+		long hours = time_us / 3600000000L;
+		snprintf(output, output_sz, "%ldh", hours);
+	} else if (time_us >= 60000000L) {
+		/* Minutes */
+		long minutes = time_us / 60000000L;
+		snprintf(output, output_sz, "%ldm", minutes);
+	} else if (time_us >= 1000000L) {
+		/* Seconds */
+		long seconds = time_us / 1000000L;
+		snprintf(output, output_sz, "%lds", seconds);
+	} else if (time_us >= 1000L) {
+		/* Milliseconds */
+		long milliseconds = time_us / 1000L;
+		snprintf(output, output_sz, "%ldms", milliseconds);
+	} else {
+		/* Microseconds */
+		snprintf(output, output_sz, "%ldus", time_us);
+	}
+}
+
 pid_t ovis_execute(const char *command)
 {
 	char *argv[] = {"/bin/sh", "-c", (char*)command, NULL};
@@ -779,7 +851,7 @@ FILE *fopen_perm(const char *path, const char *f_mode, int o_mode)
  * \retval 0 OK
  * \retval errno for error
  */
-int __uid_gid_check(uid_t uid, gid_t gid)
+static int __uid_gid_check(uid_t uid, gid_t gid)
 {
 	struct passwd pw;
 	struct passwd *p;
@@ -1117,4 +1189,102 @@ void ovis_pgrep_free(ovis_pgrep_array_t a)
 		free(a->ent[i]);
 	}
 	free(a);
+}
+
+ovis_buff_t ovis_buff_new(size_t grain)
+{
+	ovis_buff_t buff;
+	buff = malloc(sizeof(*buff));
+	if (!buff)
+		return NULL;
+	ovis_buff_init(buff, grain);
+	return buff;
+}
+
+void ovis_buff_free(ovis_buff_t buff)
+{
+	if (!buff)
+		return;
+	ovis_buff_entry_t ent;
+	while ((ent = TAILQ_FIRST(&buff->tq))) {
+		TAILQ_REMOVE(&buff->tq, ent, entry);
+		free(ent);
+	}
+	free(buff);
+}
+
+void ovis_buff_init(struct ovis_buff_s *buff, size_t grain)
+{
+	buff->grain = grain;
+	TAILQ_INIT(&buff->tq);
+}
+
+void ovis_buff_purge(struct ovis_buff_s *buff)
+{
+	ovis_buff_entry_t ent;
+	while ((ent = TAILQ_FIRST(&buff->tq))) {
+		TAILQ_REMOVE(&buff->tq, ent, entry);
+		free(ent);
+	}
+}
+
+__attribute__((format(printf, 2, 3)))
+int ovis_buff_appendf(ovis_buff_t buff, const char *fmt, ...)
+{
+	int rc;
+	struct ovis_buff_entry_s dummy[2] = {{},};
+	ovis_buff_entry_t ent;
+	va_list ap;
+	size_t len;
+
+	if (!buff)
+		return EINVAL;
+ again:
+	va_start(ap, fmt);
+	ent = TAILQ_LAST(&buff->tq, ovis_buff_entry_tq_s);
+	if (!ent)
+		ent = dummy;
+	len = vsnprintf(ent->buff + ent->off, ent->avail_len, fmt, ap);
+	va_end(ap);
+	if (len >= ent->avail_len) {
+		/* not enough buffer */
+		ent->buff[ent->off] = 0;
+		size_t sz = ((len + buff->grain) / buff->grain) * buff->grain;
+		ent = malloc(sizeof(*ent) + sz);
+		if (!ent) {
+			rc = ENOMEM;
+			goto out;
+		}
+		ent->buff_len = sz;
+		ent->avail_len = sz;
+		ent->off = 0;
+		TAILQ_INSERT_TAIL(&buff->tq, ent, entry);
+		goto again;
+	}
+	ent->off += len;
+	ent->avail_len -= len;
+	rc = 0;
+ out:
+	return rc;
+}
+
+char *ovis_buff_str(ovis_buff_t buff)
+{
+	char *ret = NULL;
+	off_t off = 0;
+	size_t len = 0;
+	ovis_buff_entry_t ent;
+	TAILQ_FOREACH(ent, &buff->tq, entry) {
+		len += ent->off;
+	}
+	ret = malloc(len + 1);
+	if (!ret)
+		goto out;
+	TAILQ_FOREACH(ent, &buff->tq, entry) {
+		memcpy(ret + off, ent->buff, ent->off);
+		off += ent->off;
+	}
+	ret[off] = 0;
+ out:
+	return ret;
 }

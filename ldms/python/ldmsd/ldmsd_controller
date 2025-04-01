@@ -43,7 +43,7 @@
 # A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
 # OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
 # SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,p
 # DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 # THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
@@ -64,9 +64,9 @@ from datetime import datetime
 
 from ldmsd import ldmsd_util
 from ldmsd.ldmsd_communicator import LDMSD_Request, LDMSD_Req_Attr
-from ldmsd.ldmsd_communicator import Communicator, fmt_status
+from ldmsd.ldmsd_communicator import Communicator, fmt_status, get_cmd_attr_list
 import errno
-from _ast import Or
+import math
 
 LDMSD_REQ_SOM_F=1
 LDMSD_REQ_EOM_F=2
@@ -102,7 +102,9 @@ class LdmsdCmdParser(cmd.Cmd):
                                          port,
                                          auth,
                                          auth_opt)
-            self.comm.connect()
+            rc = self.comm.connect()
+            if rc:
+                raise ConnectionError("Please verify the transport, hostname, port, and authentication method.")
             self.prompt = "{0}:{1}:{2}> ".format(xprt, host, port)
         else:
             self.comm = None
@@ -113,14 +115,19 @@ class LdmsdCmdParser(cmd.Cmd):
         else:
             cmd.Cmd.__init__(self)
 
+    def completedefault(self, text, line, begidx, endidx):
+        cmd = line.split()[0]
+        return self.__complete_attr_list(cmd, text)
+
     def __complete_attr_list(self, verb, text):
-        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+        req_opt_attr = get_cmd_attr_list(verb)
         attr_list = []
         if req_opt_attr['req'] is not None:
-            attr_list = req_opt_attr['req']
+            attr_list += req_opt_attr['req']
         if req_opt_attr['opt'] is not None:
             attr_list += req_opt_attr['opt']
-        return ["{0}=".format(attr) for attr in attr_list if attr.startswith(text)]
+        ret = ["{0}=".format(attr) for attr in attr_list if attr.startswith(text)]
+        return ret
 
     def emptyline(self):
         pass
@@ -133,7 +140,7 @@ class LdmsdCmdParser(cmd.Cmd):
         return True
 
     def __check_command_args(self, verb, args):
-        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+        req_opt_attr = get_cmd_attr_list(verb)
         if set(req_opt_attr['req']) <= set(args):
             return 0
         else:
@@ -158,48 +165,6 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         print(args)
 
-    def do_connect(self, args):
-        if self.state != self.comm.CONNECTED:
-            if self.comm:
-                self.comm.connect()
-            kwargs = {
-                "xprt": "sock",
-                "host": "localhost",
-                "port": None,
-                "auth": "none",
-                "auth_opt": {},
-            }
-            r = re.compile(r"\s*(\w+)=(\w+)")
-            for attr, value in r.findall(args):
-                if attr in kwargs:
-                    kwargs[attr] = value
-                else:
-                    # treat as auth options
-                    kwargs["auth_opt"][attr] = value
-            self.comm = Communicator(kwargs['xprt'],
-                                     kwargs['host'],
-                                     kwargs['port'],
-                                     kwargs['auth'],
-                                     kwargs['auth_opt'])
-            rc = self.comm.connect()
-            if rc:
-                self.promt = "Error connecting to {1} on port {2} with {0}".format(xprt, host, port)
-            else:
-                self.prompt = "{0}:{1}:{2}> ".format(xprt, host, port)
-        else:
-            print(f"WARN: Already connected, do nothing.")
-            return None
-
-    def complete_connect(self, text, line, begidx, endidx):
-        name_list = ["xprt=", "host=", "port=", "auth="]
-        full_list = ["xprt=(sock|rdma|ugni)",
-                     "host=HOSTNAME",
-                     "port=PORT",
-                     "auth=AUTH_METHOD"]
-        if not text:
-            return full_list
-        return [x for x in name_list if x.startswith(text)]
-
     def precmd(self, line):
         if line[0:1] == '#':
             return ''
@@ -208,7 +173,7 @@ class LdmsdCmdParser(cmd.Cmd):
     def handle_args(self, verb, _args):
         if _args and not self.__check_command_syntax(_args):
             print("Syntax error, there are attributes for which no value is given.")
-        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+        req_opt_attr = get_cmd_attr_list(verb)
 
         if not self.comm:
             print("Error: no LDMS connection")
@@ -253,6 +218,24 @@ class LdmsdCmdParser(cmd.Cmd):
     def read_none_tty(self, fin):
         for cmd in fin:
             self.onecmd(cmd)
+
+    def do_dump_cfg(self, arg):
+        """
+        Dump the current running configuration to a file specified in the path
+
+        Parameters:
+        path - path to valid directory to write LDMSD configuration file.
+               Filename is generated using the hostname and port of the ldmsd
+               that received the configuration request. e.g. <hostname>-<port>.conf
+        """
+        arg = self.handle_args('dump_cfg', arg)
+        if arg:
+            rc, msg = self.comm.dump_cfg(arg['path'])
+            if rc:
+                print(f'Error {rc} printing current configuration: {msg}')
+
+    def complete_dump_cfg(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('dump_cfg', text)
 
     def do_source(self, arg):
         """
@@ -308,13 +291,20 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         Load a plugin at the Aggregator/Producer
         Parameters:
-        name=     The plugin name
+        name=   The plugin to load
+        plugin= The configuration name for the plugin (default = <name>)
         """
         arg = self.handle_args('load', arg)
         if arg:
-            rc, msg = self.comm.plugn_load(arg['name'])
+            name = arg['name']
+            if arg['plugin']:
+                plugin = arg['plugin']
+            else:
+                plugin = name
+            rc, msg = self.comm.plugn_load(name, plugin)
             if rc:
-                print(f'Error loading plugin {arg["name"]}: {msg}')
+                print(f'Error loading configuration named {arg["name"]} '
+                      f'with plugin {arg["plugin"]}')
 
     def complete_load(self, text, line, begidx, endidx):
         return self.__complete_attr_list('load', text)
@@ -338,27 +328,102 @@ class LdmsdCmdParser(cmd.Cmd):
         name=     A unique name for this Producer
         xprt=     The transport name [sock, rdma, ugni]
         host=     The hostname of the host
-        port=     The port number on which the LDMS is listening
-        type=     The connection type [active, passive]
-        interval= The connection retry interval (us)
-        auth=     The authentication method
+        type=     The connection type [active, passive, bridge]
+                  Active -- A connection is initiated with the peer and
+                           its metric sets will be queried.
+                  Passive - A connect request is expected from the specified producer.
+                            After the connection is established, the peer's metric sets
+                            will be queried
+                  Bridge -- A connection is initiated to the remote peer,
+                            but its metric sets are not queried.
+                            This is the active side of the passive-mode producer.
+        [port=]   The port number on which the peer LDMS is listening. It is not required, if type is PASSIVE.
+        reconnect= The connection retry interval (us)
+        interval= The connection retry interval (us) (Deprecated, please use 'reconnect'.)
+        [auth=]   The authentication method
         [perm=]   The permission to modify the producer in the future.
+        [rail=]   The number of rail endpoints for the prdcr (default: 1).
+        [quota=]  The recv quota our ldmsd (the one we are controlling)
+                   advertises to the prdcr (default: value from ldmsd --quota
+                   option). This limits how much outstanding data our ldmsd
+                   holds for the prdcr.
+        [rx_rate=] The recv rate (bytes/sec) limit for this connection. The
+                   default is -1 (unlimited).
+        [cache_ip=]   True to cache the IP address after first successful resolution (default).
+                      False to resolve the hostname at prdcr_add and at every connection attempt.
         """
         arg = self.handle_args('prdcr_add', arg)
-        if arg:
+        if arg is None:
+            return
+        if arg['interval'] is None and arg['reconnect'] is None:
+            print(f"The attribute 'reconnect' is missing.")
+        else:
+            if arg['interval'] is not None:
+                if arg['reconnect'] is not None:
+                    print(f"Both 'interval' and 'reconnect' is given. The 'reconnect' value will be used.")
+                else:
+                    arg['reconnect'] = arg['interval']
+                    print(f"'interval' is being deprecated. Please, use 'reconnect' in the future.")
             rc, msg = self.comm.prdcr_add(arg['name'],
                                           arg['type'],
                                           arg['xprt'],
                                           arg['host'],
                                           arg['port'],
-                                          arg['interval'],
+                                          arg['reconnect'],
                                           arg['auth'],
-                                          arg['perm'])
+                                          arg['perm'],
+                                          arg['rail'],
+                                          arg['quota'],
+                                          arg['rx_rate'],
+                                          arg['cache_ip'])
             if rc:
                 print(f'Error adding prdcr {arg["name"]}: {msg}')
 
     def complete_prdcr_add(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_add', text)
+
+    def do_bridge_add(self, arg):
+        """
+        Add a bridge connection. This is the active side of the passive producer.
+        Parameters:
+                name=      A unique name for this Producer
+                xprt=      The transport name [sock, rdma, ugni]
+                host=      The hostname of the host
+                port=      Port number
+                reconnect= The connection retry interval (us)
+                [auth=]    The authentication method
+                [perm=]    The permission to modify the producer in the future.
+                [rail=]    The number of rail endpoints for the prdcr (default: 1).
+                [quota=]   The recv quota our ldmsd (the one we are controlling)
+                           advertises to the prdcr (default: value from ldmsd --quota
+                           option). This limits how much outstanding data our ldmsd
+                           holds for the prdcr.
+                [rx_rate=] The recv rate (bytes/sec) limit for this connection. The
+                           default is -1 (unlimited).
+        """
+        arg = f"{arg} type=bridge" # Automatically add the producer type
+        arg = self.handle_args('bridge_add', arg)
+        if arg is None:
+            return
+        if arg['reconnect'] is None:
+            print(f"The attribute 'reconnect' is missing.")
+        else:
+            rc, msg = self.comm.prdcr_add(arg['name'],
+                                          "bridge",
+                                          arg['xprt'],
+                                          arg['host'],
+                                          arg['port'],
+                                          arg['reconnect'],
+                                          arg['auth'],
+                                          arg['perm'],
+                                          arg['rail'],
+                                          arg['quota'],
+                                          arg['rx_rate'])
+            if rc:
+                print(f'Error adding Bridge {arg["name"]}: {msg}')
+
+    def complete_bridge_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('bridge_add', text)
 
     def do_prdcr_del(self, arg):
         """
@@ -376,34 +441,59 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_prdcr_del(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_del', text)
 
+    def do_bridge_del(self, arg):
+        """
+        Delete a bridge from the sampler daemon. The bridge connot be in use.
+        Parameters:
+        name =   The bridge name
+        """
+        self.do_prdcr_del(arg)
+
+    def complete_bridge_del(self, text, line, begidx, endidx):
+        return self.complete_prdcr_del(text, line, begidx, endidx)
+
     def do_prdcr_start(self, arg):
         """
         Start the specified producer.
         Parameters:
         name=     The name of the producer
-        [interval=] The connection retry interval in micro-seconds. If this is not
+        [reconnect=] The connection retry interval in micro-seconds. If this is not
                   specified, the previously configured value will be used.
+        [interval=]  The same as reconnect. It is being deprecated. Please use 'reconnect'.
         """
         arg = self.handle_args('prdcr_start', arg)
         if arg:
-            rc, msg = self.comm.prdcr_start(arg['name'], regex=False, reconnect=arg['interval'])
+            if arg['reconnect'] is None and arg['interval'] is not None:
+                arg['reconnect'] = arg['interval']
+                print(f"'interval' is being deprecated. Please, use 'reconnect' in the future")
+            rc, msg = self.comm.prdcr_start(arg['name'], regex=False, reconnect=arg['reconnect'])
             if rc:
                 print(f'Error starting prdcr {arg["name"]}: {msg}')
 
     def complete_prdcr_start(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_start', text)
 
+    def do_bridge_start(self, arg):
+        self.do_prdcr_start(arg)
+
+    def complete_bridge_del(self, text, line, begidx, endidx):
+        return self.complete_prdcr_start(text, line, begidx, endidx)
+
     def do_prdcr_start_regex(self, arg):
         """
         Start all producers matching a regular expression.
         Parameters:
         regex=     A regular expression
-        [interval=]  The connection retry interval in micro-seconds. If this is not
+        [reconnect=]  The connection retry interval in micro-seconds. If this is not
                    specified, the previously configured value will be used.
+        [interval=]   The same as reconnect. It is being deprecated. Please use 'reconnect'.
         """
         arg = self.handle_args('prdcr_start_regex', arg)
         if arg:
-            rc, msg = self.comm.prdcr_start(arg['regex'], reconnect=arg['interval'])
+            if arg['reconnect'] is None and arg['interval'] is not None:
+                arg['reconnect'] = arg['interval']
+                print(f"'interval' is being deprecated. Please, use 'reconnect' in the future.")
+            rc, msg = self.comm.prdcr_start(arg['regex'], reconnect=arg['reconnect'])
             if rc:
                 print(f'Error starting prdcr(s) with regex {arg["regex"]}: {msg}')
 
@@ -425,6 +515,17 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_prdcr_stop(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_stop', text)
 
+    def do_bridge_stop(self, arg):
+        """
+        Stop the specified Bridge
+        Parameters:
+        name=  The bridge name
+        """
+        self.do_prdcr_stop(arg)
+
+    def complete_bridge_stop(self, text, line, begidx, endidx):
+        return self.complete_prdcr_stop(text, line, begidx, endidx)
+
     def do_prdcr_stop_regex(self, arg):
         """
         Stop all producers matching a regular expression.
@@ -444,12 +545,15 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         Subscribe for stream data from all matching producers
         Parameters:
-        regex=     A regular expression matching producer names
-        stream=    The stream name
+        regex=     A regular expression matching PRODUCER names
+        stream=    The stream name or regular expression
+        [rx_rate=] The recv rate (bytes/sec) limit for the matching streams. The
+                   default is -1 (unlimited).
         """
         arg = self.handle_args('prdcr_subscribe', arg)
         if arg:
-            rc, msg = self.comm.prdcr_subscribe(arg['regex'], arg['stream'])
+            rc, msg = self.comm.prdcr_subscribe(arg['regex'], arg['stream'],
+                                                arg['rx_rate'])
             if rc:
                 print(f'Error subscribing to stream {arg["stream"]}: {msg}')
 
@@ -478,6 +582,9 @@ class LdmsdCmdParser(cmd.Cmd):
         Parameters:
         regex=     A regular expression matching producer names
         """
+        print("prdcr_stream_status is deprecated")
+        return
+        # DEPRECATED
         FIRST = "first_ts"
         LAST = "last_ts"
         RATE = "bytes/sec"
@@ -679,16 +786,20 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         Start updaters. The parameters to the commands are as
         follows:
-        name=     The update policy name
-        [interval=] The update interval in micro-seconds. If this is not
-                  specified, the previously configured value will be used.
-        [offset=]   Offset for synchronization
-                    If 'interval' is given but not 'offset,
-                    the updater will update sets asynchronously.
-        [auto_interval=]   [true|false] If true, the updater will schedule
-                           set updates according to the update hint. If false,
-                           the updater will schedule the set updates according
-                           to the default schedule, i.e., the given interval and offset values.
+        name=string
+               The update policy name
+        [interval=us]
+               The update interval in micro-seconds. If this is not
+               specified, the previously configured value will be used.
+        [offset=us]
+               Offset for synchronization If 'interval' is given but not
+               offset, The default is 0.
+        [auto_interval={true|false}]
+               If true, the updater will schedule
+               set updates according to the update hint. If false,
+               the updater will schedule the set updates according
+               to the default schedule, i.e., the given interval and
+               offset values.
         """
         arg = self.handle_args('updtr_start', arg)
         if arg:
@@ -722,7 +833,8 @@ class LdmsdCmdParser(cmd.Cmd):
         name=      The unique storage policy name.
         plugin=    The name of the storage backend.
         container= The storage backend container name.
-        schema=    The schema name of the metric set to store.
+        [schema=]  The schema name of the metric set to store. If 'schema' is given, 'regex' is ignored.
+        [regex=]   A regular expression matching set schemas. It must be used with decomposition.
         [flush=]   The interval between calls to the storage plugin flush method.
                    By default, the flush method is not called.
         [perm=]    The permission to modify the storage policy in the future.
@@ -735,6 +847,7 @@ class LdmsdCmdParser(cmd.Cmd):
                                       arg['plugin'],
                                       arg['container'],
                                       arg['schema'],
+                                      arg['regex'],
                                       arg['perm'],
                                       arg['flush'],
                                       arg['decomposition'])
@@ -887,14 +1000,23 @@ class LdmsdCmdParser(cmd.Cmd):
             rc, msg = self.comm.prdcr_status(arg['name'])
             if rc == 0 and msg is not None:
                 producers = fmt_status(msg)
-                print("Name             Host             Port         Transport    State")
-                print("---------------- ---------------- ------------ ------------ ------------")
+                print(f"{'Name':16} {'Host':16} {'Port':12} {'Transport':12} {'auth':16} {'State':12} {'Type':20}")
+                print(f"{'-'*16} {'-'*16} {'-'*12} {'-'*12} {'-'*16} {'-'*12} {'-'*20}")
                 for prdcr in producers:
-                    print("{0:16} {1:16} {2:12} {3:12} {4:12}".format(prdcr['name'],
-                                                                      prdcr['host'],
-                                                                      prdcr['port'],
-                                                                      prdcr['transport'],
-                                                                      prdcr['state']))
+                    port = prdcr['port']
+                    if prdcr['type'] == 'bridge':
+                        continue
+                    pstate = prdcr['state']
+                    if prdcr['type'] == 'advertised':
+                        if prdcr['state'] == 'STANDBY':
+                            # We report STOPPED to tell
+                            # the users that the producer is not running.
+                            pstate = "STOPPED"
+                    print(f"{prdcr['name']:16} {prdcr['host']:16} " \
+                          f"{port:12} " \
+                          f"{prdcr['transport']:12} " \
+                          f"{prdcr['auth']:16} " \
+                          f"{pstate:12} {prdcr['type']:10}")
                     for pset in prdcr['sets']:
                         print("    {0:16} {1:16} {2}".format(pset['inst_name'],
                                                              pset['schema_name'],
@@ -903,6 +1025,30 @@ class LdmsdCmdParser(cmd.Cmd):
                 print(f'Error getting prdcr status: {msg}')
 
     def complete_prdcr_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_status', text)
+
+    def do_bridge_status(self, arg):
+        """
+        Get the statuses of bridge connections
+        Parameters:
+        [name=]        Bridge name
+        """
+        arg = self.handle_args('prdcr_status', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_status(arg['name'])
+            if rc == 0 and msg is not None:
+                producers = fmt_status(msg)
+                print("Name             Host             Port         Transport    State")
+                print("---------------- ---------------- ------------ ------------ ------------")
+                for prdcr in producers:
+                    if prdcr['type'] != 'bridge':
+                        continue
+                    print(f"{prdcr['name']:16} {prdcr['host']:16} {prdcr['port']:12} {prdcr['transport']:12} " \
+                          f"{prdcr['state']:12}")
+            else:
+                print(f'Error getting prdcr status: {msg}')
+
+    def complete_bridge_status(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_status', text)
 
     def do_prdcr_set_status(self, arg):
@@ -920,14 +1066,14 @@ class LdmsdCmdParser(cmd.Cmd):
         if rc == 0:
             metric_sets = fmt_status(msg)
 
-            print("Name                 Schema Name      State      Origin           Producer         timestamp                duration (sec)")
-            print("-------------------- ---------------- ---------- ---------------- ---------------- ------------------------- ---------------")
+            print(f"{'Name':30} {'Schema Name':16} {'State':10} {'Origin':16} {'Producer':16} {'Timestamp':25} {'Duration(sec)':12}")
+            print(f"{'-'*30} {'-'*16} {'-'*10} {'-'*16} {'-'*16} {'-'*25} {'-'*12}")
             for pset in metric_sets:
                 ts = float(pset['timestamp.sec'])
                 ts_sec = datetime.fromtimestamp(ts).strftime('%m-%d-%y %H:%M:%S')
                 ts_str = "{0} [{1}]".format(ts_sec, pset['timestamp.usec'])
                 dur = pset['duration.sec'] + "." + pset['duration.usec'].zfill(6)
-                print("{0:20} {1:16} {2:10} {3:16} {4:16} {5:25} {6:12}".format(pset['inst_name'],
+                print("{0:30} {1:16} {2:10} {3:16} {4:16} {5:25} {6:>12}".format(pset['inst_name'],
                                                                                 pset['schema_name'],
                                                                                 pset['state'],
                                                                                 pset['origin'],
@@ -955,11 +1101,11 @@ class LdmsdCmdParser(cmd.Cmd):
           Oversampled  The number of times the generation number of a set has not changed from the previous update complete.
         """
         arg = self.handle_args('updtr_status', arg)
-        rc, msg = self.comm.updtr_status(arg['name'], arg['summary'])
+        rc, msg = self.comm.updtr_status(**arg)
         if rc == 0:
             updaters = fmt_status(msg)
-            print("Name             Interval:Offset  Auto   Mode            State        Skipped counter Oversampled counter")
-            print(f"---------------- ---------------- ------ --------------- ------------ {'-'*15} {'-'*19}")
+            print("Name             Interval:Offset  Auto   Mode            State")
+            print(f"---------------- ---------------- ------ --------------- ---------------")
             for updtr in updaters:
                 if 'auto' in updtr:
                     auto = updtr['auto']
@@ -968,8 +1114,7 @@ class LdmsdCmdParser(cmd.Cmd):
                     auto = updtr['????']
                 interval_s = cvt_intrvl_off_to_str(updtr['interval'], updtr['offset'])
                 print(f"{updtr['name']:16} {interval_s:16} {auto:6} {updtr['mode']:15} " \
-                      f"{updtr['state']:10} {updtr['outstanding count']:15} " \
-                      f"{updtr['oversampled count']:19}")
+                      f"{updtr['state']:10}")
                 if arg['summary'] is None:
                     for prdcr in updtr['producers']:
                         print("    {0:16} {1:16} {2:12} {3:12} {4:12}".format(
@@ -987,7 +1132,9 @@ class LdmsdCmdParser(cmd.Cmd):
                  'cnt' : 0,
                  'min_prdcr' : None,
                  'max_prdcr' : None,
-                 'producers' : {}
+                 'producers' : {},
+                 'skipped_cnt': 0,
+                 'oversampled_cnt': 0
                }
 
         for p, prdcr in updtr.items():
@@ -1012,9 +1159,14 @@ class LdmsdCmdParser(cmd.Cmd):
                 if pstats['max'] < prdset['max']:
                     pstats['max'] = prdset['max']
                     pstats['max_prdset'] = s
-                pstats['avg'] = pstats['avg'] * (pstats['cnt']/(pstats['cnt'] + prdset['cnt']))
-                pstats['avg'] += prdset['avg'] * (prdset['cnt']/(pstats['cnt'] + prdset['cnt']))
-                pstats['cnt'] += prdset['cnt']
+
+                if prdset['cnt'] > 0:
+                    pstats['avg'] = pstats['avg'] * (pstats['cnt']/(pstats['cnt'] + prdset['cnt']))
+                    pstats['avg'] += prdset['avg'] * (prdset['cnt']/(pstats['cnt'] + prdset['cnt']))
+                    pstats['cnt'] += prdset['cnt']
+
+                stats['skipped_cnt'] += prdset['skipped_cnt']
+                stats['oversampled_cnt'] += prdset['oversampled_cnt']
             stats['producers'][p] = pstats
 
             if stats['min'] > pstats['min']:
@@ -1023,32 +1175,43 @@ class LdmsdCmdParser(cmd.Cmd):
             if stats['max'] < pstats['max']:
                 stats['max'] = pstats['max']
                 stats['max_prdcr'] = p
-            stats['avg'] = stats['avg'] * (stats['cnt']/(stats['cnt'] + pstats['cnt']))
-            stats['avg'] += pstats['avg'] * (pstats['cnt']/(stats['cnt'] + pstats['cnt']))
-            stats['cnt'] += pstats['cnt']
+            if pstats['cnt'] > 0:
+                stats['avg'] = stats['avg'] * (stats['cnt']/(stats['cnt'] + pstats['cnt']))
+                stats['avg'] += pstats['avg'] * (pstats['cnt']/(stats['cnt'] + pstats['cnt']))
+                stats['cnt'] += pstats['cnt']
         return stats
 
     def do_update_time_stats(self, arg):
         """
         Get the update time statistics of updaters
 
+        - Updater is the updater name.
+        - Min(usec) is the minimum time the updater spent to update a set.
+        - Max(usec) is the maximum time the updater spent to update a set.
+        - Average(usec) is the average time the updater spent to update a set.
+        - Count is the number of samples used to calculate the minimum, maximum, and average values.
+
         Parameters:
         [name=]        updater name
+        [reset=]       If 'true', reset the statistics after returning the values.
+                       The default is false.
         """
         arg = self.handle_args('update_time_stats', arg)
-        rc, msg = self.comm.update_time_stats(arg['name'])
+        rc, msg = self.comm.update_time_stats(**arg)
         if rc != 0:
             print(f'Error {rc}: {msg}')
             return
 
         j = fmt_status(msg)
-        print("Updater         Min(usec)       Max(usec)       Average(usec)   Count     ")
-        print(f"{'-'*15} {'-'*15} {'-'*15} {'-'*15} {'-'*10}")
+        print(f"{'Updater':15} {'Min(usec)':15} {'Max(usec)':15} {'Average(usec)':15} {'Count':10} {'Skipped Count':15} {'Oversampled Count':15}")
+        print(f"{'-'*15} {'-'*15} {'-'*15} {'-'*15} {'-'*10} {'-'*15} {'-'*15}")
         if rc !=0:
             return
         for n, updtr in j.items():
             stats = self.__update_time_stats(updtr)
-            print(f"{n:15} {stats['min']:15.4f} {stats['max']:15.4f} {stats['avg']:15.4f} {stats['cnt']:10}")
+            print(f"{n:15} {stats['min']:15.4f} {stats['max']:15.4f} " \
+                  f"{stats['avg']:15.4f} {stats['cnt']:10} " \
+                  f"{stats['skipped_cnt']:15} {stats['oversampled_cnt']:15}")
 
     def complete_update_time_stats(self, text, line, begidx, endidx):
         return self.__complete_attr_list('update_time_stats', text)
@@ -1065,12 +1228,13 @@ class LdmsdCmdParser(cmd.Cmd):
         rc, msg = self.comm.strgp_status(arg['name'])
         if rc == 0:
             policies = fmt_status(msg)
-            print("Name             Container        Schema           Plugin           flush(sec)       State")
-            print("---------------- ---------------- ---------------- ---------------- ------------ ----------------")
+            print(f"{'Name':16} {'Container':16} {'Schema':16} {'Regex':16} {'Plugin':16} {'Flush':16} {'State':10} {'Decomposition':20}")
+            print(f"{'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*10} {'-'*20}")
             for strgp in policies:
-                print("{0:16} {1:16} {2:16} {3:16} {4:16} {5}".format(
-                    strgp['name'], strgp['container'], strgp['schema'],
-                    strgp['plugin'], strgp['flush'], strgp['state']))
+                print(f"{strgp['name']:16} {strgp['container']:16} "
+                      f"{strgp['schema']:16} {strgp['regex']:16} "
+                      f"{strgp['plugin']:16} {strgp['flush']:16} {strgp['state']:10} "
+                      f"{strgp['decomp']}")
                 print("    producers: ", end='')
                 for prdcr in strgp['producers']:
                     print("{0} ".format(prdcr), end='')
@@ -1083,22 +1247,336 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_strgp_status(self, text, line, begidx, endidx):
         return self.__complete_attr_list('strgp_status', text)
 
+    def __datatbl_new(self):
+        return {'set_name' : [],
+                'min' : math.inf,
+                'max' : 0,
+                'avg' : 0,
+                'count' : 0,
+                'start_ts' : None,
+                'end_ts' : None,
+                'min_ts' : None,
+                'max_ts' : None,
+                'min_member' : None,
+                'max_member' : None,
+                'min_avg_member' : None,
+                'max_avg_member' : None}
+
+    def __bounds(self, tbl):
+        min_v = math.inf
+        max_v = 0
+        min_avg = math.inf
+        max_avg = 0
+
+        for k in tbl.keys():
+            if k == 'stats':
+                continue
+            if min_v > tbl[k]['stats']['min']:
+                min_v = tbl[k]['stats']['min']
+                tbl['stats']['min_member'] = k
+            if max_v < tbl[k]['stats']['max']:
+                max_v = tbl[k]['stats']['max']
+                tbl['stats']['max_member'] = k
+            if min_avg > tbl[k]['stats']['avg']:
+                min_avg = tbl[k]['stats']['avg']
+                tbl['stats']['min_avg_member'] = k
+            if max_avg < tbl[k]['stats']['avg']:
+                max_avg = tbl[k]['stats']['avg']
+                tbl['stats']['max_avg_member'] = k
+
+    def __avg_update(self, cur_avg, cur_cnt, v, cnt):
+        new_cnt = cur_cnt + cnt
+        if new_cnt == 0:
+            return 0.0
+        return (cur_avg * (cur_cnt / new_cnt) + v * (cnt / new_cnt), new_cnt)
+
+    def __min_max(self, tbl, data):
+        is_min = False
+        is_max = False
+
+        if tbl['min'] is None or tbl['min'] > data['min']:
+            tbl['min'] = data['min']
+            tbl['min_ts'] = data['min_ts']
+            is_min = True
+
+        if tbl['max'] is None or tbl['max'] < data['max']:
+            tbl['max'] = data['max']
+            tbl['max_ts'] = data['max_ts']
+            is_max = True
+        return (is_min, is_max)
+
+    def __datatbl_update(self, pset, strgp_tbl, schema_tbl, thread_tbl):
+        stgtbl = strgp_tbl['stats']
+        sstgtbl = strgp_tbl[pset['schema']]['stats']
+        tsstgtbl = strgp_tbl[pset['schema']][pset['thread_id']]['stats']
+
+        stbl = schema_tbl[pset['schema']]['stats']
+        ttbl = thread_tbl[pset['thread_id']]['stats']
+        tstbl = thread_tbl[pset['thread_id']][pset['schema']]['stats']
+
+        pset_avg = pset['stats']['avg']
+        pset_count = pset['stats']['count']
+
+        stgtbl['set_name'].append(pset['name'])
+        sstgtbl['set_name'].append(pset['name'])
+        tsstgtbl['set_name'].append(pset['name'])
+        stbl['set_name'].append(pset['name'])
+        ttbl['set_name'].append(pset['name'])
+        tstbl['set_name'].append(pset['name'])
+
+        stgtbl['avg'], stgtbl['count'] = self.__avg_update(stgtbl['avg'], stgtbl['count'],
+                                                           pset_avg, pset_count)
+        sstgtbl['avg'], sstgtbl['count'] = self.__avg_update(sstgtbl['avg'], sstgtbl['count'],
+                                                           pset_avg, pset_count)
+        tsstgtbl['avg'], tsstgtbl['count'] = self.__avg_update(tsstgtbl['avg'], tsstgtbl['count'],
+                                                           pset_avg, pset_count)
+
+        stbl['avg'], stbl['count'] = self.__avg_update(stbl['avg'], stbl['count'],
+                                                       pset_avg, pset_count)
+
+        ttbl['avg'], ttbl['count'] = self.__avg_update(ttbl['avg'], ttbl['count'],
+                                                       pset_avg, pset_count)
+        tstbl['avg'], tstbl['count'] = self.__avg_update(tstbl['avg'], tstbl['count'],
+                                                         pset_avg, pset_count)
+
+        self.__min_max(stgtbl, pset['stats'])
+        self.__min_max(sstgtbl, pset['stats'])
+        self.__min_max(tsstgtbl, pset['stats'])
+        self.__min_max(stbl, pset['stats'])
+        self.__min_max(ttbl, pset['stats'])
+        self.__min_max(tstbl, pset['stats'])
+
+    def __store_time_process(self, d):
+        # -----------------------------------------------
+        # SOURCE DICT
+        # -----------------------------------------------
+        # Assume that the returned jSON object is
+        # { <strgp_name> :{
+        #     "producers" : { <producer_name> : { EMPTY } },
+        #     "threads"   : { <producer set's thread ID> : { EMPTY }},
+        #     "schemas"   : { <set schema name> : { EMPTY }},
+        #     "sets"      : {
+        #        <set instance name> : {
+        #           "producer" : <producer name>,
+        #           "schema"   : <schema name>,
+        #           "thead_id" : <thread ID>,
+        #           "stats"    : {
+        #              "min"      : <float>,
+        #              "max"      : <float>,
+        #              "min_ts"   : <float>,
+        #              "max_ts"   : <float>,
+        #              "avg"      : <float>,
+        #              "count"    : <integer>,
+        #              "start_ts" : <float>, # seconds
+        #              "end_ts"   : <float>  # seconds
+        #           }
+        #        }
+        #     }
+        # }
+        #
+        # -----------------------------------------------
+        # RESULT TABLES FROM __store_time_process()
+        # -----------------------------------------------
+        # The function returns a tuple of three tables: (strgp_tbl, schema_tbl, thread_tbl)
+        #
+        # Each table organizes the same underlying data from different perspectives
+        # and contains statistics at various levels of hierarchy.
+        #
+        # First, the common stats dictionary structure used throughout:
+        # stats_dict = {
+        #   'set_name': [],          # List of set names in this group
+        #   'min': float,            # Minimum value
+        #   'max': float,            # Maximum value
+        #   'avg': float,            # Weighted average
+        #   'count': int,            # Count of operations
+        #   'start_ts': float,       # Earliest start timestamp (might be None)
+        #   'end_ts': float,         # Latest end timestamp (might be None)
+        #   'min_ts': float,         # Timestamp of minimum value (might be None)
+        #   'max_ts': float,         # Timestamp of maximum value (might be None)
+        #   'min_member': str/None,  # Member with minimum value (None at leaf level)
+        #   'max_member': str/None,  # Member with maximum value (None at leaf level)
+        #   'min_avg_member': str/None, # Member with minimum average (None at leaf level)
+        #   'max_avg_member': str/None  # Member with maximum average (None at leaf level)
+        # }
+        #
+        # 1. Storage Policy Table (strgp_tbl) - Organized by storage policy → schema → thread
+        # strgp_tbl = {
+        #   'stats': stats_dict,       # Global stats across all storage policies
+        #   '<strgp_name>': {          # Per storage policy entry
+        #     'stats': stats_dict,     # Stats for this storage policy
+        #     '<schema_name>': {       # Per schema within this storage policy
+        #       'stats': stats_dict,   # Stats for this schema within this storage policy
+        #       '<thread_id>': {       # Per thread within this schema and storage policy
+        #         'stats': stats_dict  # Stats for this thread, schema, and storage policy
+        #       }
+        #     }
+        #   }
+        # }
+        #
+        # 2. Schema Table (schema_tbl) - Organized by schema
+        # schema_tbl = {
+        #   'stats': stats_dict,       # Global stats across all schemas
+        #   '<schema_name>': {         # Per schema entry
+        #     'stats': stats_dict      # Stats for this schema
+        #   }
+        # }
+        #
+        # 3. Thread Table (thread_tbl) - Organized by thread → schema
+        # thread_tbl = {
+        #   'stats': stats_dict,       # Global stats across all threads
+        #   '<thread_id>': {           # Per thread entry
+        #     'stats': stats_dict,     # Stats for this thread
+        #     '<schema_name>': {       # Per schema within this thread
+        #       'stats': stats_dict    # Stats for this schema within this thread
+        #     }
+        #   }
+        # }
+        schema_tbl = {'stats' : self.__datatbl_new()}
+        thread_tbl = {'stats' : self.__datatbl_new()}
+        strgp_tbl = {'stats' : self.__datatbl_new()}
+
+        for strgp_name, strgp in d.items():
+            strgp_tbl[strgp_name] = {'stats' : self.__datatbl_new()}
+
+            for set_name, prdset in strgp['sets'].items():
+                prdset['name'] = set_name
+                schema_name = prdset['schema']
+                thread_id = prdset['thread_id']
+
+                if schema_name not in strgp_tbl[strgp_name]:
+                    strgp_tbl[strgp_name][schema_name] = {'stats' : self.__datatbl_new()}
+                if thread_id not in strgp_tbl[strgp_name][schema_name].keys():
+                    strgp_tbl[strgp_name][schema_name][thread_id] = {'stats' : self.__datatbl_new()}
+
+                if schema_name not in schema_tbl.keys():
+                    schema_tbl[schema_name] = {'stats': self.__datatbl_new()}
+
+                if thread_id not in thread_tbl.keys():
+                    thread_tbl[thread_id] = {'stats' : self.__datatbl_new()}
+                if schema_name not in thread_tbl[thread_id].keys():
+                    thread_tbl[thread_id][schema_name] = {'stats': self.__datatbl_new()}
+
+                self.__datatbl_update(prdset, strgp_tbl[strgp_name], schema_tbl, thread_tbl)
+
+        self.__bounds(strgp_tbl)
+        for k in strgp_tbl.keys():
+            if k == 'stats':
+                continue
+            self.__bounds(strgp_tbl[k])
+            for tid in strgp_tbl[k].keys():
+                if tid == 'stats':
+                    continue
+                self.__bounds(strgp_tbl[k][tid])
+
+        self.__bounds(schema_tbl)
+
+        self.__bounds(thread_tbl)
+        for k in thread_tbl.keys():
+            if k == 'stats':
+                continue
+            self.__bounds(thread_tbl[k])
+
+        return (strgp_tbl, schema_tbl, thread_tbl)
+
+    def __symbols(self, key, stats):
+        symbol = list()
+        if key == stats['min_member']:
+            symbol.append("<")
+        if key == stats['max_member']:
+            symbol.append(">")
+        if key == stats['min_avg_member']:
+            symbol.append("-")
+        if key == stats['max_avg_member']:
+            symbol.append("+")
+        return "".join(symbol)
+
     def do_store_time_stats(self, arg):
         """
         Get the store time statistics of a storage policy
+
+         - Storage Policy is the storage policy name.
+         - Min(usec), Max(usec), Avg(usec) are the minumum, maximum, and average times
+           the storage policy spent to store a set in microseconds.
+         - Count is the number of samples used to calculate the minimum, maximum, and average values.
+         - Number of Sets is the number of sets the storage policy is responsible to store.
+
         Parameters:
             [name=]    a storage policy name
+            [reset=]   If 'true', reset the statistics after returning the values.
+                       The default is false.
         """
         arg = self.handle_args('store_time_stats', arg)
-        rc, msg = self.comm.store_time_stats(arg['name'])
+        rc, msg = self.comm.store_time_stats(**arg)
         if rc != 0:
             # self.handle() already reported the error.
             return
         j = fmt_status(msg)
-        print("strgp           min(usec)       max(usec)      avg(usec)      Count")
-        print(f"{'-'*15} {'-'*15} {'-'*15} {'-'*15} {'-'*10}")
-        for n, strgp in j.items():
-            print(f"{n:15} {strgp['min']:15.4f} {strgp['max']:15.4f} {strgp['avg']:15.4f} {strgp['cnt']:10}")
+
+        try:
+            strgp_tbl, schema_tbl, thread_tbl = self.__store_time_process(j)
+        except Exception as e:
+            print(e)
+            return
+
+        # Schema Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"   <   Minimum Value          -   Minimum Average value")
+        print(f"   >   Maximum Value          +   Maximum Average value")
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4} {'Schema':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        schema_names = sorted(list(schema_tbl.keys()))
+        for schema in schema_names:
+            if schema == 'stats':
+                continue
+            stats = schema_tbl[schema]['stats']
+            print(f"{self.__symbols(schema, schema_tbl['stats']):>4}   {schema:>18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+
+        # Thread Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4}-{'Thread':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        # print(f"{'-'*4} {'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        threads = sorted(list(thread_tbl.keys()))
+        for tid in threads:
+            if tid == 'stats':
+                continue
+            symbol_tid = list()
+            stats = thread_tbl[tid]['stats']
+            print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+            print(f"{self.__symbols(tid, thread_tbl['stats']):>4}   {tid:18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+            schema_names = sorted([s for s in list(thread_tbl[tid].keys()) if s != 'stats'])
+            print(f"{' '*4} {'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+            for schema in schema_names:
+                st = thread_tbl[tid][schema]['stats']
+                print(f"   {self.__symbols(schema, thread_tbl[tid]['stats']):>4} {schema:>18} {st['min']:15.4f} {st['avg']:15.4f} {st['max']:15.4f} {st['min_ts']:20.4f} {st['max_ts']:20.4f} {len(set(st['set_name'])):10} {stats['count']:10}")
+            # print(f"{'-'*(4+21+16+16+16+21+21+11+11)}")
+
+        # Storage policy Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4} {'Storage Policy':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        strgps = sorted(list(strgp_tbl.keys()))
+        for strgp in strgps:
+            if strgp == 'stats':
+                continue
+            stats = strgp_tbl[strgp]['stats']
+            if 0 == len(stats['set_name']):
+                continue
+            print(f"{self.__symbols(strgp, strgp_tbl['stats']):>5}  {strgp:18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+            schemas = sorted([s for s in list(strgp_tbl[strgp].keys()) if s != 'stats'])
+            for schema in schemas:
+                print(f"   {' '*2}{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+                sch_stats = strgp_tbl[strgp][schema]['stats']
+                print(f"   {self.__symbols(schema, strgp_tbl[strgp]['stats']):>5} {schema:16} {sch_stats['min']:15.4f} {sch_stats['avg']:15.4f} " \
+                      f"{sch_stats['max']:15.4f} {sch_stats['min_ts']:20.4f} {sch_stats['max_ts']:20.4f} " \
+                      f"{len(set(sch_stats['set_name'])):10} {stats['count']:10}")
+                threads = sorted([s for s in list(strgp_tbl[strgp][schema].keys()) if s != 'stats'])
+                for tid in threads:
+                    st = strgp_tbl[strgp][schema][tid]['stats']
+                    print(f"       {self.__symbols(tid, strgp_tbl[strgp][schema]['stats']):>5}{tid:>13} {st['min']:15.4f} {st['avg']:15.4f} " \
+                          f"{st['max']:15.4f} {st['min_ts']:20.4f} {st['max_ts']:20.4f} " \
+                          f"{len(set(st['set_name'])):10} {stats['count']:10}")
+            print(f"{' '*5}  {'-'*18} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
 
     def complete_store_time_stats(self, text, line, begidx, endidx):
         return self.__complete_attr_list('store_time_stats', text)
@@ -1110,12 +1588,11 @@ class LdmsdCmdParser(cmd.Cmd):
         rc, msg = self.comm.plugn_status(arg['name'])
         if rc == 0:
             plugins = fmt_status(msg)
-            print("Name         Type         Interval     Offset       Libpath")
-            print("------------ ------------ ------------ ------------ ------------")
+            print("Config Name  Plugin                   Type         libpath")
+            print("------------ ------------------------ ------------ ------------")
             for plugn in plugins:
-                print("{0:12} {1:12} {2:12} {3:12} {4:12}".format(
-                    plugn['name'], plugn['type'],
-                    plugn['sample_interval_us'], plugn['sample_offset_us'],
+                print("{0:12} {1:24} {2:12} {3}".format(
+                    plugn['name'], plugn['plugin'], plugn['type'],
                     plugn['libpath']))
 
     def do_plugn_sets(self, arg):
@@ -1216,7 +1693,7 @@ class LdmsdCmdParser(cmd.Cmd):
         if arg:
             rc, msg = self.comm.plugn_config(arg['name'], arg['cfg_str'])
             if rc:
-                print(f'Error configuring {arg["name"]} plugin: {msg}')
+                print(f'Error configuring the \'{arg["name"]}\' plugin: {msg}')
 
     def complete_config(self, text, line, begidx, endidx):
         return self.__complete_attr_list('config', text)
@@ -1232,10 +1709,17 @@ class LdmsdCmdParser(cmd.Cmd):
                   the sample interval. If this offset is specified, including 0,
                   collection will be synchronous; if the offset is not specified,
                   collection will be asynchronous.
+        [exclusive_thread=]
+                  If exclusive_thread is 0, the sampler shares a thread with
+                  other sampler. If exclusive_thread is 1, the sampler has an
+                  exclusive thread to work on. The default is 0 (i.e. share
+                  sampling threads).
         """
         arg = self.handle_args('start', arg)
         if arg:
-            rc, msg = self.comm.plugn_start(arg['name'], arg['interval'], arg['offset'])
+            rc, msg = self.comm.plugn_start(arg['name'], arg['interval'],
+                                            arg['offset'],
+                                            arg.get('exclusive_thread'))
             if rc:
                 print(f'Error starting {arg["name"]} plugin: {msg}')
 
@@ -1302,20 +1786,63 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_udata_regex(self, text, line, begidx, endidx):
         return self.__complete_attr_list('udata_regex', text)
 
+    def __log_level(self, arg):
+        arg = self.handle_args('log_level', arg)
+        if arg:
+            rc, msg = self.comm.log_level(arg['level'], arg['name'], arg['regex'])
+            if rc:
+                print(f'Error changing log level: {msg}')
+
     def do_loglevel(self, arg):
         """
-        Changing the verbosity level of ldmsd
+        Changing the verbosity level of ldmsd loggers
+
+        If neither 'name' or 'regex' is given, the command will change the default log level.
+
         Parameters:
-        level=    Verbosity levels [DEBUG, INFO, ERROR, CRITICAL, QUIET]
+           level=    The choices are "default", "quiet",
+                     a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL.
+                    It is case insensitive.
+
+                     Note that "<level>," and "<level>" give different results.
+                     "<level>" -- a single level name -- set the log level
+                     to the given level and all the more severity levels.
+                     In contrast, "<level>," -- a level name followed by a comma --
+                     set the log level to only the given level.
+           [name=]   A logger name
+           [regex=]  A regular expression matching logger names,
+                     e.g., xprt.* to change the transport-related log levels.
         """
-        arg = self.handle_args('loglevel', arg)
-        if arg:
-            rc, msg = self.comm.loglevel(arg['level'])
-            if rc:
-                print(f'Error changing log level to arg["level"]: {msg}')
+        print(f'`loglevel` is being deprecated. Please use `log_level` in the future.')
+        self.__log_level(arg)
 
     def complete_loglevel(self, text, line, begidx, endidx):
-        return self.__complete_attr_list('loglevel', text)
+        return self.__complete_attr_list('log_level', text)
+
+    def do_log_level(self, arg):
+        """
+        Changing the verbosity level of ldmsd loggers
+
+        If neither 'name' or 'regex' is given, the command will change the default log level.
+
+        Parameters:
+           level=    The choices are "default", "quiet",
+                     a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL.
+                    It is case insensitive.
+
+                     Note that "<level>," and "<level>" give different results.
+                     "<level>" -- a single level name -- set the log level
+                     to the given level and all the more severity levels.
+                     In contrast, "<level>," -- a level name followed by a comma --
+                     set the log level to only the given level.
+           [name=]   A logger name
+           [regex=]  A regular expression matching logger names,
+                     e.g., xprt.* to change the transport-related log levels.
+        """
+        self.__log_level(arg)
+
+    def complete_log_level(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('log_level', text)
 
     def do_logrotate(self, arg):
         """
@@ -1625,77 +2152,82 @@ class LdmsdCmdParser(cmd.Cmd):
         ts_str = "{0} [{1}]".format(ts_sec, usec)
         return ts_str
 
-    def do_set_route(self, arg):
-        """
-        Display the route of the set from aggregators to the sampler daemon.
-        Parameters:
-        instance=   Set instance name
-        """
-        arg = self.handle_args('set_route', arg)
-        if not arg:
-            return
-        rc, msg = self.comm.set_route(arg['instance'])
-        attr_list = msg
-        if attr_list is None:
-            print("No response back")
+    def __floatts2human(self, ts):
+        if ts == 0:
+            return "-EMPTY-"
+        max_ts = float(int.from_bytes(b'\xff'*7+b'\x7f', 'little'))
+        if ts >= max_ts:
+            return "-EMPTY-"
+        sec = int(ts)
+        usec = int(ts % 1.0 * 1000000)
+        return self.__ts2human(sec, usec)
 
-        if attr_list[0].attr_id != LDMSD_Req_Attr.JSON:
-            # Assume that this is an error message
-            return
+    def display_worker_thread_stats(self, worker_threads, hdr):
+        print(hdr)
+        print(f"{'='*60}")
+        print(f"{'Thread ID':15} {'Linux Thread ID':20} {'Name':20} {'Idle':15} {'Active':15} {'Duration (sec)':15} {'Event Counts':15}")
+        print(f"{'-'*15} {'-'*20} {'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*15}")
+        for e in worker_threads:
+            print(f"{e['tid']:^15} {e['thread_id']:20} {e['name']:20} " \
+                  f"{e['idle_pc']:14.2f}% " \
+                  f"{e['active_pc']:14.2f}% {e['total_us']/1000000:14.2f}" \
+                  f"{e['ev_cnt']:15}")
 
-        try:
-            src = json.loads(attr_list[0].attr_value)
-            route = src['route']
-            print("---------------------")
-            print("instance: '{0}'".format(src['instance']))
-            print("schema: '{0}'".format(src['schema']))
-            print("=====================")
-            print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
-                "host", "type", "name", "prdcr_host", "interval", "offset", "sync", "start", "end"))
-            print("-------------------- --------------- --------------- --------------- "
-                    "---------- ---------- ----- ------------------------- -------------------------")
-            for hop in route:
-                detail = hop['detail']
-                if hop['type'] == "producer":
-                    print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
-                        hop['host'], hop['type'], detail['name'], detail['host'], detail['update_int'],
-                        detail['update_off'], detail['update_sync'],
-                        self.__ts2human(detail['last_start_sec'], detail['last_start_usec']),
-                        self.__ts2human(detail['last_end_sec'], detail['last_end_usec'])))
-                else:
-                    print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
-                        hop['host'], hop['type'], detail['name'], "---", detail['interval_us'],
-                        detail['offset_us'], detail['sync'],
-                        self.__ts2human(detail['trans_start_sec'], detail['trans_start_usec']),
-                        self.__ts2human(detail['trans_end_sec'], detail['trans_end_usec'])))
-        except:
-            raise
-
-    def complete_set_route(self, text, line, begidx, endidx):
-        return self.__complete_attr_list('set_info', text)
-
-    def display_thread_stats(self, stats):
-        print(f"{'Name':16} {'Samples':12} {'Sample Rate':12} " \
+    def display_io_thread_stats(self, io_threads):
+        print(f"IO Thread Statistics")
+        print(f"{'='*60}")
+        print(f"{'Thread ID':15} {'Linux Thread ID':20} {'Name':16} {'Samples':12} {'Sample Rate':12} " \
               f"{'Utilization':12} {'Send Queue Size':16} " \
               f"{'Num of EPs':12}")
-        print("---------------- ------------ ------------ ------------ "\
+        print(f"{'-'*15} {'-'*20} ---------------- ------------ ------------ ------------ "\
               "---------------- ------------")
-        for e in stats['entries']:
-            print(f"{e['name']:16} {e['sample_count']:12.0f} " \
+        for e in io_threads:
+            print(f"{e['tid']:^15} {e['thread_id']:20} {e['name']:16} {e['sample_count']:12.0f} " \
                   f"{e['sample_rate']:12.2f} {e['utilization'] * 100:12.2f} " \
                   f"{e['sq_sz']:16} {e['n_eps']:12}")
 
     def do_thread_stats(self, arg):
         """
-        Query the daemon's thread utilization statistics
+        Query the IO thread utilization statistics
+
+        The column descriptions are;
+          Samples is the total number of samples from the start or from the last reset until the query;
+          Sample Rate is the frequency of epoll waking up from the start or the last reset until the query;
+          Utilization is the ratio of the active time over a time window of each IO thread.
+          Send Queue Size is the number of send requests pending in the send queue.
+          Number of EPs is the number of connections (endpoints) each IO thread is responsible for.
+
+        Parameters:
+           [reset=]    If 'true', reset the statistics after returning the value. The default is false.
         """
-        rc, msg = self.comm.thread_stats()
+        arg = self.handle_args('thread_stats', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.thread_stats(arg['reset'])
         if msg == "":
             return
         if rc != 0:
+            print(f"Error {rc}: {msg}")
             return
         msg = fmt_status(msg)
-        self.display_thread_stats(msg)
+        print()
+        self.display_worker_thread_stats(msg['worker_threads'],
+                                         f"LDMSD Worker Thread Statistics")
+        self.display_worker_thread_stats(msg['xthreads'],
+                                         f"Exclusive Worker Thread Statistics")
+        print(f"{'='*60}")
+        self.display_io_thread_stats(msg['io_threads'])
+        print(f"{'='*60}")
+        print(f"IO Thread Usages of LDMS Operations")
+        print(f"{'='*60}")
+        for thr in msg['io_threads']:
+            thr['ldms_xprt'] = dict(sorted(thr['ldms_xprt'].items(), key = lambda item: item[1], reverse = True))
+            total = sum(v for v in thr['ldms_xprt'].values())
+            print(f"{thr['tid']}     {thr['thread_id']}     {thr['name']}")
+            print("   ", end="")
+            display = dict([(k, v) for k, v in thr['ldms_xprt'].items() if v != 0])
+            print('\n   '.join(f"{key:20} {(value/total*100):12.6f}%    {value}" for key, value in display.items()))
+            print(f"{'-'*60}")
 
     def complete_thread_stats(self, text, line, begidx, endidx):
         return self.__complete_attr_list('thread_stats', text)
@@ -1752,13 +2284,16 @@ class LdmsdCmdParser(cmd.Cmd):
         for n in stats:
             if n == 'compute_time':
                 continue
+            if n == 'summary':
+                continue
             print(f"{n:20} {stats[n]:16}")
 
     def do_set_stats(self, arg):
         """
         Query the daemon's set statistics
         """
-        rc, msg = self.comm.set_stats()
+        arg = self.handle_args('set_stats', arg)
+        rc, msg = self.comm.set_stats(**arg)
         if msg == "":
             return
         if rc != 0:
@@ -1818,18 +2353,35 @@ class LdmsdCmdParser(cmd.Cmd):
         for op_name in op_stats:
             s = op_stats[op_name]
             print(f"{op_name:12} {s['count']:12} {s['min_us']:12} {s['mean_us']:12} {s['max_us']:12}")
+        print(f"{'-'*40}")
+        print(f"Total send-queue depth: {sum([ e['sq_sz'] for k, e in stats['endpoints'].items()])}")
+
+        if stats['level'] == 0:
+            # Nothing else to do
+            return
+
+        print(f"{'-'*40}")
+        print(f"{'Remote Address':20} {'SQ Depth':10}")
+        print(f"{'-'*20} {'-'*10}")
+        sorted_ep = dict(sorted(stats['endpoints'].items()))
+        for k, x in sorted_ep.items():
+            print(f"{k:20} {x['sq_sz']:10}")
 
     def do_xprt_stats(self, arg):
         """
         Query the daemon's transport telemetry data
 
         Parameters:
-        [reset=]  If true, reset the statistics after returning them
+        [reset=]  If true, reset the statistics after returning them.
+        [sq_depth=] If true, the send-queue depth of each endpoint will be reported.
         """
         arg = self.handle_args('xprt_stats', arg)
         if not arg:
             return
-        rc, msg = self.comm.xprt_stats(arg['reset'])
+        level = 0
+        if arg['sq_depth'] is not None:
+            level = 1
+        rc, msg = self.comm.xprt_stats(reset=arg['reset'], level=level)
         if msg == "":
             return
         if rc != 0:
@@ -1840,6 +2392,30 @@ class LdmsdCmdParser(cmd.Cmd):
 
     def complete_xprt_stats(self, text, line, begidx, endidx):
         return self.__complete_attr_list('xprt_stats', text)
+
+    def do_profiling(self, arg):
+        """
+        Enable/disable and query the LDMS operation profiling data
+
+        The command was intended for diagnostic or study to improve ldmsd performance.
+
+        The command always reports the cached profiling data if exists.
+
+        Parameters:
+          [enabled=]   True to enable LDMS profiling
+          [reset=]     True to reset and free cached profiling data after the report
+        """
+        arg = self.handle_args('profiling', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.profiling(**arg)
+        if msg == "":
+            return
+        if rc != 0:
+            print(f"Error: {rc} {msg}")
+            return
+        stats = fmt_status(msg)
+        print(stats)
 
     def do_updtr_task(self, arg):
         """
@@ -1921,8 +2497,13 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         Dump the stream information
 
-        No Parameters
+        Parameters:
+        [reset=]     If true, reset the statistics of all streams after returning the values.
+                     The default is false.
         """
+        print("stream_status is deprecated")
+        return
+        # DEPRECATED
         FIRST = "first_ts"
         LAST = "last_ts"
         RATE = "bytes/sec"
@@ -1961,7 +2542,11 @@ class LdmsdCmdParser(cmd.Cmd):
                 return "-"
             return info["last_ts"]
 
-        rc, msg = self.comm.stream_status()
+        arg = self.handle_args('stream_status', arg)
+        if not arg:
+            return
+
+        rc, msg = self.comm.stream_status(arg['reset'])
         if msg is None:
             raise RuntimeError("no response")
         if (rc == 0):
@@ -1971,8 +2556,8 @@ class LdmsdCmdParser(cmd.Cmd):
             # print("--------------- -------------- --------------- ----- ----------------- -----------\n")
             for name,s in streams.items():
                 if name == "_OVERALL_":
-                    s['mode'] = ""
-                    print(f"{name}")
+                    # Skip the _OVERALL_ because it is confusing.
+                    continue
                 else:
                     print(f"{name} ({s['mode']})")
 
@@ -1987,6 +2572,118 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_stream_status(self, text, line, begidx, endidx):
         return self.__complete_attr_list('stream_status', text)
 
+    def do_stream_stats(self, arg):
+        """
+        Print stream stats that match the given `regex` or `stream`.
+
+        Parameters:
+            [regex=]  The regular expression to match the stream name
+            [stream=] The exact stream name
+            [json=1]  Set the output format to JSON
+        """
+        arg = self.handle_args('stream_stats', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.stream_stats(arg['regex'], arg['stream'], arg['reset'])
+        if rc:
+            emsg = f"stream_stats error: {rc}, msg: {msg}"
+            print(emsg)
+            if is_debug:
+                raise RuntimeError(emsg)
+        streams = fmt_status(msg)
+        if arg.get('json'):
+            print(json.dumps(streams, indent=1))
+            return
+        # header
+        print(f'{"name":30} {"bytes":12} {"count":12} {"first":26} {"last":26}')
+        print("-" * 30, "-" * 12, "-" * 12, "-" * 26, "-" * 26)
+        for s in streams:
+            name    = s["name"]
+            rx      = s["rx"]
+            sources = s.get("sources", dict())
+            clients = s.get("clients", list())
+            print(f'{name:30} {rx["bytes"]:>12} {rx["count"]:>12} '\
+                  f'{self.__floatts2human(rx["first_ts"]):26} ' \
+                  f'{self.__floatts2human(rx["last_ts"]):26}')
+            first_src = True
+            first_cli = True
+            for addr, rx in sources.items():
+                if first_src:
+                    print(" - sources:")
+                    first_src = False
+                print(f'   - {addr:25} {rx["bytes"]:>12} {rx["count"]:>12} '\
+                      f'{self.__floatts2human(rx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(rx["last_ts"]):26}')
+            for cli in clients:
+                if first_cli:
+                    print(" - clients:")
+                    first_cli = False
+                name = f"[{cli['client_match']}] {cli['client_desc']}"
+                tx = cli['tx']
+                drops = cli['drops']
+                print(f'   - {name+":":25}')
+                print(f'     - {"tx":23} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                      f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(tx["last_ts"]):26}')
+                print(f'     - {"drops":23} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                      f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                      f'{self.__floatts2human(drops["last_ts"]):26}')
+
+    def complete_stream_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_stats', text)
+
+    def do_stream_client_stats(self, arg):
+        """
+        Print stream stats
+
+        Parameters:
+            [json=1]  Set the output format to JSON
+        """
+        arg = self.handle_args('stream_stats', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.stream_client_stats(arg['reset'])
+        if rc:
+            emsg = f"stream_client_stats error: {rc}, msg: {msg}"
+            print(emsg)
+            if is_debug:
+                raise RuntimeError(emsg)
+        clients = fmt_status(msg)
+        if arg.get('json'):
+            print(json.dumps(clients, indent=1))
+            return
+        print(f'{"name":30} {"bytes":12} {"count":12} {"first":26} {"last":26}')
+        print("-" * 30, "-" * 12, "-" * 12, "-" * 26, "-" * 26)
+        for cli in clients:
+            name = f'[{cli["match"]}] {cli["dest"]} {cli["desc"]}'
+            tx = cli['tx']
+            drops = cli['drops']
+            print(f'{name}')
+            print(f' - {"tx":27} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                  f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                  f'{self.__floatts2human(tx["last_ts"]):26}')
+            print(f' - {"drops":27} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                  f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                  f'{self.__floatts2human(drops["last_ts"]):26}')
+            first_stream = True
+            for s in cli['streams']:
+                if first_stream:
+                    print(" - streams:")
+                    first_stream = False
+                name = s['stream_name']
+                tx = s['tx']
+                drops = s['drops']
+                print(f'   - {name+":":25}')
+                print(f'     - {"tx":23} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                      f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(tx["last_ts"]):26}')
+                print(f'     - {"drops":23} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                      f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                      f'{self.__floatts2human(drops["last_ts"]):26}')
+
+    def complete_stream_client_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_client_stats', text)
+
     def do_listen(self, arg):
         """
         Add a listen endpoint
@@ -1998,7 +2695,9 @@ class LdmsdCmdParser(cmd.Cmd):
             [auth=] Authenticantion domain.
                     If this is omitted or auth=auth_default is give,
                     the default authentication given the command line (-a and -A)
-                    will be used..
+                    will be used
+            [quota=] Receive quota of the connections established by accepted connection requests
+            [rx_rate=] Receive rate limit of the connections established by accepted connection requests
         """
         arg = self.handle_args('listen', arg)
         if not arg:
@@ -2006,7 +2705,9 @@ class LdmsdCmdParser(cmd.Cmd):
         rc, msg = self.comm.listen(arg['xprt'],
                                    arg['port'],
                                    arg['host'],
-                                   arg['auth'])
+                                   arg['auth'],
+                                   arg['quota'],
+                                   arg['rx_rate'])
         if rc:
             print(f'Error adding listener {arg["xprt"]} on port {arg["port"]}: {msg}')
 
@@ -2078,6 +2779,316 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_set_sec_mod(self, text, line, begidx, endidx):
         return self.__complete_attr_list('set_sec_mod', text)
 
+    def do_log_status(self, arg):
+        """
+        Return the list of loggers and their log level thresholds
+
+        If a name is given, only the log level threashold of the matched logger will be returned.
+
+        Parameters:
+           [name=]    A logger name.
+        """
+        arg = self.handle_args('log_status', arg)
+        rc, msg = self.comm.log_status(name = arg['name'])
+        if rc:
+            print(f"Error getting the logger infomation. {msg}")
+        loggers = fmt_status(msg)
+
+        print(f"{'Name':20} {'Log Level':30} Description")
+        print(f"{'-'*20} {'-'*30} {'-'*30}")
+
+        for l in loggers:
+            print(f"{l['name']:20} {l['level']:30} {l['desc']}")
+        print(f"{'-'*(20 + 30 + 30 + 2)}")
+        print("The loggers with the Log Level as 'default' use the same "
+              "log level as the default logger (ldmsd). When the default log "
+              "level changes, their log levels change accordingly.")
+
+    def complete_stats_reset(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stats_reset', text)
+
+    def do_stats_reset(self, arg):
+        """
+        Reset the statistics counters
+
+        Parameters:
+           [list=]   A comma-seprated list of statistics to be reset
+              thread - reset the thread statistics.
+              xprt   - reset the transport statistics.
+              update - reset the update time statistics and skipped and over-sampled counters.
+              store  - reset the store time statistics.
+              stream - reset the stream and stream client statistics
+        """
+        arg = self.handle_args('stats_reset', arg)
+        rc, msg = self.comm.stats_reset(s = arg['list'])
+        if rc:
+            print(f"Failed to reset the statistics")
+
+    def do_advertiser_add(self, arg):
+        """
+        Add an advertisement of its hostname to an aggregator. This is a part of the sampler discovery feature.
+        Parameters:
+                name=      A unique name to be used as producer name on the aggregator
+                xprt=      The transport name [sock, rdma, ugni]
+                host=      The aggregator hostname
+                port=      The aggregator port number
+                reconnect= The connection retry interval
+                [auth=]    The authentication method
+                [perm=]    The permission to modify the producer in the future.
+                [rail=]    The number of rail endpoints for the prdcr (default: 1).
+                [quota=] The send quota our ldmsd (the one we are controlling)
+                           advertises to the prdcr (default: value from ldmsd --quota
+                           option). This limits how much outstanding data our ldmsd
+                           holds for the prdcr. The prdcr drops messages when it does
+                           not have enough send quota.
+                [rx_rate=] The recv rate (bytes/sec) limit for this connection. The
+                           default is -1 (unlimited).
+        """
+        arg = self.handle_args('advertiser_add', arg)
+        if arg is None:
+            return
+        if arg['reconnect'] is None:
+            print(f"The attribute 'reconnect' is missing.")
+        else:
+            rc, msg = self.comm.advertiser_add(arg['name'],
+                                          arg['xprt'],
+                                          arg['host'],
+                                          arg['port'],
+                                          arg['reconnect'],
+                                          arg['auth'],
+                                          arg['perm'],
+                                          arg['rail'],
+                                          arg['quota'],
+                                          arg['rx_rate'])
+            if rc:
+                print(f'Error adding advertiser {arg["name"]}: {msg}')
+
+    def complete_advertiser_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('advertiser_add', text)
+
+    def do_advertiser_del(self, arg):
+        """
+        Delete an advertise from the sampler daemon. The advertise connot be in use.
+        Parameters:
+        name =   The advertise name
+        """
+        arg = self.handle_args('advertiser_del', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.advertiser_del(**arg)
+        if rc:
+            print(f"Error deleting advertiser {arg['name']}: {msg}")
+
+    def complete_advertiser_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('advertiser_del', text)
+
+    def do_advertiser_start(self, arg):
+        """
+        Start an advertisement
+        Parameters:
+        name =   The advertise name
+        """
+        arg = self.handle_args('advertiser_start', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.advertiser_start(**arg)
+        if rc:
+            print(f"Error starting advertiser {arg['name']}: {msg}")
+
+    def complete_advertiser_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('advertiser_start', text)
+
+    def do_advertiser_stop(self, arg):
+        """
+        Stop an advertisement
+        Parameters:
+        name =   The advertise name
+        """
+        arg = self.handle_args('advertiser_stop', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.advertiser_stop(**arg)
+        if rc:
+            print(f"Error stopping advertiser {arg['name']}: {msg}")
+
+    def complete_advertiser_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('advertiser_stop', text)
+
+    def do_advertiser_status(self, arg):
+        """
+        Get the statuses of advertisers
+        Parameters:
+        [name=]        Advertiser name
+        """
+        arg = self.handle_args('prdcr_status', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_status(arg['name'])
+            if rc == 0 and msg is not None:
+                producers = fmt_status(msg)
+                print("Name             Aggregator Host  Aggregator Port Transport    Reconnect(us)  State")
+                print("---------------- ---------------- --------------- ------------ --------------- ------------")
+                for prdcr in producers:
+                    if prdcr['type'] != 'advertiser':
+                        continue
+                    print(f"{prdcr['name']:16} {prdcr['host']:16} {prdcr['port']:<15} " \
+                          f"{prdcr['transport']:12} {prdcr['reconnect_us']:15} " \
+                          f"{prdcr['state']:12}")
+            else:
+                print(f'Error getting advertise status: {msg}')
+
+    def complete_advertiser_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_status', text)
+
+    def do_prdcr_listen_add(self, arg):
+        """
+        Add a producer listen
+
+        The producer listen must be started by using 'prdcr_listen_start'.
+
+        After the producer listen starts,
+        the aggregator waits for advertisements from samplers and
+        automatically adds and starts a producer if the peer (sampler) hostname
+        matches the regular expression.
+
+        The auto-generated producers can be stopped and restarted by using
+        prdcr_stop and prdcr_start, respectively, as manually added producers.
+
+        Parameters:
+                name=              A unique name of the producer listen
+                reconnect=         The retry interval to check for connection establishment of producers matched the regular expression.
+                [disable_start=]  Tell LDMSD not to start the producers
+                [ip=]              An IP masks to filter advertisements using the source IP
+                [regex=]           A regular expression to match sampler hostnames
+            Parameters to Control Advertised Producers:
+                [quota=]           The send quota our ldmsd (the one we are controlling)
+                                   advertises to the prdcr (default: value from ldmsd --quota
+                                   option). This limits how much outstanding data our ldmsd
+                                   holds for the prdcr. The prdcr drops messages when it does
+                                   not have enough send quota.
+                [rx_rate=]         The recv rate (bytes/sec) limit for this connection. The
+                                   default is -1 (unlimited).
+                [type=]            Passive(default) or active
+              Parameters for Active, Advertised Producers:
+                [advertiser_xprt=] Advertiser transport for active, advertised producer to use
+                [advertiser_port=] Advertiser port for active, advertised producer to connect to
+                [advertiser_auth=] Autentication domain to be used to connect to the advertiser
+                [rail=]            The number of rail endpoints for the prdcr (default: 1)
+        """
+        arg = self.handle_args('prdcr_listen_add', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.prdcr_listen_add(**arg)
+        if rc:
+            print(f"Error adding producer listen {arg['name']}: {msg}")
+
+    def complete_prdcr_listen_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_listen_add', text)
+
+    def do_prdcr_listen_del(self, arg):
+        """
+        Delete a producer_listen
+
+        The producer listen must not be running.
+
+        Parameters:
+                name=     A unique name of the producer listen
+        """
+        arg = self.handle_args('prdcr_listen_del', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.prdcr_listen_del(**arg)
+        if rc:
+            print(f"Error deleting producer listen {arg['name']}: {msg}")
+
+    def complete_prdcr_listen_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_listen_del', text)
+
+    def do_prdcr_listen_start(self, arg):
+        """
+        Start a producer_listen
+
+        The aggregator waits for advertisements from samplers. It matches the
+        hostnames in advertisements with the regular expression. If they match,
+        there are two scenarios; 1) no producer of the same name exists, and 2)
+        a producer of the same name exists. In the former case, the aggregator
+        will create a producer with the given name and start it. In the later
+        case, if the producer is stopped, the aggregator will _not_ start it
+        automatically. The producer can be started using `prdcr_start` or
+        `prdcr_start_regex`.
+
+        Parameters:
+                name=     A unique name of the producer listen
+        """
+        arg = self.handle_args('prdcr_listen_start', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.prdcr_listen_start(**arg)
+        if rc:
+            print(f"Error starting producer listen {arg['name']}: {msg}")
+
+    def complete_prdcr_listen_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_listen_start', text)
+
+    def do_prdcr_listen_stop(self, arg):
+        """
+        Stop a running producer_listen
+
+        The aggregator stops matching the hostnames in advertisements with the
+        regular expression. That is, the aggregator will not automatically add
+        any producers that the hostnames matches the regular expression.
+
+        Parameters:
+                name=     A unique name of the producer listen
+        """
+        arg = self.handle_args('prdcr_listen_stop', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.prdcr_listen_stop(**arg)
+        if rc:
+            print(f"Error stopping producer listen {arg['name']}: {msg}")
+
+    def complete_prdcr_listen_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_listen_stop', text)
+
+    def do_prdcr_listen_status(self, arg):
+        """
+        Display the status of all producer listen
+        """
+        arg = self.handle_args('prdcr_listen_status', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.prdcr_listen_status(**arg)
+        if rc == 0 and msg is not None:
+            l = fmt_status(msg)
+            print(f"{'Name':20} {'State':10} {'Type':8} {'IP Range':30} {'Regex':20}")
+            print(f"{'-'*20} {'-'*10} {'-'*8} {'-'*30} {'-'*20}")
+            for pl in l:
+                print(f"{pl['name']:20} {pl['state']:10} {pl['type']:8} {pl['IP range']:30} {pl['regex']:20}")
+
+                if pl['type'] == "active":
+                    print(f"    Connection config: xprt={pl['xprt']} port={pl['port']} " \
+                          f"reconnect={pl['reconnect']}", end="")
+                    if pl['auth_dom'] is not None and pl['auth_dom'] != "_DEFAULT_":
+                        print(f" auth={pl['auth_dom']}", end="")
+                    if pl['rail_sz'] is not None:
+                        print(f" rail={pl['rail_sz']}", end="")
+                else:
+                    print(f"    Connection config: ", end="")
+                    if pl['rx_rate'] == "-1" and pl['quota'] == "-1":
+                        print("None", end="")
+
+                if pl['rx_rate'] != "-1":
+                    print(f" rx_rate={pl['rx_rate']}", end="")
+                if pl['quota'] != "-1":
+                    print(f" quota={pl['quota']}", end="")
+                print(end="\n")
+
+                if len(pl['producers']):
+                    print(f"Producers: {', '.join(p for p in pl['producers'])}")
+                print(end="\n")
+        else:
+            print(f'Error getting prdcr_listen status: {msg}')
+
     def do_option(self, arg):
         """
         ONLY SUPPORTED IN CONFIGURATION FILES
@@ -2118,6 +3129,96 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         print("Not supported! The 'option' command is only supported in a configuration file.")
 
+    def do_qgroup_config(self, arg):
+        """
+        Configure Quota Group (qgroup) feature
+
+        Parameters:
+            quota=          The amount of our quota (bytes).
+            ask_interval=   The time interval to ask the members when our quota
+                            is low.
+            ask_amount=     The amount of quota to ask from our members.
+            ask_mark=       The amount of quota to determine as 'low'.
+            reset_interval= The time interval to reset our quota to its original
+                            value.
+        """
+        arg = self.handle_args('qgroup_config', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_config(**arg)
+        if rc:
+            print(f"qgroup_config error: {msg}")
+
+    def do_qgroup_member_add(self, arg):
+        """
+        Add a member to the Quota Group (qgroup)
+
+        Parameters:
+            host=     The hostname of the host.
+            xprt=     The transport name [sock, rdma, ugni].
+            [port=]   The OPTIONAL port number on which the peer LDMS is
+                      listening (default: 411).
+            [auth=]   The OPTIONAL authentication method.
+        """
+        arg = self.handle_args('qgroup_member_add', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_member_add(**arg)
+        if rc:
+            print(f"qgroup_member_add error: {msg}")
+
+    def do_qgroup_member_del(self, arg):
+        """
+        Delete a member from the Quota Group (qgroup).
+
+        Parameters:
+            host=     The hostname of the host.
+            [port=]   The OPTIONAL port number on which the peer LDMS is
+                      listening (default: 411).
+        """
+        arg = self.handle_args('qgroup_member_del', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_member_add(**arg)
+        if rc:
+            print(f"qgroup_member_add error: {msg}")
+
+    def do_qgroup_start(self, arg):
+        """
+        Start the Quota Group (qgroup) service.
+        """
+        arg = self.handle_args('qgroup_start', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_start(**arg)
+        if rc:
+            print(f"qgroup_start error: {msg}")
+
+    def do_qgroup_stop(self, arg):
+        """
+        Stop the Quota Group (qgroup) service.
+        """
+        arg = self.handle_args('qgroup_stop', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_stop(**arg)
+        if rc:
+            print(f"qgroup_stop error: {msg}")
+
+    def do_qgroup_info(self, arg):
+        """
+        Get the Quota Group (qgroup) information.
+        """
+        arg = self.handle_args('qgroup_info', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.qgroup_info(**arg)
+        if rc:
+            print(f"qgroup_info error: {msg}")
+        else:
+            obj = json.loads(msg)
+            print(json.dumps(obj, indent=1))
+
     def parseline(self, line):
         """Parse the line into a command name and a string containing
         the arguments.  Returns a tuple containing (command, args, line).
@@ -2144,7 +3245,6 @@ class LdmsdCmdParser(cmd.Cmd):
         while i < n and line[i] in self.identchars: i = i+1
         cmd, arg = line[:i], line[i:].strip()
         return cmd, arg, line
-
 
 if __name__ == "__main__":
     is_debug = True
@@ -2184,6 +3284,8 @@ if __name__ == "__main__":
         args = parser.parse_args()
 
         is_debug = args.debug
+        if is_debug:
+            import pdb
 
         auth_opt = None
         if args.auth_arg:
@@ -2226,3 +3328,4 @@ if __name__ == "__main__":
             raise
         else:
             print(e)
+            sys.exit(0)

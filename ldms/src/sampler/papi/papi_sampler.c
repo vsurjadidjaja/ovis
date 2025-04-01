@@ -1,6 +1,6 @@
 /* -*- c-basic-offset: 8 -*-
  *
- * Copyright (c) 2019 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2019,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -56,18 +56,19 @@
 #include <assert.h>
 #include <papi.h>
 #include <ovis_json/ovis_json.h>
+#include <ovis_log/ovis_log.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldmsd_stream.h"
 #include "../sampler_base.h"
 #include "papi_sampler.h"
 #include "papi_hook.h"
 
 #define SAMP "papi_sampler"
 
-static ldmsd_msg_log_f msglog;
+static ovis_log_t mylog;
 static char *papi_stream_name;
-base_data_t papi_base;
+base_data_t papi_base = NULL;
+ldms_stream_client_t stream_client = NULL;
 
 pthread_mutex_t job_lock = PTHREAD_MUTEX_INITIALIZER;
 struct rbt job_tree;		/* indexed by job_key */
@@ -193,7 +194,7 @@ static void *cleanup_proc(void *arg)
 		while (!LIST_EMPTY(&delete_list)) {
 			job = LIST_FIRST(&delete_list);
 			if (job->instance_name) {
-				msglog(LDMSD_LINFO,
+				ovis_log(mylog, OVIS_LINFO,
 				       "papi_sampler [%d]: deleting instance '%s', "
 				       "set_id %ld.\n",
 				       __LINE__, job->instance_name,
@@ -308,7 +309,7 @@ static int create_metric_set(job_data_t job)
 	ldms_schema_delete(schema);
 	return 0;
  err:
-	msglog(LDMSD_LERROR,
+	ovis_log(mylog, OVIS_LERROR,
 	       "papi_sampler [%d]: Error %d creating the metric set '%s'.\n",
 	       __LINE__, errno, job->instance_name);
 	if (schema)
@@ -329,11 +330,6 @@ static const char *usage(struct ldmsd_plugin *self)
 		"     job_expiry    Number of seconds to retain sets for completed jobs. Defaults to 60s\n";
 }
 
-static ldms_set_t get_set(struct ldmsd_sampler *self)
-{
-	return NULL;
-}
-
 static void sample_job(job_data_t job)
 {
 	long long values[64];
@@ -347,7 +343,7 @@ static void sample_job(job_data_t job)
 	LIST_FOREACH(t, &job->task_list, entry) {
 		rc = PAPI_read(t->event_set, values);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "reading EventSet for pid %d.\n", __LINE__,
 			       PAPI_strerror(rc), t->pid);
 		}
@@ -404,7 +400,7 @@ static int sample(struct ldmsd_sampler *self)
 	}
 	while (!LIST_EMPTY(&delete_list)) {
 		job = LIST_FIRST(&delete_list);
-		msglog(LDMSD_LINFO,
+		ovis_log(mylog, OVIS_LINFO,
 		       "papi_sampler [%d]: forcing cleanup of instance '%s', "
 		       "set %p, set_id %ld.\n",
 		       __LINE__, job->instance_name, job->set,
@@ -420,11 +416,6 @@ static int sample(struct ldmsd_sampler *self)
 	return 0;
 }
 
-static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
-			  ldmsd_stream_type_t stream_type,
-			  const char *msg, size_t msg_len,
-			  json_entity_t entity);
-
 static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, json_entity_t e)
 {
 	int rc;
@@ -434,7 +425,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 
 	attr = json_attr_find(e, "timestamp");
 	if (!attr) {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'timestamp' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'timestamp' attribute "
 				"in 'step_init' event.\n");
 		return EINVAL;
 	}
@@ -442,7 +433,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 
 	data = json_attr_find(e, "data");
 	if (!data) {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'data' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'data' attribute "
 		       "in 'init' event.\n");
 		return EINVAL;
 	}
@@ -452,7 +443,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	if (attr) {
 		local_tasks = json_value_int(json_attr_value(attr));
 	} else {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'local_tasks' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'local_tasks' attribute "
 		       "in 'init' event.\n");
 		return EINVAL;
 	}
@@ -460,8 +451,8 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	/* Parse the the subscriber_data attribute*/
 	attr = json_attr_find(dict, "subscriber_data");
 	if (!attr) {
-		msglog(LDMSD_LERROR,
-		       "papi_sampler[%d]: subscriber_data missing from init message, job %d ignored.\n",
+		ovis_log(mylog, OVIS_LERROR,
+		       "papi_sampler[%d]: subscriber_data missing from init message, job %ld ignored.\n",
 		       __LINE__, job_id);
 		return EINVAL;
 	}
@@ -493,15 +484,15 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	 */
 	json_entity_t subs_data = json_attr_value(attr);
 	if (json_entity_type(subs_data) != JSON_DICT_VALUE) {
-		msglog(LDMSD_LINFO,
-		       "papi_sampler[%d]: subscriber_data is not a dictionary, job %d ignored.\n",
-		       __LINE__);
+		ovis_log(mylog, OVIS_LINFO,
+		       "papi_sampler[%d]: subscriber_data is not a dictionary, job %ld ignored.\n",
+		       __LINE__, job_id);
 		rc = EINVAL;
 		goto out;
 	}
 	attr = json_attr_find(subs_data, "papi_sampler");
 	if (!attr)  {
-		msglog(LDMSD_LINFO,
+		ovis_log(mylog, OVIS_LINFO,
 		       "papi_sampler[%d]: subscriber_data missing papi_sampler attribute, job is ignored.\n",
 		       __LINE__);
 		rc = EINVAL;
@@ -513,7 +504,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	file_attr = json_attr_find(dict, "file");
 	config_attr = json_attr_find(dict, "config");
 	if (!file_attr && !config_attr) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "papi_sampler[%d]: papi_config object must contain "
 		       "either the 'file' or 'config' attribute.\n",
 		       __LINE__);
@@ -521,7 +512,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 		goto out;
 	}
 	if (job) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 				"papi_sampler[%d]: Duplicate step initialization for %lu.%lu",
 				__LINE__, job_id, app_id);
 		rc = EINVAL;
@@ -529,7 +520,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	}
 	job = alloc_job_data(job_id, app_id);
 	if (!job) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 				"papi_sampler[%d]: Memory allocation failure, job ignored.\n",
 				__LINE__);
 		rc = ENOMEM;
@@ -538,31 +529,31 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	if (file_attr) {
 		json_entity_t file_name = json_attr_value(file_attr);
 		if (json_entity_type(file_name) != JSON_STRING_VALUE) {
-			msglog(LDMSD_LERROR,
-			       "papi_sampler[%d]: papi_config 'file' attribute "
+			ovis_log(mylog, OVIS_LERROR,
+			       "papi_sampler[%ld]: papi_config 'file' attribute "
 			       "must be a string, job %d ignored.",
 			       job_id, __LINE__);
 			rc = EINVAL;
 			goto out;
 		}
-		rc = papi_process_config_file(job, json_value_str(file_name)->str, msglog);
+		rc = papi_process_config_file(job, json_value_str(file_name)->str, mylog);
 		if (rc) {
 			switch (rc) {
 			case ENOENT:
-				msglog(LDMSD_LERROR,
-				       "papi_sampler: The configuration "
+				ovis_log(mylog, OVIS_LERROR,
+				       "The configuration "
 				       "file, %s, does not exist.\n",
 				       json_value_str(file_name)->str);
 				break;
 			case EPERM:
-				msglog(LDMSD_LERROR,
-				       "papi_sampler: Permission denied "
+				ovis_log(mylog, OVIS_LERROR,
+				       "Permission denied "
 				       "processing the %s configuration file\n",
 				       json_value_str(file_name)->str);
 				break;
 			default:
-				msglog(LDMSD_LERROR,
-				       "papi_sampler: Error %d processing "
+				ovis_log(mylog, OVIS_LERROR,
+				       "Error %d processing "
 				       "the %s configuration file\n",
 				       rc, json_value_str(file_name)->str);
 
@@ -573,9 +564,9 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 	} else {
 		json_entity_t config_string = json_attr_value(config_attr);
 		if (json_entity_type(config_string) != JSON_STRING_VALUE) {
-			msglog(LDMSD_LERROR,
-			       "papi_sampler: papi_config 'config' "
-			       "attribute must be a string, job %d ignored.",
+			ovis_log(mylog, OVIS_LERROR,
+			       "papi_config 'config' "
+			       "attribute must be a string, job %ld ignored.",
 			       job_id);
 			rc = EINVAL;
 			goto out;
@@ -583,7 +574,7 @@ static int handle_step_init(job_data_t job, uint64_t job_id, uint64_t app_id, js
 		rc = papi_process_config_data(job,
 					      json_value_str(config_string)->str,
 					      json_value_str(config_string)->str_len,
-					      msglog);
+					      mylog);
 	}
 	job->job_state = JOB_PAPI_INIT;
 	job->job_state_time = time(NULL);
@@ -637,7 +628,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 	}
 	data = json_attr_find(e, "data");
 	if (!data) {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'data' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'data' attribute "
 		       "in 'task_init' event.\n");
 		return;
 	}
@@ -645,7 +636,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 
 	attr = json_attr_find(dict, "task_pid");
 	if (!attr) {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'task_pid' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'task_pid' attribute "
 		       "in 'task_init' event.\n");
 		return;
 	}
@@ -653,7 +644,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 
 	attr = json_attr_find(dict, "task_global_id");
 	if (!attr) {
-		msglog(LDMSD_LERROR, "papi_sampler: Missing 'task_global_id' attribute "
+		ovis_log(mylog, OVIS_LERROR, "Missing 'task_global_id' attribute "
 		       "in 'task_init' event.\n");
 		return;
 	}
@@ -661,7 +652,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 
 	t = malloc(sizeof *t);
 	if (!t) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "papi_sampler[%d]: Memory allocation failure.\n",
 		       __LINE__);
 		return;
@@ -688,7 +679,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 	LIST_FOREACH(t, &job->task_list, entry) {
 		rc = PAPI_create_eventset(&t->event_set);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "creating EventSet.\n", __LINE__, PAPI_strerror(rc));
 			job->job_state = JOB_PAPI_ERROR;
 			job->job_state_time = time(NULL);
@@ -696,7 +687,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 		}
 		rc = PAPI_assign_eventset_component(t->event_set, 0);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "assign EventSet to CPU.\n", __LINE__, PAPI_strerror(rc));
 			job->job_state = JOB_PAPI_ERROR;
 			job->job_state_time = time(NULL);
@@ -704,7 +695,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 		}
 		rc = PAPI_set_multiplex(t->event_set);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "setting multiplex.\n", __LINE__, PAPI_strerror(rc));
 			job->job_state = JOB_PAPI_ERROR;
 			job->job_state_time = time(NULL);
@@ -714,7 +705,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 		TAILQ_FOREACH(ev, &job->event_list, entry) {
 			rc = PAPI_add_event(t->event_set, ev->event_code);
 			if (rc != PAPI_OK) {
-				msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+				ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 				       "adding event '%s'.\n", __LINE__, PAPI_strerror(rc),
 				       ev->event_name);
 				job->job_state = JOB_PAPI_ERROR;
@@ -724,7 +715,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 		}
 		rc = PAPI_attach(t->event_set, t->pid);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "attaching EventSet to pid %d.\n", __LINE__,
 			       PAPI_strerror(rc), t->pid);
 			job->job_state = JOB_PAPI_ERROR;
@@ -735,7 +726,7 @@ static void handle_task_init(job_data_t job, json_entity_t e)
 	LIST_FOREACH(t, &job->task_list, entry) {
 		rc = PAPI_start(t->event_set);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "starting EventSet for pid %d.\n", __LINE__,
 			       PAPI_strerror(rc), t->pid);
 			job->job_state = JOB_PAPI_ERROR;
@@ -792,14 +783,14 @@ static void handle_task_exit(job_data_t job, json_entity_t e)
 			return;
 		rc = PAPI_stop(t->event_set, values);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler [%d]: PAPI error '%s' "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler [%d]: PAPI error '%s' "
 			       "stopping EventSet for pid %d.\n", __LINE__,
 			       PAPI_strerror(rc), t->pid);
 		}
 		t->papi_start = 0;
 		rc = PAPI_detach(t->event_set);
 		if (rc != PAPI_OK) {
-			msglog(LDMSD_LERROR, "papi_sampler[%d]: Error '%s' de-attaching from "
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler[%d]: Error '%s' de-attaching from "
 			       "process pid= %d. rc= %d\n", __LINE__,
 			       PAPI_strerror(rc), t->pid, rc);
 		}
@@ -829,37 +820,36 @@ static void handle_job_exit(job_data_t job, json_entity_t e)
 	release_job_data(job);
 }
 
-static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
-			  ldmsd_stream_type_t stream_type,
+static int stream_recv_cb(ldms_stream_type_t stream_type,
 			  const char *msg, size_t msg_len,
 			  json_entity_t entity)
 {
 	int rc = 0;
 	json_entity_t event, data, dict, attr;
 
-	if (stream_type != LDMSD_STREAM_JSON) {
-		msglog(LDMSD_LDEBUG, "papi_sampler: Unexpected stream type data...ignoring\n");
-		msglog(LDMSD_LDEBUG, "papi_sampler:" "%s\n", msg);
+	if (stream_type != LDMS_STREAM_JSON) {
+		ovis_log(mylog, OVIS_LDEBUG, "papi_sampler: Unexpected stream type data...ignoring\n");
+		ovis_log(mylog, OVIS_LDEBUG, "papi_sampler:" "%s\n", msg);
 		return EINVAL;
 	}
 
 	event = json_attr_find(entity, "event");
 	if (!event) {
-		msglog(LDMSD_LERROR, "papi_sampler: 'event' attribute missing\n");
+		ovis_log(mylog, OVIS_LERROR, "'event' attribute missing\n");
 		goto out_0;
 	}
 
 	json_str_t event_name = json_value_str(json_attr_value(event));
 	data = json_attr_find(entity, "data");
 	if (!data) {
-		msglog(LDMSD_LERROR, "papi_sampler: '%s' event is missing "
+		ovis_log(mylog, OVIS_LERROR, "'%s' event is missing "
 		       "the 'data' attribute\n", event_name->str);
 		goto out_0;
 	}
 	dict = json_attr_value(data);
 	attr = json_attr_find(dict, "job_id");
 	if (!attr) {
-		msglog(LDMSD_LERROR, "papi_sampler: The event is missing the "
+		ovis_log(mylog, OVIS_LERROR, "The event is missing the "
 		       "'job_id' attribute.\n");
 		goto out_0;
 	}
@@ -887,22 +877,36 @@ static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
 		if (job)
 			handle_job_exit(job, entity);
 	} else {
-		msglog(LDMSD_LDEBUG,
-		       "papi_sampler: ignoring event '%s'\n", event_name->str);
+		ovis_log(mylog, OVIS_LDEBUG,
+		       "ignoring event '%s'\n", event_name->str);
 	}
  	pthread_mutex_unlock(&job_lock);
  out_0:
 	return rc;
 }
 
+static int stream_cb(ldms_stream_event_t ev, void *arg)
+{
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
+	return stream_recv_cb(ev->recv.type, ev->recv.data, ev->recv.data_len,
+			      ev->recv.json);
+}
+
 static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct attr_value_list *avl)
 {
 	char *value;
+
+	if (papi_base) {
+		ovis_log(mylog, OVIS_LERROR, "papi_sampler config: already configured.\n");
+		return EEXIST;
+	}
+
 	value = av_value(avl, "job_expiry");
 	if (value)
 		papi_job_expiry = strtol(value, NULL, 0);
 
-	papi_base = base_config(avl, "papi_sampler", "papi-events", msglog);
+	papi_base = base_config(avl, self->cfg_name, "papi-events", mylog);
 	if (!papi_base)
 		return errno;
 	value = av_value(avl, "stream");
@@ -911,22 +915,31 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	} else {
 		papi_stream_name = strdup(value);
 		if (!papi_stream_name) {
-			msglog(LDMSD_LERROR, "papi_sampler[%d]: Memory allocation failure.\n", __LINE__);
+			ovis_log(mylog, OVIS_LERROR, "papi_sampler[%d]: Memory allocation failure.\n", __LINE__);
 			base_del(papi_base);
 			papi_base = NULL;
 			return EINVAL;
 		}
 	}
-	if (!ldmsd_stream_subscribe(papi_stream_name, stream_recv_cb, self)) {
-		msglog(LDMSD_LERROR, "papi_sampler[%d]: Error %d attempting "
+	stream_client =  ldms_stream_subscribe(papi_stream_name, 0, stream_cb, self, "papi_sampler");
+	if (!stream_client) {
+		ovis_log(mylog, OVIS_LERROR, "papi_sampler[%d]: Error %d attempting "
 		       "subscribe to the '%s' stream.\n",
-		       errno, papi_stream_name);
+		       __LINE__, errno, papi_stream_name);
 	}
 	return errno;
 }
 
 static void term(struct ldmsd_plugin *self)
 {
+	if (papi_base) {
+		base_del(papi_base);
+		papi_base = NULL;
+	}
+	if (stream_client) {
+		ldms_stream_close(stream_client);
+		stream_client = NULL;
+	}
 }
 
 static struct ldmsd_sampler papi_sampler = {
@@ -937,13 +950,18 @@ static struct ldmsd_sampler papi_sampler = {
 		.config = config,
 		.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler."SAMP, "Message for the " SAMP " plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of '" SAMP "' plugin. Error %d\n", rc);
+	}
 	return &papi_sampler.base;
 }
 
@@ -967,7 +985,7 @@ static void __attribute__ ((constructor)) papi_sampler_init(void)
 	pthread_t cleanup_thread;
 	int rc = PAPI_library_init(PAPI_VER_CURRENT);
 	if (rc < 0) {
-		ldmsd_lerror("papi_sampler: Error %d attempting to "
+		ovis_log(mylog, OVIS_LERROR, "Error %d attempting to "
 			     "initialize the PAPI library.\n", rc);
 	}
 	PAPI_thread_init(pthread_self);

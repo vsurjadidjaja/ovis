@@ -121,9 +121,10 @@ struct ovis_loglevel_s {
 	const char *name;
 };
 /*
- * The log level order in the table _must_ be from the least severity to the most severity.
+ * The log level is order by severity
  */
 struct ovis_loglevel_s level_tbl[] = {
+		{ OVIS_LQUIET,  "QUIET" },
 		{ OVIS_LDEBUG,	"DEBUG" },
 		{ OVIS_LINFO,	"INFO" },
 		{ OVIS_LWARN,	"WARNING" },
@@ -158,8 +159,13 @@ int ovis_log_set_level(ovis_log_t mylog, int level)
 	ovis_log_t log = mylog;
 	if (!is_level_valid(level))
 		return EINVAL;
-	if (!mylog && (level == OVIS_LDEFAULT)) {
-		/* Ignore OVIS_LDEFAULT because mylog is the default subsystem already. */
+	if ((!mylog || (mylog == &default_log)) && (level == OVIS_LDEFAULT)) {
+		/*
+		 * The caller is trying to change the log level of
+		 * the default logger to the default log level.
+		 *
+		 * Ignore it!
+		 */
 		return 0;
 	}
 	if (!mylog)
@@ -204,7 +210,7 @@ int ovis_log_set_level_by_regex(const char *regex_s, int level)
 		rc = regexec(&regex, l->name, 0, NULL, 0);
 		if (rc)
 			continue;
-		l->level = level;
+		ovis_log_set_level(l, level);
 		cnt++;
 	}
 	pthread_mutex_unlock(&subsys_tree_lock);
@@ -272,59 +278,37 @@ static int __str_to_loglevel(const char *level_s)
 	}
 }
 
-static int __get_bit(int level)
-{
-	int counter = -1;
-	while (level > 0) {
-		level = level >> 1;
-		counter++;
-	}
-	return counter;
-}
-
 int ovis_log_str_to_level(const char *level_s)
 {
-	int level = 0;
-	int i, rc = 0;
+	int level;
+	int i, rc;
 	char *s, *ptr, *tok;
-	struct ovis_loglevel_s *l;
 
-	if (!strchr(level_s, ',')) {
-		s = NULL;
-		/*
-		 * A single log level name is given.
-		 */
-		level = __str_to_loglevel(level_s);
-		if (level < 0) {
-			/*
-			 * Unrecognized level name
-			 */
-			rc = level;
-			goto err;
-		} else if (level == OVIS_LQUIET) {
-			/* QUIET is given. Return immediately. */
-		} else {
-			/*
-			 * A log level higher than QUIET is given.
-			 * Iterate through all levels that are equal or higher
-			 * than the given level and return the bitwise-or of the values.
-			 */
-			i = __get_bit(level);
-			l = &level_tbl[i+1];
-			while (l->name) {
-				level |= l->value;
-				l++;
-			}
-		}
-		return level;
-	}
+	if (strchr(level_s, ','))
+		goto parse_log_str;
 
+	/*
+	 * A single log level name is given.
+	 */
+	for (i = 0; strcasecmp(level_tbl[i].name, level_s); i++);
+	if (!i)
+		return OVIS_LQUIET;
+	if (!level_tbl[i].value)
+		return ENOENT;	/* level_s not found */
+	for (rc = 0; level_tbl[i].value; i++)
+		rc |= level_tbl[i].value;
+	return rc;
+
+parse_log_str:
 	s = strdup(level_s);
 	if (!s)
 		return -ENOMEM;
-	for (tok = strtok_r(s, ",", &ptr); tok; tok = strtok_r(NULL, ",", &ptr)) {
+	for (level = 0, tok = strtok_r(s, ",", &ptr); tok;
+			tok = strtok_r(NULL, ",", &ptr)) {
 		rc = __str_to_loglevel(tok);
-		if (rc < 0)
+		if (rc <= 0)
+			/* Not found or QUIET. QUIET cannot be combined
+			 * with any other log level */
 			goto err;
 		level |= rc;
 	}
@@ -448,17 +432,23 @@ struct ovis_log_buf {
 
 static int __buf_append(struct ovis_log_buf *buf, const char *fmt, ...)
 {
-	va_list ap;
+	va_list ap, ap_dup;
 	size_t cnt;
 	va_start(ap, fmt);
-	cnt = vsnprintf(&buf->buf[buf->off], buf->sz - buf->off, fmt, ap);
-	if (cnt >= buf->sz - buf->off) {
-		char *tmp = realloc(&buf->buf, buf->sz * 2);
-		if (!tmp)
-			return ENOMEM;
-		buf->buf = tmp;
-		buf->sz *= 2;
-		cnt = vsnprintf(&buf->buf[buf->off], buf->sz - buf->off, fmt, ap);
+	va_copy(ap_dup, ap);
+	while (1) {
+		cnt = vsnprintf(&buf->buf[buf->off], buf->sz - buf->off, fmt, ap_dup);
+		va_end(ap_dup);
+		if (cnt >= buf->sz - buf->off) {
+			char *tmp = realloc(buf->buf, buf->sz * 2);
+			if (!tmp)
+				return ENOMEM;
+			buf->buf = tmp;
+			buf->sz *= 2;
+			va_copy(ap_dup, ap);
+			continue;
+		}
+		break;
 	}
 	buf->off += cnt;
 	va_end(ap);
@@ -520,19 +510,29 @@ char *ovis_log_list(const char *subsys)
 		goto err;
 	}
 
+	rc = __buf_append(buf, "{\"name\":\"%s (default)\","
+			        "\"desc\":\"%s\","
+			        "\"level\":\"%s\"}",
+				default_log.name,
+				default_log.desc,
+				ovis_log_level_to_str(default_log.level));
+	if (rc) {
+		errno = rc;
+		goto err;
+	}
+
 	if (l) {
+		rc = __buf_append(buf, ",");
+		if (rc) {
+			errno = rc;
+			goto err;
+		}
 		rc = __get_log_info(l, buf);
 		if (rc) {
 			errno = rc;
 			goto err;
 		}
 	} else {
-		rc = __buf_append(buf, "{\"name\":\"%s\","
-				        "\"desc\":\"%s\","
-				        "\"level\":\"%s\"}",
-					default_log.name,
-					default_log.desc,
-					ovis_log_level_to_str(default_log.level));
 		RBT_FOREACH(rbn, &subsys_tree) {
 			rc = __buf_append(buf, ",");
 			if (rc) {
@@ -869,7 +869,9 @@ int ovis_log_open(const char *path)
 
 int ovis_log_flush()
 {
-	return fflush(log_fp);
+	if (log_fp && log_fp != OVIS_LOG_SYSLOG)
+		return fflush(log_fp);
+	return 0;
 }
 
 int ovis_log_close()
@@ -898,7 +900,7 @@ int ovis_vlog(ovis_log_t log, int level, const char *fmt, va_list ap)
 {
 	ev_t log_ev;
 	char *msg;
-	int rc;
+	int rc = 0;
 	struct timeval tv;
 	struct tm tm;
 	time_t t;
@@ -906,6 +908,11 @@ int ovis_vlog(ovis_log_t log, int level, const char *fmt, va_list ap)
 
 	if (!log)
 		log = &default_log;
+	/*
+	 * Take a log handle reference to prevent it
+	 * being destroyed while in this function.
+	 */
+	(void) __ovis_log_get(log);
 
 	lmask = ((log->level == OVIS_LDEFAULT)?default_log.level:log->level);
 
@@ -916,7 +923,7 @@ int ovis_vlog(ovis_log_t log, int level, const char *fmt, va_list ap)
 	 */
 	if (!(lmask & level)) {
 		/* The given level is disabled. Do nothing. */
-		return 0;
+		goto out;
 	}
 
 	if (default_modes & OVIS_LOG_M_TS) {
@@ -929,19 +936,21 @@ int ovis_vlog(ovis_log_t log, int level, const char *fmt, va_list ap)
 
 	rc = vasprintf(&msg, fmt, ap);
 	if (rc < 0) {
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto out;
 	}
 
 	if (!logger_w) {
 		/* No workers, so directly log to the file. */
 		rc = __log(log, level, msg, &tv, &tm);
 		free(msg);
-		return rc;
+		goto out;
 	}
 
 	log_ev = ev_new(log_type);
 	if (!log_ev) {
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto out;
 	}
 	EV_DATA(log_ev, struct log_data)->msg = msg;
 	EV_DATA(log_ev, struct log_data)->level = level;
@@ -953,7 +962,9 @@ int ovis_vlog(ovis_log_t log, int level, const char *fmt, va_list ap)
 	else
 		EV_DATA(log_ev, struct log_data)->tm = tm;
 	ev_post(NULL, logger_w, log_ev, NULL);
-	return 0;
+out:
+	__ovis_log_put(log); /* Put back the reference taken at the top of the function. */
+	return rc;
 }
 
 int ovis_log(ovis_log_t log, int level, const char *fmt, ...)

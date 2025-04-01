@@ -60,13 +60,8 @@
 #include "ldms_xprt.h"
 #include "config.h"
 
-/* a - b */
-static inline double ts_diff_usec(struct timespec *a, struct timespec *b)
-{
-	double aa = a->tv_sec*1e9 + a->tv_nsec;
-	double bb = b->tv_sec*1e9 + b->tv_nsec;
-	return (aa - bb)/1e3; /* make it usec */
-}
+/* Defined in ldmsd.c */
+extern ovis_log_t updtr_log;
 
 void ldmsd_updtr___del(ldmsd_cfgobj_t obj)
 {
@@ -86,7 +81,7 @@ void ldmsd_updtr___del(ldmsd_cfgobj_t obj)
 		rbn = rbt_min(&updtr->prdcr_tree);
 		rbt_del(&updtr->prdcr_tree, rbn);
 		prdcr_ref = container_of(rbn, struct ldmsd_prdcr_ref, rbn);
-		ldmsd_cfgobj_put(&prdcr_ref->prdcr->obj);
+		ldmsd_cfgobj_put(&prdcr_ref->prdcr->obj, "init");
 		free(prdcr_ref);
 	}
 	ldmsd_cfgobj___del(obj);
@@ -216,23 +211,6 @@ static void updtr_task_set_reset(ldmsd_updtr_task_t task)
 	task->set_count = 0;
 }
 
-static inline void
-__stats(struct ldmsd_stat *stat, struct timespec *start, struct timespec *end)
-{
-	double dur = ts_diff_usec(end, start);
-
-	stat->count++;
-	if (1 == stat->count) {
-		stat->avg = stat->min = stat->max = dur;
-	} else {
-		stat->avg = (stat->avg * ((stat->count - 1.0)/stat->count)) + (dur/stat->count);
-		if (stat->min > dur)
-			stat->min = dur;
-		else if (stat->max < dur)
-			stat->max = dur;
-	}
-}
-
 static void updtr_update_cb(ldms_t t, ldms_set_t set, int status, void *arg)
 {
 	uint64_t gn, push_it = 0;
@@ -243,10 +221,10 @@ static void updtr_update_cb(ldms_t t, ldms_set_t set, int status, void *arg)
 
 	pthread_mutex_lock(&prd_set->lock);
 	clock_gettime(CLOCK_REALTIME, &prd_set->updt_stat.end);
-	__stats(&prd_set->updt_stat, &prd_set->updt_stat.start, &prd_set->updt_stat.end);
+	ldmsd_stat_update(&prd_set->updt_stat, &prd_set->updt_stat.start, &prd_set->updt_stat.end);
 
 	errcode = LDMS_UPD_ERROR(status);
-	ldmsd_log(LDMSD_LDEBUG, "Update complete for Set %s with status %#x\n",
+	ovis_log(updtr_log, OVIS_LDEBUG, "Update complete for Set %s with status %#x\n",
 					prd_set->inst_name, status);
 	if (errcode) {
 		char *op_s;
@@ -254,20 +232,20 @@ static void updtr_update_cb(ldms_t t, ldms_set_t set, int status, void *arg)
 			op_s = "update";
 		else
 			op_s = "push";
-		ldmsd_log(LDMSD_LINFO, "Set %s: %s completing with "
+		ovis_log(updtr_log, OVIS_LINFO, "Set %s: %s completing with "
 					"bad status %d\n",
 					prd_set->inst_name, op_s,errcode);
 		goto out;
 	}
 
 	if (!ldms_set_is_consistent(set)) {
-		ldmsd_log(LDMSD_LINFO, "Set %s is inconsistent.\n", prd_set->inst_name);
+		ovis_log(updtr_log, OVIS_LINFO, "Set %s is inconsistent.\n", prd_set->inst_name);
 		goto set_ready;
 	}
 
 	gn = ldms_set_data_gn_get(set);
 	if (prd_set->last_gn == gn) {
-		ldmsd_log(LDMSD_LINFO, "Set %s oversampled %"PRIu64" == %"PRIu64".\n",
+		ovis_log(updtr_log, OVIS_LINFO, "Set %s oversampled %"PRIu64" == %"PRIu64".\n",
 			  prd_set->inst_name, prd_set->last_gn, gn);
 		__atomic_fetch_add(&prd_set->oversampled_cnt, 1, __ATOMIC_SEQ_CST);
 		goto set_ready;
@@ -281,9 +259,12 @@ static void updtr_update_cb(ldms_t t, ldms_set_t set, int status, void *arg)
 
 		ldmsd_strgp_lock(strgp);
 		clock_gettime(CLOCK_REALTIME, &start);
-		strgp->update_fn(strgp, prd_set);
+		strgp->update_fn(strgp, prd_set, &str_ref->decomp_ctxt);
 		clock_gettime(CLOCK_REALTIME, &end);
-		__stats(&strgp->stat, &start, &end);
+		if (prd_set->store_stat.start.tv_sec == 0)
+			prd_set->store_stat.start = start;
+		prd_set->store_stat.end = end;
+		ldmsd_stat_update(&prd_set->store_stat, &start, &end);
 		ldmsd_strgp_unlock(strgp);
 	}
 set_ready:
@@ -293,11 +274,11 @@ set_ready:
 out:
 	pthread_mutex_unlock(&prd_set->lock);
 	if (0 == errcode && push_it) {
-		ldmsd_log(LDMSD_LDEBUG, "Pushing set %p %s\n",
+		ovis_log(updtr_log, OVIS_LDEBUG, "Pushing set %p %s\n",
 			  prd_set->set, prd_set->inst_name);
 		int rc = ldms_xprt_push(prd_set->set);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR, "Failed to push set %s\n",
+			ovis_log(updtr_log, OVIS_LERROR, "Failed to push set %s\n",
 						prd_set->inst_name);
 		}
 	}
@@ -347,7 +328,7 @@ static int schedule_set_updates(ldmsd_prdcr_set_t prd_set, ldmsd_updtr_task_t ta
 	ldmsd_updtr_t updtr = task->updtr;
 	struct ldmsd_group_traverse_ctxt ctxt;
 	/* The reference will be put back in update_cb */
-	ldmsd_log(LDMSD_LDEBUG, "Schedule an update for set %s\n",
+	ovis_log(updtr_log, OVIS_LDEBUG, "Schedule an update for set %s\n",
 					prd_set->inst_name);
 	int push_flags = 0;
 	struct str_list_ent_s *ent;
@@ -409,7 +390,7 @@ static int schedule_set_updates(ldmsd_prdcr_set_t prd_set, ldmsd_updtr_task_t ta
 					     updtr_update_cb, prd_set);
 		if (rc) {
 			/* This message does not repeat */
-			ldmsd_log(LDMSD_LERROR, "Register push error %d Set %s\n",
+			ovis_log(updtr_log, OVIS_LERROR, "Register push error %d Set %s\n",
 						rc, prd_set->inst_name);
 		} else {
 			/* Only set the flag if we succeed */
@@ -422,7 +403,7 @@ out:
 		free(ent);
 	}
 	if (rc) {
-		ldmsd_log(LDMSD_LINFO, "Synchronous error %d: %s Set %s\n",
+		ovis_log(updtr_log, OVIS_LINFO, "Synchronous error %d: %s Set %s\n",
 						rc, op_s, prd_set->inst_name);
 		if (!updtr->push_flags)
 			ldmsd_prdcr_set_ref_put(prd_set);
@@ -433,13 +414,13 @@ out:
 static int cancel_set_updates(ldmsd_prdcr_set_t prd_set, ldmsd_updtr_t updtr)
 {
 	int rc;
-	ldmsd_log(LDMSD_LDEBUG, "Cancel push for set %s\n", prd_set->inst_name);
+	ovis_log(updtr_log, OVIS_LDEBUG, "Cancel push for set %s\n", prd_set->inst_name);
 	assert(prd_set->set);
 	if (!(prd_set->push_flags & LDMSD_PRDCR_SET_F_PUSH_REG))
 		return 0;
 	rc = ldms_xprt_cancel_push(prd_set->set);
 	if (rc) {
-		ldmsd_log(LDMSD_LINFO, "Synchronous error %d: canceling push for Set %s\n",
+		ovis_log(updtr_log, OVIS_LINFO, "Synchronous error %d: canceling push for Set %s\n",
 			  rc, prd_set->inst_name);
 	}
 	/* Put the push reference */
@@ -464,7 +445,7 @@ static int __setgrp_members_lookup(ldmsd_prdcr_set_t setgrp)
 	 */
 	rc = ldmsd_group_iter(setgrp->set, __grp_iter_cb, &ctxt);
 	if (rc) {
-		ldmsd_log(LDMSD_LERROR, "Error %d: Failed to get the set member "
+		ovis_log(updtr_log, OVIS_LERROR, "Error %d: Failed to get the set member "
 				"list of ssetgroup %s\n", rc, setgrp->inst_name);
 		return rc;
 	}
@@ -490,7 +471,7 @@ static int __setgrp_members_lookup(ldmsd_prdcr_set_t setgrp)
 				 */
 				continue;
 			case LDMSD_PRDCR_SET_STATE_UPDATING:
-				ldmsd_log(LDMSD_LINFO, "%s: %s in an "
+				ovis_log(updtr_log, OVIS_LINFO, "%s: %s in an "
 						"unexpected state (%s)\n",
 						__func__, pset->inst_name,
 						ldmsd_prdcr_set_state_str(pset->state));
@@ -504,7 +485,7 @@ static int __setgrp_members_lookup(ldmsd_prdcr_set_t setgrp)
 						      __ldmsd_prdset_lookup_cb, pset);
 				if (rc) {
 					pset->state = LDMSD_PRDCR_SET_STATE_START;
-					ldmsd_log(LDMSD_LINFO,
+					ovis_log(updtr_log, OVIS_LINFO,
 						"Synchronous error %d "
 						"from ldms_lookup\n", rc);
 					ldmsd_prdcr_set_ref_put(pset);
@@ -535,7 +516,7 @@ void __ldmsd_prdset_lookup_cb(ldms_t xprt, enum ldms_lookup_status status,
 		assert(NULL == set);
 		status = (status < 0 ? -status : status);
 		if (status == ENOMEM) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(updtr_log, OVIS_LERROR,
 				  "prdcr %s: Set memory allocation failure in lookup of "
 				  "set '%s'. Consider changing the -m parameter on the "
 				  "command line to a larger value. The current value is %s\n",
@@ -543,13 +524,13 @@ void __ldmsd_prdset_lookup_cb(ldms_t xprt, enum ldms_lookup_status status,
 				  prd_set->inst_name,
 				  ldmsd_get_max_mem_sz_str());
 		} else if (status == EEXIST) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(updtr_log, OVIS_LERROR,
 				  "prdcr %s: The set '%s' (%p) already exists. "
 				  "It is likely that there are multiple "
 				  "producers providing a set with the same instance name.\n",
 				  prd_set->prdcr->obj.name, prd_set->inst_name, set);
 		} else {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(updtr_log, OVIS_LERROR,
 				  "prdcr %s: Error %d in lookup callback of set '%s' (%p)\n",
 				  prd_set->prdcr->obj.name,
 				  status, prd_set->inst_name, set);
@@ -573,8 +554,9 @@ void __ldmsd_prdset_lookup_cb(ldms_t xprt, enum ldms_lookup_status status,
 		if (__setgrp_members_lookup(prd_set))
 			goto out;
 	}
+	prd_set->zap_thread_id = ldms_set_thread_id_get(set);
 	prd_set->state = LDMSD_PRDCR_SET_STATE_READY;
-	ldmsd_log(LDMSD_LINFO, "Set %s is ready\n", prd_set->inst_name);
+	ovis_log(updtr_log, OVIS_LINFO, "Set %s is ready\n", prd_set->inst_name);
 	ldmsd_strgp_update(prd_set);
 	ready = 1;
 out:
@@ -585,6 +567,8 @@ out:
 	return;
 }
 
+/* Implemented in ldmsd.c */
+extern double ts_diff_usec(struct timespec *a, struct timespec *b);
 static void schedule_prdcr_updates(ldmsd_updtr_task_t task,
 				   ldmsd_prdcr_t prdcr, ldmsd_name_match_t match)
 {
@@ -614,7 +598,7 @@ static void schedule_prdcr_updates(ldmsd_updtr_task_t task,
 				goto next_prd_set;
 		}
 
-		ldmsd_log(LDMSD_LDEBUG, "updtr_task sched '%ld': set '%s'\n",
+		ovis_log(updtr_log, OVIS_LDEBUG, "updtr_task sched '%ld': set '%s'\n",
 				task->sched.intrvl_us, prd_set->inst_name);
 		updtr_task_set_add(task);
 
@@ -636,7 +620,7 @@ static void schedule_prdcr_updates(ldmsd_updtr_task_t task,
 			if (rc) {
 				/* If the error is EEXIST, the set is already in the set tree. */
 				if (rc == EEXIST) {
-					ldmsd_log(LDMSD_LERROR, "Prdcr '%s': "
+					ovis_log(updtr_log, OVIS_LERROR, "Prdcr '%s': "
 						"lookup failed synchronously. "
 						"The set '%s' already exists. "
 						"It is likely that there are more "
@@ -645,7 +629,7 @@ static void schedule_prdcr_updates(ldmsd_updtr_task_t task,
 						prd_set->prdcr->obj.name,
 						prd_set->inst_name);
 				} else {
-					ldmsd_log(LDMSD_LINFO, "Synchronous error "
+					ovis_log(updtr_log, OVIS_LINFO, "Synchronous error "
 							"%d from ldms_lookup\n", rc);
 				}
 				prd_set->state = LDMSD_PRDCR_SET_STATE_START;
@@ -653,12 +637,12 @@ static void schedule_prdcr_updates(ldmsd_updtr_task_t task,
 			}
 			goto next_prd_set;
 		case LDMSD_PRDCR_SET_STATE_LOOKUP:
-			ldmsd_log(LDMSD_LINFO, "%s: Set %s: "
+			ovis_log(updtr_log, OVIS_LINFO, "%s: Set %s: "
 				"there is an outstanding lookup.\n",
 				__func__, prd_set->inst_name);
 			goto next_prd_set;
 		case LDMSD_PRDCR_SET_STATE_UPDATING:
-			ldmsd_log(LDMSD_LINFO, "%s: Set %s: "
+			ovis_log(updtr_log, OVIS_LINFO, "%s: Set %s: "
 				"there is an outstanding update.\n",
 				__func__, prd_set->inst_name);
 			__atomic_fetch_add(&prd_set->skipped_upd_cnt, 1, __ATOMIC_SEQ_CST);
@@ -869,7 +853,7 @@ static int updtr_tasks_create(ldmsd_updtr_t updtr)
 	char *str;
 	int rc;
 
-	ldmsd_log(LDMSD_LDEBUG, "updtr '%s' getting auto-schedule\n", updtr->obj.name);
+	ovis_log(updtr_log, OVIS_LDEBUG, "updtr '%s' getting auto-schedule\n", updtr->obj.name);
 
 	for (prd_ref = updtr_prdcr_ref_first(updtr); prd_ref;
 			prd_ref = updtr_prdcr_ref_next(prd_ref)) {
@@ -906,20 +890,17 @@ err:
 	return rc;
 }
 
-int prdcr_ref_cmp(void *a, const void *b)
-{
-	return strcmp(a, b);
-}
-
 #define UPDTR_TREE_MGMT_TASK_INTRVL 3600000000
 
+/* The implementation is in ldmsd_prdcr.c */
+extern int prdcr_ref_cmp(void *a, const void *b);
 ldmsd_updtr_t
 ldmsd_updtr_new_with_auth(const char *name, char *interval_str, char *offset_str,
 					int push_flags, int is_auto_task,
 					uid_t uid, gid_t gid, int perm)
 {
+	int rc;
 	struct ldmsd_updtr *updtr;
-	char *endptr;
 	long interval_us = UPDTR_TREE_MGMT_TASK_INTRVL, offset_us = LDMSD_UPDT_HINT_OFFSET_NONE;
 	updtr = (struct ldmsd_updtr *)
 		ldmsd_cfgobj_new_with_auth(name, LDMSD_CFGOBJ_UPDTR,
@@ -932,16 +913,12 @@ ldmsd_updtr_new_with_auth(const char *name, char *interval_str, char *offset_str
 	updtr->default_task.is_default = 1;
 	updtr->is_auto_task = is_auto_task;
 	if (interval_str) {
-		interval_us = strtol(interval_str, &endptr, 0);
-		if (('\0' == interval_str[0]) || ('\0' != endptr[0]))
-			goto einval;
-		if (0 >= interval_us)
+		rc = ovis_time_str2us(interval_str, &interval_us);
+		if (rc || (0 >= interval_us))
 			goto einval;
 		if (offset_str) {
-			offset_us = strtol(offset_str, &endptr, 0);
-			if (('\0' == offset_str[0]) || ('\0' != endptr[0]))
-				goto einval;
-			if (interval_us < labs(offset_us) * 2)
+			rc = ovis_time_str2us(offset_str, &offset_us);
+			if (rc || (interval_us < labs(offset_us) * 2))
 				goto einval;
 			/* Make it a hint offset */
 			offset_us -= updtr_sched_offset_skew_get();
@@ -961,10 +938,13 @@ ldmsd_updtr_new_with_auth(const char *name, char *interval_str, char *offset_str
 	rbt_init(&updtr->task_tree, ldmsd_updtr_schedule_cmp);
 	updtr->push_flags = push_flags;
 	ldmsd_cfgobj_unlock(&updtr->obj);
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&updtr->obj.ref, updtr->obj.name, stderr);
+#endif
 	return updtr;
 einval:
 	ldmsd_cfgobj_unlock(&updtr->obj);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "init");
 	errno = EINVAL;
 	return NULL;
 }
@@ -983,7 +963,6 @@ ldmsd_updtr_new(const char *name, char *interval_str,
 }
 
 extern struct rbt *cfgobj_trees[];
-extern pthread_mutex_t *cfgobj_locks[];
 ldmsd_cfgobj_t __cfgobj_find(const char *name, ldmsd_cfgobj_type_t type);
 
 int ldmsd_updtr_del(const char *updtr_name, ldmsd_sec_ctxt_t ctxt)
@@ -991,7 +970,7 @@ int ldmsd_updtr_del(const char *updtr_name, ldmsd_sec_ctxt_t ctxt)
 	int rc = 0;
 	ldmsd_updtr_t updtr;
 
-	pthread_mutex_lock(cfgobj_locks[LDMSD_CFGOBJ_UPDTR]);
+	ldmsd_cfg_lock(LDMSD_CFGOBJ_UPDTR);
 	updtr = (ldmsd_updtr_t)__cfgobj_find(updtr_name, LDMSD_CFGOBJ_UPDTR);
 	if (!updtr) {
 		rc = ENOENT;
@@ -1006,16 +985,38 @@ int ldmsd_updtr_del(const char *updtr_name, ldmsd_sec_ctxt_t ctxt)
 		goto out_1;
 	}
 
+	/*
+	 * Remove our references on our producers
+	 */
+	struct rbn *rbn;
+	ldmsd_prdcr_ref_t ref;
+	rbn = rbt_min(&updtr->prdcr_tree);
+	while (rbn) {
+		ref = container_of(rbn, struct ldmsd_prdcr_ref, rbn);
+		ldmsd_prdcr_put(ref->prdcr, "updtr_prdcr_ref");
+		rbt_del(&updtr->prdcr_tree, rbn);
+		rbn = rbn_succ(rbn);
+		free(ref);
+	}
+	/*
+	 * Check that only 'init', 'find', and 'cfgobj_tree' references
+	 * remain.
+	 */
+	if (ldmsd_cfgobj_refcount(&updtr->obj) > 3) {
+		rc = EBUSY;
+		goto out_1;
+	}
+
 	rbt_del(cfgobj_trees[LDMSD_CFGOBJ_UPDTR], &updtr->obj.rbn);
-	ldmsd_updtr_put(updtr); /* tree reference */
+	ldmsd_updtr_put(updtr, "cfgobj_tree"); /* tree reference */
+	ldmsd_updtr_put(updtr, "init"); /* tree reference */
 	rc = 0;
 	/* let-through */
 out_1:
 	ldmsd_updtr_unlock(updtr);
 out_0:
-	pthread_mutex_unlock(cfgobj_locks[LDMSD_CFGOBJ_UPDTR]);
-	if (updtr)
-		ldmsd_updtr_put(updtr); /* `find` reference */
+	ldmsd_cfg_unlock(LDMSD_CFGOBJ_UPDTR);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1088,8 +1089,12 @@ int ldmsd_updtr_start(const char *updtr_name, const char *interval_str,
 	interval_us = updtr->default_task.sched.intrvl_us;
 	offset_us = updtr->default_task.hint.offset_us;
 	if (interval_str) {
-		/* A new interval is given. */
-		interval_us = strtol(interval_str, NULL, 0);
+		/* A new interval is given, and its value has been checked by the handler. */
+		rc = ovis_time_str2us(interval_str, &interval_us);
+		if (rc || (interval_us <= 0)) {
+			rc = EINVAL;
+			goto err;
+		}
 		if (!offset_str) {
 			/* An offset isn't given. We assume that
 			 * users want the updater to schedule asynchronously.
@@ -1097,28 +1102,32 @@ int ldmsd_updtr_start(const char *updtr_name, const char *interval_str,
 			offset_us = LDMSD_UPDT_HINT_OFFSET_NONE;
 		}
 	}
-	if (offset_str)
-		offset_us = strtol(offset_str, NULL, 0)
-					- updtr_sched_offset_skew_get();
-
-	if (interval_us < labs(offset_us) * 2) {
-		ldmsd_log(LDMSD_LERROR, "%s: The absolute value of the offset"
-			" value must not be larger than the half of "
-			"the update interval. (i=%ld, o=%ld)\n", "ldmsd_updtr_start",
-			interval_us, offset_us);
-		rc = EINVAL;
-		goto err;
+	if (offset_str) {
+		rc = ovis_time_str2us(offset_str, &offset_us);
+		if (rc) {
+			rc = EINVAL;
+			goto err;
+		}
+		if (interval_us < labs(offset_us) * 2) {
+			ovis_log(updtr_log, OVIS_LERROR, "%s: The absolute value of the offset"
+				" value must not be larger than the half of "
+				"the update interval. (i=%ld, o=%ld)\n", "ldmsd_updtr_start",
+				interval_us, offset_us);
+			rc = EINVAL;
+			goto err;
+		}
+		offset_us = offset_us - updtr_sched_offset_skew_get();
 	}
 	/* Initialize the default task */
 	updtr_task_init(&updtr->default_task, updtr, 1, interval_us, offset_us);
 	ldmsd_updtr_unlock(updtr);
 	rc = __ldmsd_updtr_start(updtr, ctxt);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 
 err:
 	ldmsd_updtr_unlock(updtr);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1172,6 +1181,9 @@ int __ldmsd_updtr_stop(ldmsd_updtr_t updtr, ldmsd_sec_ctxt_t ctxt)
 	updtr->state = LDMSD_UPDTR_STATE_STOPPED;
 	/* let-through */
 out_1:
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&updtr->obj.ref, updtr->obj.name, stderr);
+#endif
 	ldmsd_updtr_unlock(updtr);
 	return rc;
 }
@@ -1183,7 +1195,7 @@ int ldmsd_updtr_stop(const char *updtr_name, ldmsd_sec_ctxt_t ctxt)
 	if (!updtr)
 		return ENOENT;
 	rc = __ldmsd_updtr_stop(updtr, ctxt);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1303,7 +1315,7 @@ out_2:
 	free(match);
 out_1:
 	ldmsd_updtr_unlock(updtr);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1345,7 +1357,7 @@ int ldmsd_updtr_match_del(const char *updtr_name, const char *regex_str,
 	free(match);
 out_1:
 	ldmsd_updtr_unlock(updtr);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1353,7 +1365,7 @@ ldmsd_prdcr_ref_t prdcr_ref_new(ldmsd_prdcr_t prdcr)
 {
 	ldmsd_prdcr_ref_t ref = calloc(1, sizeof *ref);
 	if (ref) {
-		ref->prdcr = ldmsd_prdcr_get(prdcr);
+		ref->prdcr = ldmsd_prdcr_get(prdcr, "updtr_prdcr_ref");
 		rbn_init(&ref->rbn, prdcr->obj.name);
 	}
 	return ref;
@@ -1367,8 +1379,6 @@ ldmsd_prdcr_ref_t prdcr_ref_find(ldmsd_updtr_t updtr, const char *name)
 		return NULL;
 	return container_of(rbn, struct ldmsd_prdcr_ref, rbn);
 }
-
-
 
 ldmsd_prdcr_ref_t prdcr_ref_find_regex(ldmsd_updtr_t updtr, regex_t *regex)
 {
@@ -1392,10 +1402,6 @@ int __ldmsd_updtr_prdcr_add(ldmsd_updtr_t updtr, ldmsd_prdcr_t prdcr)
 	ldmsd_prdcr_ref_t ref;
 
 	ldmsd_updtr_lock(updtr);
-	if (updtr->state != LDMSD_UPDTR_STATE_STOPPED) {
-		rc = EBUSY;
-		goto out;
-	}
 	ref = prdcr_ref_find(updtr, prdcr->obj.name);
 	if (ref) {
 		rc = EEXIST;
@@ -1415,20 +1421,15 @@ out:
 int ldmsd_updtr_prdcr_add(const char *updtr_name, const char *prdcr_regex,
 			  char *rep_buf, size_t rep_len, ldmsd_sec_ctxt_t ctxt)
 {
-	regex_t regex;
 	ldmsd_updtr_t updtr;
 	ldmsd_prdcr_t prdcr;
+	ldmsd_name_match_t prd_match;
 	int rc;
-
-	rc = ldmsd_compile_regex(&regex, prdcr_regex, rep_buf, rep_len);
-	if (rc)
-		return EINVAL;
 
 	updtr = ldmsd_updtr_find(updtr_name);
 	if (!updtr) {
 		sprintf(rep_buf, "%dThe updater specified does not "
 						"exist\n", ENOENT);
-		regfree(&regex);
 		return ENOENT;
 	}
 
@@ -1442,9 +1443,32 @@ int ldmsd_updtr_prdcr_add(const char *updtr_name, const char *prdcr_regex,
 		rc = EBUSY;
 		goto out_1;
 	}
+
+	prd_match = calloc(1, sizeof(*prd_match));
+	if (!prd_match) {
+		ovis_log(NULL, OVIS_LCRIT, "Memory allocation failure.\n");
+		rc = ENOMEM;
+		goto unlock;
+	}
+	prd_match->regex_str = strdup(prdcr_regex);
+	if (!prd_match->regex_str) {
+		ovis_log(NULL, OVIS_LCRIT, "Memory allocation failure.\n");
+		rc = ENOMEM;
+		free(prd_match);
+		goto unlock;
+	}
+
+	rc = ldmsd_compile_regex(&prd_match->regex, prdcr_regex, rep_buf, rep_len);
+	if (rc) {
+		rc = EINVAL;
+		free(prd_match);
+		goto unlock;
+	}
+
+	LIST_INSERT_HEAD(&updtr->prdcr_filter, prd_match, entry);
 	ldmsd_cfg_lock(LDMSD_CFGOBJ_PRDCR);
 	for (prdcr = ldmsd_prdcr_first(); prdcr; prdcr = ldmsd_prdcr_next(prdcr)) {
-		if (regexec(&regex, prdcr->obj.name, 0, NULL, 0))
+		if (regexec(&prd_match->regex, prdcr->obj.name, 0, NULL, 0))
 			continue;
 		/* See if this match is already in the list */
 		ldmsd_prdcr_ref_t ref = prdcr_ref_find(updtr, prdcr->obj.name);
@@ -1454,7 +1478,7 @@ int ldmsd_updtr_prdcr_add(const char *updtr_name, const char *prdcr_regex,
 		if (!ref) {
 			rc = ENOMEM;
 			sprintf(rep_buf, "%dMemory allocation failure.\n", ENOMEM);
-			ldmsd_prdcr_put(prdcr);
+			ldmsd_prdcr_put(prdcr, "iter");
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR);
 			goto out_1;
 		}
@@ -1463,9 +1487,9 @@ int ldmsd_updtr_prdcr_add(const char *updtr_name, const char *prdcr_regex,
 	ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR);
 	sprintf(rep_buf, "0\n");
 out_1:
-	regfree(&regex);
+unlock:
 	ldmsd_updtr_unlock(updtr);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 	return rc;
 }
 
@@ -1499,13 +1523,13 @@ int ldmsd_updtr_prdcr_del(const char *updtr_name, const char *prdcr_regex,
 	for (ref = prdcr_ref_find_regex(updtr, &regex);
 	     ref; ref = prdcr_ref_find_regex(updtr, &regex)) {
 		rbt_del(&updtr->prdcr_tree, &ref->rbn);
-		ldmsd_prdcr_put(ref->prdcr);
+		ldmsd_prdcr_put(ref->prdcr, "updtr_prdcr_ref");
 		free(ref);
 	}
 out_1:
 	regfree(&regex);
 	ldmsd_updtr_unlock(updtr);
-	ldmsd_updtr_put(updtr);
+	ldmsd_updtr_put(updtr, "find");
 out_0:
 	return rc;
 }

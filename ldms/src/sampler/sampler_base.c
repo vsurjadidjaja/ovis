@@ -91,7 +91,7 @@ static void init_job_data(base_data_t base)
 	if (!base->job_set) {
 		if (!base_missing_warned_set(base)) {
 			base_missing_warned_on(base, BASE_WARN_SET);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 			    "%s: The job data set named, %s, does not exist. Valid job "
 			    "data will not be associated with the metric values.\n",
 			    base->pi_name, base->job_set_name);
@@ -135,7 +135,7 @@ static void init_job_data(base_data_t base)
 	if (base->job_start_idx < 0) {
 		if (!base_missing_warned_start(base)) {
 			base_missing_warned_on(base, BASE_WARN_START);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 				"%s: The specified job_set '%s' is missing "
 				"the 'job_start' attribute and cannot be used.\n",
 				base->pi_name, base->job_set_name);
@@ -144,7 +144,7 @@ static void init_job_data(base_data_t base)
 	} else {
 		if (base_missing_warned_start(base)) {
 			base_missing_warned_off(base, BASE_WARN_START);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 				"%s: The specified job_set '%s' now has "
 				"the 'job_start' attribute and will be used.\n",
 				base->pi_name, base->job_set_name);
@@ -154,7 +154,7 @@ static void init_job_data(base_data_t base)
 	if (base->job_end_idx < 0) {
 		if (!base_missing_warned_end(base)) {
 			base_missing_warned_on(base, BASE_WARN_END);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 				"%s: The specified job_set '%s' is missing "
 				"the 'job_end' attribute and cannot be used.\n",
 				base->pi_name, base->job_set_name);
@@ -164,7 +164,7 @@ static void init_job_data(base_data_t base)
 	if (base->job_id_idx < 0) {
 		if (!base_missing_warned_start(base)) {
 			base_missing_warned_on(base, BASE_WARN_START);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 				"%s: The specified job_set '%s' is missing "
 				"the 'job_id' attribute and cannot be used.\n",
 				base->pi_name, base->job_set_name);
@@ -173,7 +173,7 @@ static void init_job_data(base_data_t base)
 	} else {
 		if (base_missing_warned_start(base)) {
 			base_missing_warned_off(base, BASE_WARN_START);
-			base->log(base->job_log_lvl,
+			ovis_log(base->mylog, base->job_log_lvl,
 				"%s: The specified job_set '%s' now has "
 				"the 'job_id' attribute and will be used.\n",
 				base->pi_name, base->job_set_name);
@@ -188,7 +188,7 @@ err:
 
 base_data_t base_config(struct attr_value_list *avl,
 			const char *name, const char *def_schema,
-			ldmsd_msg_log_f log)
+			ovis_log_t mylog)
 {
 	char *job_set_name;
 	char *value;
@@ -196,16 +196,16 @@ base_data_t base_config(struct attr_value_list *avl,
 
 	base_data_t base = calloc(1, sizeof(*base));
 	if (!base) {
-		log(LDMSD_LERROR, "Memory allocation failure in %s\n", name);
+		ovis_log(mylog, OVIS_LERROR, "Memory allocation failure in %s\n", name);
 		errno = ENOMEM;
 		return NULL;
 	}
 
-	base->job_log_lvl = LDMSD_LINFO;
+	base->job_log_lvl = OVIS_LINFO;
 
 	base->pi_name = strdup(name);
 	if (!base->pi_name) {
-		log(LDMSD_LERROR, "Memory allocation failure in %s\n", name);
+		ovis_log(mylog, OVIS_LERROR, "Memory allocation failure in %s\n", name);
 		free(base);
 		errno = ENOMEM;
 		return NULL;
@@ -213,7 +213,7 @@ base_data_t base_config(struct attr_value_list *avl,
 
 	value = av_value(avl, "producer");
 	if (!value) {
-		log(LDMSD_LERROR, "%s: config string is missing the producer name.\n", name);
+		ovis_log(mylog, OVIS_LERROR, "%s: config string is missing the producer name.\n", name);
 		goto einval;
 	}
 	base->producer_name = strdup(value);
@@ -227,7 +227,7 @@ base_data_t base_config(struct attr_value_list *avl,
 	}
 	value = av_value(avl, "instance");
 	if (!value) {
-		log(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		    "%s: configuration is missing the instance name.\n",
 		    name);
 		goto einval;
@@ -247,13 +247,12 @@ base_data_t base_config(struct attr_value_list *avl,
 	else
 		base->job_set_name = strdup(job_set_name);
 
-	int rc = base_auth_parse(avl, &base->auth, log);
+	int rc = base_auth_parse(avl, &base->auth, mylog);
 	if (rc)
 		goto einval;
 
 	value = av_value(avl, "set_array_card");
 	base->set_array_card = (value)?(strtol(value, NULL, 0)):(1);
-	base->log = log;
 	return base;
 einval:
 	errno = EINVAL;
@@ -308,43 +307,9 @@ void base_schema_delete(base_data_t base)
         base->schema = NULL;
 }
 
-int __set_init(base_data_t base)
-{
-	int rc;
-	ldms_set_producer_name_set(base->set, base->producer_name);
-	ldms_metric_set_u64(base->set, BASE_COMPONENT_ID, base->component_id);
-	ldms_metric_set_u64(base->set, BASE_JOB_ID, 0);
-	ldms_metric_set_u64(base->set, BASE_APP_ID, 0);
-	base_auth_set(&base->auth, base->set);
-
-	rc = ldms_set_publish(base->set);
-	if (rc) {
-		base->log(LDMSD_LERROR,"base_set_new: ldms_set_publish failed for %s\n",
-				base->instance_name);
-		return rc;
-	}
-	ldmsd_set_register(base->set, base->pi_name);
-	return 0;
-}
-
 ldms_set_t base_set_new(base_data_t base)
 {
-	int rc;
-	base->missing_warned = 0;
-	errno = 0;
-	base->set = ldms_set_new(base->instance_name, base->schema);
-	if (!base->set) {
-		const char *serr = STRERROR(errno);
-		base->log(LDMSD_LERROR,"base_set_new: ldms_set_new failed %d(%s) for %s\n",
-				errno, serr, base->instance_name);
-		return NULL;
-	}
-	rc = __set_init(base);
-	if (rc) {
-		ldms_set_delete(base->set);
-		base->set = NULL;
-	}
-	return base->set;
+	return base_set_new_heap(base, 0);
 }
 
 ldms_set_t base_set_new_heap(base_data_t base, size_t heap_sz)
@@ -355,16 +320,39 @@ ldms_set_t base_set_new_heap(base_data_t base, size_t heap_sz)
 	base->set = ldms_set_new_with_heap(base->instance_name, base->schema, heap_sz);
 	if (!base->set) {
 		const char *serr = STRERROR(errno);
-		base->log(LDMSD_LERROR,"base_set_new: ldms_set_new failed %d(%s) for %s\n",
+		ovis_log(base->mylog, OVIS_LERROR,"base_set_new: ldms_set_new failed %d(%s) for %s\n",
 				errno, serr, base->instance_name);
 		return NULL;
 	}
-	rc = __set_init(base);
+
+	ldms_set_producer_name_set(base->set, base->producer_name);
+	ldms_metric_set_u64(base->set, BASE_COMPONENT_ID, base->component_id);
+	ldms_metric_set_u64(base->set, BASE_JOB_ID, 0);
+	ldms_metric_set_u64(base->set, BASE_APP_ID, 0);
+	base_auth_set(&base->auth, base->set);
+
+	rc = ldms_set_publish(base->set);
 	if (rc) {
-		ldms_set_delete(base->set);
-		base->set = NULL;
+		ovis_log(base->mylog, OVIS_LERROR,
+			"base_set_new: ldms_set_publish failed for %s "
+			"with error %d\n",
+			base->instance_name, rc);
+		goto err;
+	}
+	rc = ldmsd_set_register(base->set, base->pi_name);
+	if (rc) {
+		ovis_log(base->mylog, OVIS_LERROR,
+			"base_set_new: ldms_set_register failed for %s "
+			"with error %d\n",
+			base->instance_name, rc);
+		goto err;
 	}
 	return base->set;
+err:
+	ldms_set_delete(base->set);
+	base->set = NULL;
+	errno = rc;
+	return NULL;
 }
 
 void base_set_delete(base_data_t base)
@@ -441,7 +429,7 @@ void base_sample_end(base_data_t base)
 }
 
 int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
-		    ldmsd_msg_log_f log)
+		    ovis_log_t mylog)
 {
 	char *value;
 	/* uid, gid, permission */
@@ -454,8 +442,8 @@ int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
 			/* Try to lookup the user name */
 			struct passwd *pwd = getpwnam(value);
 			if (!pwd) {
-				log(LDMSD_LERROR,
-				    "%s: The specified user '%s' does not exist\n",
+				ovis_log(mylog, OVIS_LERROR,
+				    ": The specified user '%s' does not exist\n",
 				    value);
 				goto einval;
 			}
@@ -471,8 +459,8 @@ int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
 			/* Try to lookup the group name */
 			struct group *grp = getgrnam(value);
 			if (!grp) {
-				log(LDMSD_LERROR,
-				    "%s: The specified group '%s' does not exist\n",
+				ovis_log(mylog, OVIS_LERROR,
+				    ": The specified group '%s' does not exist\n",
 				    value);
 				goto einval;
 			}
@@ -489,7 +477,7 @@ int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
 		lval = strtol(value, NULL, 8);
 		pval = lval & 0777;
 		if (errno || pval != lval || pval == 0) {
-			log(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 			    "The permission bits must specified "
 			    "as a non-zero octal number <= 777; got %s.\n", value);
 			goto einval;

@@ -80,7 +80,10 @@ typedef struct base_data_s {
 	int app_id_idx;
 	int job_start_idx;
 	int job_end_idx;
-	ldmsd_msg_log_f log;
+	ovis_log_t mylog;
+	/*
+	 * TODO: I feel that we shouldn't have \c job_log_lvl anymore with libovis_log
+	 */
 	int job_log_lvl;
 	unsigned missing_warned; /* 0 bit if warning not issued since set last seen */
 } *base_data_t;
@@ -148,13 +151,13 @@ void base_schema_delete(base_data_t base);
  * \param avl The attribute value keyword list provided to the config call
  * \param name The sampler name
  * \param def_schema The default schema name
- * \param log_fn The error logging function.
+ * \param mylog The log subsystem of the the sampler plugin
  * \return job_data_t if job data acquisition is configured on the system
  * \return NULL if job data is not configured or mis-configured
  */
 base_data_t base_config(struct attr_value_list *avl,
 			const char *name, const char *def_schema,
-			ldmsd_msg_log_f log);
+			ovis_log_t mylog);
 
 /**
  * \brief Create and initialize the base entries of the metric set
@@ -192,9 +195,7 @@ void base_set_delete(base_data_t base);
  * current job id in the metric set. If job data is not
  * configured on the system, no job data is stored in the set.
  *
- * \param jd The job data structure returned by sampler_job_config
- * \param set The metric set containing the job_id_metric
- * \param job_id_metric The job id metric in \c set
+ * \param base The base data structure
  */
 void base_sample_begin(base_data_t base);
 
@@ -217,10 +218,10 @@ void base_del(base_data_t base);
  * \brief parse uid, gid, and perm values from attributes, if they exist
  * \param avl attribute source to use.
  * \param auth output sturct base_auth into which the uid/gid/perm values are set
+ * \param mylog The log subsystem of the the sampler plugin
  * \return 0 on success, 1 on invalid user/group lookup.
  */
-int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
-		    ldmsd_msg_log_f log);
+int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth, ovis_log_t mylog);
 
 /**
  * \brief Set the authentication values in the ldms_set_t from base_data_t
@@ -233,7 +234,7 @@ int base_auth_parse(struct attr_value_list *avl, struct base_auth *auth,
  * to employ this function directly if your plugin calls base_set_new() to
  * create its metric sets. base_set_new() will call base_auth_set().
  *
- * \param [in] base The base_data_t struct that holds the authentication options
+ * \param [in] auth The struct base_auth that holds the authentication options
  * \param [out] set The metric set that shall have its authentication values set
  */
 void base_auth_set(const struct base_auth *auth, ldms_set_t set);

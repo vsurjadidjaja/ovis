@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2018 National Technology & Engineering Solutions
+ * Copyright (c) 2018,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2018 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2018,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -65,11 +65,16 @@
 #include "ldmsd.h"
 #include "ldmsd_request.h"
 
+#include "ldms_rail.h"
+
 #include "config.h"
 
 #define DEFAULT_PING_INTERVAL 1000000 /* unit: uSec */
 #define DEFAULT_AUTOSWITCH 1
 #define DEFAULT_TIMEOUT_FACTOR 2
+
+/* Defined in ldmsd.c */
+extern ovis_log_t fo_log;
 
 #define ARRAY_LEN(x) (sizeof(x)/sizeof(*(x)))
 
@@ -440,6 +445,30 @@ int __failover_send_prdcr(ldmsd_failover_t f, ldms_t x, ldmsd_prdcr_t p)
 	if (rc)
 		goto cleanup;
 
+	/* RAIL */
+	snprintf(buff, sizeof(buff), "%u", p->rail);
+	rc = ldmsd_req_cmd_attr_append_str(rcmd, LDMSD_ATTR_RAIL, buff);
+	if (rc)
+		goto cleanup;
+
+	/* QUOTA */
+	snprintf(buff, sizeof(buff), "%ld", p->quota);
+	rc = ldmsd_req_cmd_attr_append_str(rcmd, LDMSD_ATTR_QUOTA, buff);
+	if (rc)
+		goto cleanup;
+
+	/* RX_RATE */
+	snprintf(buff, sizeof(buff), "%ld", p->rx_rate);
+	rc = ldmsd_req_cmd_attr_append_str(rcmd, LDMSD_ATTR_RX_RATE, buff);
+	if (rc)
+		goto cleanup;
+
+	/* Cache_ip */
+	snprintf(buff, sizeof(buff), "%d", p->cache_ip);
+	rc = ldmsd_req_cmd_attr_append_str(rcmd, LDMSD_ATTR_IP, buff);
+	if (rc)
+		goto cleanup;
+
 	/* Terminate the message */
 	rc = ldmsd_req_cmd_attr_term(rcmd);
 	if (rc)
@@ -678,7 +707,7 @@ int __failover_send_strgp(ldmsd_failover_t f, ldms_t x, ldmsd_strgp_t s)
 
 	/* PLUGIN */
 	rc = ldmsd_req_cmd_attr_append_str(rcmd, LDMSD_ATTR_PLUGIN,
-					   s->plugin_name);
+					   s->store->cfg.name);
 	if (rc)
 		goto cleanup;
 
@@ -824,7 +853,7 @@ int __failover_send_cfgobjs(ldmsd_failover_t f, ldms_t x)
 			continue;
 		rc = __failover_send_prdcr(f, x, p);
 		if (rc) {
-			ldmsd_prdcr_put(p);
+			ldmsd_prdcr_put(p, "iter");
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR);
 			goto out;
 		}
@@ -838,7 +867,7 @@ int __failover_send_cfgobjs(ldmsd_failover_t f, ldms_t x)
 			continue;
 		rc = __failover_send_updtr(f, x, u);
 		if (rc) {
-			ldmsd_updtr_put(u);
+			ldmsd_updtr_put(u, "iter");
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_UPDTR);
 			goto out;
 		}
@@ -851,7 +880,7 @@ int __failover_send_cfgobjs(ldmsd_failover_t f, ldms_t x)
 			continue;
 		rc = __failover_send_strgp(f, x, s);
 		if (rc) {
-			ldmsd_strgp_put(s);
+			ldmsd_strgp_put(s, "iter");
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_STRGP);
 			goto out;
 		}
@@ -868,7 +897,7 @@ int __on_peercfg_resp(ldmsd_req_cmd_t rcmd)
 	ldmsd_req_hdr_t hdr = (void*)rcmd->reqc->req_buf;
 	__failover_lock(f);
 	if (hdr->rsp_err) {
-		ldmsd_lerror("Failover: peer config request remote error: %d\n",
+		ovis_log(fo_log, OVIS_LERROR, "peer config request remote error: %d\n",
 			     hdr->rsp_err);
 		f->conn_state = FAILOVER_CONN_STATE_ERROR;
 		ldms_xprt_close(f->ax);
@@ -876,7 +905,7 @@ int __on_peercfg_resp(ldmsd_req_cmd_t rcmd)
 		/* all peercfg have been received at this point */
 		__F_ON(f, __FAILOVER_PEERCFG_RECEIVED);
 		f->conn_state = FAILOVER_CONN_STATE_CONFIGURED;
-		ldmsd_linfo("Failover: peer config recv success\n");
+		ovis_log(fo_log, OVIS_LINFO, "peer config recv success\n");
 	}
 	__failover_unlock(f);
 	return 0;
@@ -889,7 +918,7 @@ int __failover_request_peercfg(ldmsd_failover_t f)
 	ldmsd_req_cmd_t rcmd;
 	int rc;
 
-	ldmsd_linfo("Failover: requesting peer config\n");
+	ovis_log(fo_log, OVIS_LINFO, "requesting peer config\n");
 
 	rcmd = ldmsd_req_cmd_new(f->ax, LDMSD_FAILOVER_PEERCFG_REQ,
 				 NULL, __on_peercfg_resp, f);
@@ -900,7 +929,7 @@ int __failover_request_peercfg(ldmsd_failover_t f)
 	rc = ldmsd_req_cmd_attr_term(rcmd);
 out:
 	if (rc) {
-		ldmsd_lerror("Failover: peer config request local error: %d\n",
+		ovis_log(fo_log, OVIS_LERROR, "peer config request local error: %d\n",
 			    rc);
 	}
 	return rc;
@@ -936,11 +965,11 @@ int __on_pair_resp(ldmsd_req_cmd_t rcmd)
 			f->conn_state = FAILOVER_CONN_STATE_PAIRING_RETRY;
 			goto out; /* the task will try pairing again */
 		}
-		ldmsd_lerror("Failover pairing error: %d\n", hdr->rsp_err);
+		ovis_log(fo_log, OVIS_LERROR, "Failover pairing error: %d\n", hdr->rsp_err);
 		rc = hdr->rsp_err;
 		goto err;
 	}
-	ldmsd_linfo("Failover pairing success, peer: %s\n", f->peer_name);
+	ovis_log(fo_log, OVIS_LINFO, "Failover pairing success, peer: %s\n", f->peer_name);
 
 	f->conn_state = FAILOVER_CONN_STATE_RESETTING;
 	rc = __failover_reset_and_request_peercfg(f);
@@ -973,7 +1002,7 @@ void __failover_pair(ldmsd_failover_t f)
 		return;
 	}
 
-	ldmsd_linfo("Failover pairing with peer: %s\n", f->peer_name);
+	ovis_log(fo_log, OVIS_LINFO, "Failover pairing with peer: %s\n", f->peer_name);
 
 	/* just become connected ... request pairing */
 	myname = ldmsd_myname_get();
@@ -989,7 +1018,7 @@ void __failover_pair(ldmsd_failover_t f)
 	/* rcmd will be freed when the reply is received */
 	return;
 err:
-	ldmsd_linfo("Failover pairing error (local), rc: %d\n", rc);
+	ovis_log(fo_log, OVIS_LINFO, "Failover pairing error (local), rc: %d\n", rc);
 	if (rcmd)
 		ldmsd_req_cmd_free(rcmd);
 	f->conn_state = FAILOVER_CONN_STATE_ERROR;
@@ -1250,7 +1279,7 @@ int __peercfg_delete(ldmsd_failover_t f)
 	void *del[] = {ldmsd_strgp_del, ldmsd_updtr_del, ldmsd_prdcr_del};
 	int (*fn)(void*, void*);
 
-	ldmsd_linfo("Failover: deleting peer config\n");
+	ovis_log(fo_log, OVIS_LINFO, "deleting peer config\n");
 
 	/* cfgobjs have all already stopped */
 	for (i = 0; i < 3; i++) {
@@ -1259,7 +1288,7 @@ int __peercfg_delete(ldmsd_failover_t f)
 			ent = STR_RBN(rbn);
 			rc = fn(ent->str, &sctxt);
 			if (rc) {
-				ldmsd_linfo("Failover: peer config deletion "
+				ovis_log(fo_log, OVIS_LINFO, "peer config deletion "
 					    "failed, rc: %d\n", rc);
 				return rc;
 			}
@@ -1268,7 +1297,7 @@ int __peercfg_delete(ldmsd_failover_t f)
 		}
 	}
 
-	ldmsd_linfo("Failover: peer config deleted\n");
+	ovis_log(fo_log, OVIS_LINFO, "peer config deleted\n");
 
 	return 0;
 }
@@ -1288,7 +1317,7 @@ int __peercfg_stop(ldmsd_failover_t f)
 	/* NOTE: Leaving out peer storage policy in the favor of letting our
 	 *       storage policy picks up the data. */
 
-	ldmsd_linfo("Failover: stopping peercfg\n");
+	ovis_log(fo_log, OVIS_LINFO, "stopping peercfg\n");
 	for (i = 0; i < ARRAY_LEN(t); i++) {
 		fn = stop[i];
 		RBT_FOREACH(rbn, t[i]) {
@@ -1304,9 +1333,9 @@ int __peercfg_stop(ldmsd_failover_t f)
 	}
 
 	if (rc) {
-		ldmsd_linfo("Failover: peer config stopping failed: %d\n", rc);
+		ovis_log(fo_log, OVIS_LINFO, "peer config stopping failed: %d\n", rc);
 	} else {
-		ldmsd_linfo("Failover: peer config stopped\n");
+		ovis_log(fo_log, OVIS_LINFO, "peer config stopped\n");
 		f->timeout_ts.tv_sec = INT64_MAX;
 		__F_OFF(f, __FAILOVER_PEERCFG_ACTIVATED);
 	}
@@ -1318,7 +1347,7 @@ static
 int __peercfg_reset(ldmsd_failover_t f)
 {
 	/* f->lock is held */
-	ldmsd_linfo("Failover: resetting peer config\n");
+	ovis_log(fo_log, OVIS_LINFO, "resetting peer config\n");
 	int rc = 0;
 	rc = __peercfg_stop(f);
 	if (rc)
@@ -1510,7 +1539,7 @@ int __peercfg_start(ldmsd_failover_t f)
 	struct ldmsd_sec_ctxt sctxt = __get_sec_ctxt(NULL);
 	int is_activated = 1;
 
-	ldmsd_linfo("Failover: starting peercfg, flags: %#lo\n", f->flags);
+	ovis_log(fo_log, OVIS_LINFO, "starting peercfg, flags: %#lo\n", f->flags);
 
 	RBT_FOREACH(rbn, &f->prdcr_rbt) {
 		srbn = STR_RBN(rbn);
@@ -1518,7 +1547,7 @@ int __peercfg_start(ldmsd_failover_t f)
 			continue;
 		rc = ldmsd_prdcr_start(srbn->str, NULL, &sctxt);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(fo_log, OVIS_LERROR,
 				  "failover: prdcr_start(%s) failed, "
 				  "rc: %d\n", srbn->str, rc);
 			continue;
@@ -1533,7 +1562,7 @@ int __peercfg_start(ldmsd_failover_t f)
 			continue;
 		rc = ldmsd_updtr_start(srbn->str, NULL, NULL, NULL, &sctxt);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(fo_log, OVIS_LERROR,
 				  "failover: updtr_start(%s) failed, "
 				  "rc: %d\n", srbn->str, rc);
 			continue;
@@ -2024,10 +2053,18 @@ int failover_cfgprdcr_handler(ldmsd_req_ctxt_t req)
 	char *perm = __req_attr_gets(req, LDMSD_ATTR_PERM);
 	char *auth = __req_attr_gets(req, LDMSD_ATTR_AUTH);
 	char *stream = __req_attr_gets(req, LDMSD_ATTR_STREAM);
+	char *rail_s = __req_attr_gets(req, LDMSD_ATTR_RAIL);
+	char *quota_s = __req_attr_gets(req, LDMSD_ATTR_QUOTA);
+	char *rx_rate_s = __req_attr_gets(req, LDMSD_ATTR_RX_RATE);
+	char *cache_ip = __req_attr_gets(req, LDMSD_ATTR_IP);
 
 	uid_t _uid;
 	gid_t _gid;
 	mode_t _perm;
+
+	int rail = 1;
+	int64_t quota = LDMS_UNLIMITED;
+	int64_t rx_rate = LDMS_UNLIMITED;
 
 	enum ldmsd_prdcr_type ptype;
 	ldmsd_prdcr_t p;
@@ -2049,6 +2086,13 @@ int failover_cfgprdcr_handler(ldmsd_req_ctxt_t req)
 	sctxt.crd.uid = _uid;
 	sctxt.crd.gid = _gid;
 
+	if (rail_s)
+		rail = atoi(rail_s);
+	if (quota_s)
+		quota = atol(quota_s);
+	if (rx_rate_s)
+		rx_rate = atol(rx_rate_s);
+
 	p = ldmsd_prdcr_find(name);
 	if (p) {
 		/* update interval */
@@ -2057,7 +2101,7 @@ int failover_cfgprdcr_handler(ldmsd_req_ctxt_t req)
 		/* add stream */
 		if (stream)
 			rc = ldmsd_prdcr_subscribe(p, stream);
-		ldmsd_prdcr_put(p);
+		ldmsd_prdcr_put(p, "find");
 		goto out;
 	}
 	/* create */
@@ -2078,7 +2122,8 @@ int failover_cfgprdcr_handler(ldmsd_req_ctxt_t req)
 	}
 
 	p = ldmsd_prdcr_new_with_auth(name, xprt, host, atoi(port), ptype,
-			atoi(interval), auth, _uid, _gid, _perm);
+			atoi(interval), auth, _uid, _gid, _perm, rail, quota,
+			rx_rate, atoi(cache_ip));
 	if (!p) {
 		rc = errno;
 		str_rbn_free(srbn);
@@ -2107,6 +2152,9 @@ out:
 	if (perm)
 		free(perm);
 	free(stream);
+	free(auth);
+	free(rail_s);
+	free(quota_s);
 	/* this req needs no resp */
 	return rc;
 }
@@ -2180,7 +2228,7 @@ int failover_cfgupdtr_handler(ldmsd_req_ctxt_t req)
 			goto out;
 		}
 		rbt_ins(&f->updtr_rbt, &srbn->rbn);
-		ldmsd_updtr_get(u); /* so that we can `put` without del */
+		ldmsd_updtr_get(u, "failover"); /* so that we can `put` without del */
 	} else {
 		/* update by parameters */
 		if (interval) {
@@ -2202,7 +2250,7 @@ int failover_cfgupdtr_handler(ldmsd_req_ctxt_t req)
 			goto updtr_put;
 		}
 		rc = __ldmsd_updtr_prdcr_add(u, p);
-		ldmsd_prdcr_put(p);
+		ldmsd_prdcr_put(p, "find");
 	}
 	if (match && regex) {
 		/* add matching condition */
@@ -2210,7 +2258,7 @@ int failover_cfgupdtr_handler(ldmsd_req_ctxt_t req)
 					   req->line_len, &sctxt);
 	}
 updtr_put:
-	ldmsd_updtr_put(u);
+	ldmsd_updtr_put(u, "find");
 out:
 	__failover_unlock(f);
 	if (name)
@@ -2233,6 +2281,7 @@ out:
 		free(gid);
 	if (perm)
 		free(perm);
+	free(auto_interval);
 	/* this req need no resp */
 	return rc;
 }
@@ -2294,8 +2343,8 @@ int failover_cfgstrgp_handler(ldmsd_req_ctxt_t req)
 			goto out;
 		}
 		rbt_ins(&f->strgp_rbt, &srbn->rbn);
-		ldmsd_strgp_get(s); /* so that we can `put` without del */
-		s->plugin_name = plugin;
+		ldmsd_strgp_get(s, "find"); /* so that we can `put` without del */
+		// TODO: s->plugin_name = plugin; I think this is broken...
 		plugin = NULL; /* give plugin to s */
 		s->schema = schema;
 		schema = NULL;
@@ -2319,7 +2368,7 @@ int failover_cfgstrgp_handler(ldmsd_req_ctxt_t req)
 	}
 
 put:
-	ldmsd_strgp_put(s);
+	ldmsd_strgp_put(s, "find");
 out:
 	__failover_unlock(f);
 	if (name)

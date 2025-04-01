@@ -71,8 +71,9 @@
 
 #include "ibdiag_common.h"
 
+static ovis_log_t mylog;
+
 ldms_schema_t		sx_schema;
-ldmsd_msg_log_f		msglog;
 unsigned int		sx_off;
 ib_portid_t		sx_id;
 struct ibmad_port 	*sx_src;
@@ -408,11 +409,6 @@ static int sx_config(struct ldmsd_plugin *self, struct attr_value_list *kwl, str
 	return 0;
 }
 
-static ldms_set_t sx_get_set(struct ldmsd_sampler *self)
-{
-	return sx_ldms_sets[1].sx_set;
-}
-
 static int sx_sample_set(int port)
 {
 	int rc;
@@ -466,7 +462,7 @@ static int sx_sample(struct ldmsd_sampler *self)
 		rc = sx_sample_set(port);
 		if (rc != 0) {
 			if (rc != EEXIST) {
-				msglog(LDMSD_LERROR, "sx_sample: failed sampling"
+				ovis_log(mylog, OVIS_LERROR, "sx_sample: failed sampling"
 						" port %d\n", port);
 				return rc;
 			}
@@ -507,12 +503,17 @@ static struct ldmsd_sampler switchx_plugin = {
 		.config = sx_config,
 		.usage = usage,
 	},
-	.get_set = sx_get_set,
 	.sample = sx_sample,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler.switchx", "The log subsystem of the the 'switchx' sampler plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
+				"of 'switchx' sampler plugin. Error %d\n", rc);
+	}
 	return &switchx_plugin.base;
 }

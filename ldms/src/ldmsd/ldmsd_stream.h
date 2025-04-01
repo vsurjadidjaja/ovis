@@ -3,7 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include "ldms_xprt.h"
+#include "ldms.h"
 #include <ovis_json/ovis_json.h>
 
 struct ldmsd_stream_client_s;
@@ -198,11 +198,9 @@ char * ldmsd_stream_client_dump();
 char *ldmsd_stream_dir_dump();
 
 /**
- * \brief Remove a publisher from all streams
- *
- * \param p_name   Publisher name
+ * \brief Reset the statistics of all streams
  */
-void ldmsd_stream_publisher_remove(const char *p_name);
+void ldmsd_stream_stats_reset_all();
 #ifdef __cplusplus
 }
 #endif

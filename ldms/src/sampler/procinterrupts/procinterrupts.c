@@ -67,29 +67,24 @@
 static char *procfile = PROC_FILE;
 static ldms_set_t set = NULL;
 static FILE *mf = NULL;
-static ldmsd_msg_log_f msglog;
 static int nprocs;
 #define SAMP "procinterrupts"
 static int metric_offset;
 static base_data_t base;
 
+static ovis_log_t mylog;
 
-static ldms_set_t get_set(struct ldmsd_sampler *self)
+static int getNProcs(char buf[])
 {
-	return set;
-}
-
-
-static int getNProcs(char buf[]){
 	int nproc = 0;
 	char* pch;
 	char *sp = NULL;
 	pch = strtok_r(buf, " ", &sp);
-	while (pch != NULL){
-		if (pch[0] == '\n'){
+	while (pch != NULL) {
+		if (pch[0] == '\n') {
 			break;
 		}
-		if (pch[0] != ' '){
+		if (pch[0] != ' ') {
 			nproc++;
 		}
 		pch = strtok_r(NULL, " ", &sp);
@@ -110,7 +105,7 @@ static int create_metric_set(base_data_t base)
 
 	mf = fopen(procfile, "r");
 	if (!mf) {
-		msglog(LDMSD_LERROR, "Could not open the " SAMP " file '%s'...exiting\n",
+		ovis_log(mylog, OVIS_LERROR, "Could not open the " SAMP " file '%s'...exiting\n",
 				procfile);
 		return ENOENT;
 	}
@@ -119,7 +114,7 @@ static int create_metric_set(base_data_t base)
 	schema = base_schema_new(base);
 	if (!schema) {
 		rc = errno;
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: The schema '%s' could not be created, errno=%d.\n",
 		       __FILE__, base->schema_name, rc);
 		goto err;
@@ -136,23 +131,23 @@ static int create_metric_set(base_data_t base)
 	s = fgets(lbuf, sizeof(lbuf), mf);
 	nprocs = getNProcs(lbuf);
 	if (nprocs <= 0) {
-		msglog(LDMSD_LINFO, "Bad number of CPU.\n");
+		ovis_log(mylog, OVIS_LINFO, "Bad number of CPU.\n");
 		fclose(mf);
 		return EINVAL;
 	}
 
-	while(s){
+	while(s) {
 		s = fgets(lbuf, sizeof(lbuf), mf);
 		if (!s)
 			break;
 		int currcol = 0;
 		char *sp = NULL;
 		char* pch = strtok_r(lbuf, " ", &sp);
-		while (pch != NULL && currcol <= nprocs){
-			if (pch[0] == '\n'){
+		while (pch != NULL && currcol <= nprocs) {
+			if (pch[0] == '\n') {
 				break;
 			}
-			if (currcol == 0){
+			if (currcol == 0) {
 				/* Strip the colon from metric name if present */
 				i = strlen(pch);
 				if (i && pch[i-1] == ':')
@@ -201,18 +196,18 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	int rc = 0;
 
 	if (set) {
-		msglog(LDMSD_LERROR, SAMP ": Set already created.\n");
+		ovis_log(mylog, OVIS_LERROR, "Set already created.\n");
 		return EINVAL;
 	}
 
 
-	base = base_config(avl, SAMP, SAMP, msglog);
+	base = base_config(avl, self->cfg_name, SAMP, mylog);
 	if (!base)
 		goto err;
 
 	rc = create_metric_set(base);
 	if (rc) {
-		msglog(LDMSD_LERROR, SAMP ": failed to create the metric set.\n");
+		ovis_log(mylog, OVIS_LERROR, "failed to create the metric set.\n");
 		goto err;
 	}
 	return 0;
@@ -229,8 +224,8 @@ static int sample(struct ldmsd_sampler *self)
 	char *s;
 	union ldms_value v;
 
-	if (!set){
-		msglog(LDMSD_LDEBUG, SAMP ": plugin not initialized\n");
+	if (!set) {
+		ovis_log(mylog, OVIS_LDEBUG, "plugin not initialized\n");
 		return EINVAL;
 	}
 
@@ -240,7 +235,7 @@ static int sample(struct ldmsd_sampler *self)
 	/* first line is the cpu list */
 	s = fgets(lbuf, sizeof(lbuf), mf);
 
-	while(s){
+	while(s) {
 		s = fgets(lbuf, sizeof(lbuf), mf);
 		if (!s)
 			break;
@@ -248,22 +243,22 @@ static int sample(struct ldmsd_sampler *self)
 		int currcol = 0;
 		char * sp = NULL;
 		char* pch = strtok_r(lbuf, " ", &sp);
-		while (pch != NULL && currcol <= nprocs){
+		while (pch != NULL && currcol <= nprocs) {
 			if (pch[0] == '\n') {
 				break;
 			}
 			if (pch[0] != ' ') {
-				if (currcol != 0){
+				if (currcol != 0) {
 					char* endptr;
 					unsigned long long int l1;
 					l1 = strtoull(pch,&endptr,10);
-					if (endptr != pch){
+					if (endptr != pch) {
 						v.v_u64 = l1;
 						ldms_metric_set(set, metric_no, &v);
 						metric_no++;
 					} else {
-						msglog(LDMSD_LERROR, SAMP
-							" bad val <%s>\n",pch);
+						ovis_log(mylog, OVIS_LERROR,
+							"bad val <%s>\n",pch);
 						rc = EINVAL;
 						goto out;
 					}
@@ -300,13 +295,18 @@ static struct ldmsd_sampler procinterrupts_plugin = {
 		.config = config,
 		.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler."SAMP, "The log subsystem of the " SAMP " plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
+				"of '" SAMP "' plugin. Error %d\n", rc);
+	}
 	set = NULL;
 	return &procinterrupts_plugin.base;
 }

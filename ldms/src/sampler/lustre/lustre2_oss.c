@@ -208,9 +208,9 @@ const char *ost_single_attr[] = {
 struct lustre_metric_src_list lms_list = {0};
 
 static ldms_set_t set;
-static ldmsd_msg_log_f msglog;
-
 static base_data_t base;
+
+static ovis_log_t mylog;
 
 char tmp_path[PATH_MAX];
 
@@ -299,16 +299,16 @@ static int create_metric_set(const char *osts)
 	free_str_list(lh);
 	return 0;
 err2:
-	msglog(LDMSD_LINFO, "lustre_oss.c:create_metric_set@err2\n");
+	ovis_log(mylog, OVIS_LINFO, "lustre_oss.c:create_metric_set@err2\n");
 	lustre_metric_src_list_free(&lms_list);
-	msglog(LDMSD_LINFO, "WARNING: lustre_oss set DESTROYED\n");
+	ovis_log(mylog, OVIS_LINFO, "WARNING: lustre_oss set DESTROYED\n");
 	set = 0;
 err1:
-	msglog(LDMSD_LINFO, "lustre_oss.c:create_metric_set@err1\n");
+	ovis_log(mylog, OVIS_LINFO, "lustre_oss.c:create_metric_set@err1\n");
 	free_str_list(lh);
 err0:
-	msglog(LDMSD_LDEBUG, "%s:%s@err0\n", __FILE__, __func__);
-	msglog(LDMSD_LDEBUG, "%s:%s: osts: %s\n", __FILE__, __func__, osts);
+	ovis_log(mylog, OVIS_LDEBUG, "%s:%s@err0\n", __FILE__, __func__);
+	ovis_log(mylog, OVIS_LDEBUG, "%s:%s: osts: %s\n", __FILE__, __func__, osts);
 	return rc;
 }
 
@@ -343,11 +343,11 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	char *osts;
 
 	if (set) {
-		msglog(LDMSD_LERROR, "lustre2_oss: Set already created.\n");
+		ovis_log(mylog, OVIS_LERROR, "lustre2_oss: Set already created.\n");
 		return EINVAL;
 	}
 
-	base = base_config(avl, SAMP, "Lustre_OSS", msglog);
+	base = base_config(avl, self->cfg_name, "Lustre_OSS", mylog);
 	if (!base)
 		return errno;
 
@@ -375,11 +375,6 @@ BASE_CONFIG_DESC
 ;
 }
 
-static ldms_set_t get_set(struct ldmsd_sampler *self)
-{
-	return set;
-}
-
 static int sample(struct ldmsd_sampler *self)
 {
 	if (!set)
@@ -405,18 +400,23 @@ static struct ldmsd_sampler lustre_oss_plugin = {
 		.config = config,
 		.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
+	int rc;
 	int init_complete = 0;
 	if (init_complete)
 		goto out;
-	msglog = pf;
+	mylog = ovis_log_register("sampler.lustre_oss", "Message for the lustre_oss plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of 'lustre_oss' plugin. Error %d\n", rc);
+	}
 	set = NULL;
-	lustre_sampler_set_msglog(pf);
+	lustre_sampler_set_pilog(mylog);
 
 	init_complete = 1;
 out:

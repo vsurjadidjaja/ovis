@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2016-2018 National Technology & Engineering Solutions
+ * Copyright (c) 2016-2018,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2016-2018 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2016-2018,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -74,6 +74,7 @@ enum ldmsd_request {
 	LDMSD_EXAMPLE_REQ = 0x1,
 	LDMSD_GREETING_REQ = 0x2,
 	LDMSD_CFG_CNTR_REQ = 0x3,
+	LDMSD_DUMP_CFG_REQ = 0x4,
 	LDMSD_PRDCR_ADD_REQ = 0x100,
 	LDMSD_PRDCR_DEL_REQ,
 	LDMSD_PRDCR_START_REQ,
@@ -86,6 +87,17 @@ enum ldmsd_request {
 	LDMSD_PRDCR_SUBSCRIBE_REQ,
 	LDMSD_PRDCR_UNSUBSCRIBE_REQ,
 	LDMSD_PRDCR_STREAM_STATUS_REQ,
+	LDMSD_BRIDGE_ADD_REQ,
+	LDMSD_ADVERTISER_ADD_REQ,
+	LDMSD_ADVERTISER_START_REQ,
+	LDMSD_ADVERTISER_STOP_REQ,
+	LDMSD_ADVERTISER_DEL_REQ,
+	LDMSD_PRDCR_LISTEN_ADD_REQ,
+	LDMSD_PRDCR_LISTEN_DEL_REQ,
+	LDMSD_PRDCR_LISTEN_START_REQ,
+	LDMSD_PRDCR_LISTEN_STOP_REQ,
+	LDMSD_PRDCR_LISTEN_STATUS_REQ,
+	LDMSD_ADVERTISE_REQ,
 	LDMSD_STRGP_ADD_REQ = 0x200,
 	LDMSD_STRGP_DEL_REQ,
 	LDMSD_STRGP_START_REQ,
@@ -120,7 +132,7 @@ enum ldmsd_request {
 	LDMSD_PLUGN_LOAD_REQ,
 	LDMSD_PLUGN_TERM_REQ,
 	LDMSD_PLUGN_CONFIG_REQ,
-	LDMSD_PLUGN_LIST_REQ,
+	LDMSD_PLUGN_USAGE_REQ,
 	LDMSD_PLUGN_SETS_REQ,
 	LDMSD_SET_UDATA_REQ = 0x600,
 	LDMSD_SET_UDATA_REGEX_REQ,
@@ -133,7 +145,7 @@ enum ldmsd_request {
 	LDMSD_LOGROTATE_REQ,
 	LDMSD_EXIT_DAEMON_REQ,
 	LDMSD_RECORD_LEN_ADVICE_REQ,
-	LDMSD_SET_ROUTE_REQ,
+	LDMSD_SET_ROUTE_REQ, /* Obsolete, leave in table to preserve id values */
 	LDMSD_XPRT_STATS_REQ,
 	LDMSD_THREAD_STATS_REQ,
 	LDMSD_PRDCR_STATS_REQ,
@@ -142,6 +154,18 @@ enum ldmsd_request {
 	LDMSD_SET_DEFAULT_AUTHZ_REQ,
 	LDMSD_CMDLINE_OPTIONS_SET_REQ,
 	LDMSD_SET_SEC_MOD_REQ,
+	LDMSD_LOG_STATUS_REQ,
+	LDMSD_STATS_RESET_REQ,
+	LDMSD_DEFAULT_AUTH_REQ,
+	LDMSD_MEMORY_REQ,
+	LDMSD_LOG_FILE_REQ,
+	LDMSD_PUBLISH_KERNEL_REQ,
+	LDMSD_DAEMON_NAME_SET_REQ,
+	LDMSD_WORKER_THR_SET_REQ,
+	LDMSD_DEFAULT_QUOTA_REQ,
+	LDMSD_PID_FILE_REQ,
+	LDMSD_BANNER_MODE_REQ,
+	LDMSD_PROFILING_REQ,
 
 	/* failover requests by user */
 	LDMSD_FAILOVER_CONFIG_REQ = 0x700, /* "failover_config" user command */
@@ -177,11 +201,21 @@ enum ldmsd_request {
 	LDMSD_STREAM_CLIENT_DUMP_REQ,	  /* Dump stream client info */
 	LDMSD_STREAM_NEW_REQ,	/* Create a stream */
 	LDMSD_STREAM_STATUS_REQ,	/* Query stream information */
+	LDMSD_STREAM_STATS_REQ,	/* Query stream stats of this process */
+	LDMSD_STREAM_CLIENT_STATS_REQ,	/* Query stream client stats of this process */
 
 	/* Auth */
 	LDMSD_AUTH_ADD_REQ = 0xa00, /* Add auth domain */
 	LDMSD_AUTH_DEL_REQ,         /* Delete auth domain */
 	LDMSD_NOTSUPPORT_REQ,
+
+	/* Quota Group (qgruop) */
+	LDMSD_QGROUP_CONFIG_REQ = 0xb00,
+	LDMSD_QGROUP_MEMBER_ADD_REQ,
+	LDMSD_QGROUP_MEMBER_DEL_REQ,
+	LDMSD_QGROUP_START_REQ,
+	LDMSD_QGROUP_STOP_REQ,
+	LDMSD_QGROUP_INFO_REQ,
 };
 
 enum ldmsd_request_attr {
@@ -224,6 +258,17 @@ enum ldmsd_request_attr {
 	LDMSD_ATTR_AUTH,
 	LDMSD_ATTR_RESET,
 	LDMSD_ATTR_DECOMP,
+	LDMSD_ATTR_RAIL,
+	LDMSD_ATTR_QUOTA,
+	LDMSD_ATTR_RX_RATE,
+	LDMSD_ATTR_SUMMARY,
+	LDMSD_ATTR_SIZE,
+	LDMSD_ATTR_IP,
+	LDMSD_ATTR_ASK_INTERVAL,
+	LDMSD_ATTR_ASK_MARK,
+	LDMSD_ATTR_ASK_AMOUNT,
+	LDMSD_ATTR_RESET_INTERVAL,
+	LDMSD_ATTR_XTHREAD,
 	LDMSD_ATTR_LAST,
 };
 
@@ -284,6 +329,7 @@ typedef struct ldmsd_cfg_ldms_s {
 } *ldmsd_cfg_ldms_t;
 
 typedef struct ldmsd_cfg_file_s {
+	const char *path; /* Point to the path attribute value, don't free() */
 	uint64_t cfgfile_id;
 } *ldmsd_cfg_file_t;
 
@@ -385,15 +431,14 @@ struct ldmsd_req_array {
  * \param cfg A string containing the configuaration command text
  * \param msg_no The next unique message number
  * \param xprt_max_msg The
- * \param msglog Destination for error messages.
  *
  * \return a handle to an ldmsd_request_array. NULL is returned in case of error
  *         and errno is set.
  *
  * \seealso ldmsd_request_array
  */
-struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
-					size_t xprt_max_msg, ldmsd_msg_log_f msglog);
+struct ldmsd_req_array *
+ldmsd_parse_config_str(const char *cfg, uint32_t msg_no, size_t xprt_max_msg);
 
 /**
  * \brief Destroy the result of ldmsd_parse_config_str. Ignores NULL input.
@@ -523,7 +568,13 @@ void ldmsd_ntoh_req_msg(ldmsd_req_hdr_t msg);
  * \param rec_len The record length
  */
 void ldmsd_send_cfg_rec_adv(ldmsd_cfg_xprt_t xprt, uint32_t msg_no, uint32_t rec_len);
-int ldmsd_process_config_request(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t request);
+/*
+ * \param req_filter is a function that returns zero if we want to process the
+ *                   request, and returns non-zero otherwise.
+ */
+typedef int (*req_filter_fn)(ldmsd_req_ctxt_t, void *);
+int ldmsd_process_config_request(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t request,
+				req_filter_fn req_filter, void *filter_ctxt);
 int ldmsd_process_config_response(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t response);
 int ldmsd_append_reply(struct ldmsd_req_ctxt *reqc, const char *data, size_t data_len, int msg_flags);
 void ldmsd_send_error_reply(ldmsd_cfg_xprt_t xprt, uint32_t msg_no,
@@ -545,13 +596,6 @@ static inline ldmsd_req_attr_t ldmsd_next_attr(ldmsd_req_attr_t attr)
  * \brief Initialize config transport to be an ldms transport
  */
 void ldmsd_cfg_ldms_init(ldmsd_cfg_xprt_t xprt, ldms_t ldms);
-
-/**
- * \brief Send a request to \c prdcr for the set_info of \c inst_name
- */
-int ldmsd_set_route_request(ldmsd_prdcr_t prdcr,
-			ldmsd_req_ctxt_t org_reqc, char *inst_name,
-			ldmsd_req_resp_fn resp_handler, void *ctxt);
 
 /**
  * \brief Construct ldmsd request command.

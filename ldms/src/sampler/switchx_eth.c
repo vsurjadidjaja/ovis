@@ -74,8 +74,11 @@
 #include <sx/sdk/sx_api_init.h>
 #include <sx/sdk/sx_api_port.h>
 
+#define PNAME "switchx_eth"
+
+static ovis_log_t mylog;
+
 ldms_schema_t sx_schema;
-ldmsd_msg_log_f msglog;
 
 sx_api_handle_t sx_handle = 0;
 
@@ -270,7 +273,7 @@ static int sx_create_metric_set(const char *path)
 	}
 
 	if (sx_schema == NULL) {
-		sx_schema = ldms_create_schema("switchx");
+		sx_schema = ldms_create_schema(PNAME);
 		if (sx_schema == NULL) {
 			return ENOMEM;
 		}
@@ -348,11 +351,6 @@ static int sx_config(struct ldmsd_plugin *self, struct attr_value_list *kwl, str
 		rc = sx_create_metric_set(value);
 
 	return rc;
-}
-
-static ldms_set_t sx_get_set(struct ldmsd_sampler *self)
-{
-	return sx_ldms_sets[1].sx_set;
 }
 
 static int sx_sample_set(int log_port)
@@ -479,7 +477,7 @@ static int sx_sample(struct ldmsd_sampler *self)
 		rc = sx_sample_set(port);
 		if (rc != 0) {
 			if (rc != EEXIST) {
-				msglog(LDMSD_LERROR, "sx_sample: "
+				ovis_log(mylog, OVIS_LERROR, "sx_sample: "
 					"failed sampling port %d\n", port);
 			}
 		}
@@ -495,7 +493,6 @@ static void sx_term(struct ldmsd_plugin *self)
 			ldms_set_delete(sx_ldms_sets[port].sx_set);
 		sx_ldms_sets[port].sx_set = NULL;
 	}
-
 	if (sx_schema != NULL) {
 		ldms_schema_delete(sx_schema);
 		sx_schema = NULL;
@@ -504,24 +501,29 @@ static void sx_term(struct ldmsd_plugin *self)
 
 static const char *usage(struct ldmsd_plugin *self)
 {
-	return  "config name=switchx set=<setname>\n"
+	return  "config name=" PNAME " set=<setname>\n"
 		"    setname     The set name.\n";
 }
 
 static struct ldmsd_sampler switchx_plugin = {
 	.base = {
-		.name = "switchx",
+		.name = PNAME,
 		.type = LDMSD_PLUGIN_SAMPLER,
 		.term = sx_term,
 		.config = sx_config,
 		.usage = usage,
 	},
-	.get_set = sx_get_set,
 	.sample = sx_sample,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler."PNAME, "The log subsystem of the the " PNAME " plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
+				"of '" PNAME "' plugin. Error %d\n", rc);
+	}
 	return &switchx_plugin.base;
 }

@@ -185,6 +185,14 @@ struct zap_ep {
 	uint64_t sq_sz; /* send queue size of the endpoint */
 };
 
+#define ZAP_IO_THREAD_POOL_MAX 1024 /* 1K pools should suffice */
+
+struct zap_io_thread_pool_s {
+	int idx; /* the pool index */
+	int n; /* number of threads in the pool */
+	LIST_HEAD(, zap_io_thread) _io_threads;
+};
+
 struct zap {
 	char name[ZAP_MAX_TRANSPORT_NAME_LEN];
 	int max_msg;		/* max send message size */
@@ -199,13 +207,13 @@ struct zap {
 
 	/** Request a connection with a server */
 	zap_err_t (*connect)(zap_ep_t ep, struct sockaddr *sa, socklen_t sa_len,
-			     char *data, size_t data_len);
+			     char *data, size_t data_len, int tpi);
 
 	/** Listen for incoming connection requests */
 	zap_err_t (*listen)(zap_ep_t ep, struct sockaddr *sa, socklen_t sa_len);
 
 	/** Accept a connection request */
-	zap_err_t (*accept)(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len);
+	zap_err_t (*accept)(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len, int tpi);
 
 	/** Reject a connection request */
 	zap_err_t (*reject)(zap_ep_t ep, char *data, size_t data_len);
@@ -215,6 +223,9 @@ struct zap {
 
 	/** Send a message */
 	zap_err_t (*send)(zap_ep_t ep, char *buf, size_t sz);
+
+	/** Send a message */
+	zap_err_t (*send2)(zap_ep_t ep, char *buf, size_t sz, void *cb_arg);
 
 	/** RDMA write data to a remote buffer */
 	zap_err_t (*write)(zap_ep_t ep,
@@ -324,20 +335,22 @@ struct zap {
 	 */
 	zap_err_t (*io_thread_ep_release)(zap_io_thread_t t, zap_ep_t ep);
 
-	/**
-	 * A collection of io threads of the tranport managed by libzap.
-	 *
-	 * The transport shall not access nor modify this data.
-	 */
-	LIST_HEAD(, zap_io_thread) _io_threads;
-
 	struct zap_io_thread *_passive_ep_thread;
 
 	/** Mutex for _io_threads. */
 	pthread_mutex_t _io_mutex;
 
+	/** Number of thread pools. */
+	int _n_pools;
+
+	/** The last pool that assigned the endpoint */
+	int _last_pool;
+
+	/** Thread pool handles. */
+	struct zap_io_thread_pool_s _thr_pool[ZAP_IO_THREAD_POOL_MAX];
+
 	/** Number of threads */
-	int _n_threads;
+	//int _n_threads;
 
 };
 
@@ -455,11 +468,14 @@ double zap_env_dbl(char *name, double default_value);
  * new thread, and assign the endpoint \c ep to the thread.
  * \c zap.io_thread_ep_assign() will be called subsequently.
  *
+ * \param ep  The endpoint handle.
+ * \param tpi The thread pool index.
+ *
  * \retval ZAP_ERR_OK
  * \retval ZAP_ERR_RESOURCE
  * \retval ZAP_ERR_BUSY
  */
-zap_err_t zap_io_thread_ep_assign(zap_ep_t ep);
+zap_err_t zap_io_thread_ep_assign(zap_ep_t ep, int tpi);
 
 /**
  * Release \c ep from the zap io thread.
@@ -467,8 +483,33 @@ zap_err_t zap_io_thread_ep_assign(zap_ep_t ep);
  * The transport shall call this function to release an endpoint from the
  * associated io thread. \c zap.io_thread_ep_release() will also be called as a
  * subsequence.
+ *
+ * Consequently, the endpoint will not be processed by the thread any further.
+ * However, the endpoint still keeps a reference to the thread for further statistics data access.
+ * The endpoint references to the thread is removed when \c zap_io_thread_ep_remove() is called.
+ *
+ * \param ep   A Zap endpoint
+ *
+ * \return ZAP_ERR_OK on success. Otherwise, a Zap error code is returned.
+ *
+ * \see zap_io_thread_ep_remove
  */
 zap_err_t zap_io_thread_ep_release(zap_ep_t ep);
+
+/**
+ * Remove \c ep reference to the zap io thread.
+ *
+ * The function nullifies the endpoint reference to the thread and decrements
+ * the number of endpoints associated to the thread. This results in reducing
+ * the thread's load counter.
+ *
+ * \param ep    A Zap endpoint
+ *
+ * \return ZAP_ERR_OK on success. Otherwise, a Zap error code is returned.
+ *
+ * \see zap_io_thread_ep_release
+ */
+zap_err_t zap_io_thread_ep_remove(zap_ep_t ep);
 
 /*
  * The zap_thrstat structure maintains state for
@@ -476,6 +517,7 @@ zap_err_t zap_io_thread_ep_release(zap_ep_t ep);
  */
 struct zap_thrstat {
 	char *name;
+	pid_t tid; /* This is the thread ID returned by gettid(). */
 	uint64_t window_size;
 	struct timespec start;
 	struct timespec wait_start;
@@ -489,7 +531,15 @@ struct zap_thrstat {
 	uint64_t *proc_window;
 	uint64_t sq_sz; /* send queue size (in entries) */
 	uint64_t n_eps; /* number of endpoints */
+	uint64_t wait_tot; /* Total idle time since reset in micro-seconds */
+	uint64_t proc_tot; /* Total busy time since reset  in micro-seconds */
 	LIST_ENTRY(zap_thrstat) entry;
+
+	int pool_idx;
+	uint64_t thread_id;
+
+	void *app_ctxt; /* Application statistics corresponding to the thread */
+	zap_thrstat_app_reset_fn app_reset_fn;
 };
 #define ZAP_THRSTAT_WINDOW 4096	/*< default window size */
 
@@ -525,6 +575,8 @@ struct zap_io_thread {
 	LIST_HEAD(, zap_ep) _ep_list;
 	/** (private to libzap) number of associated endpoints */
 	int _n_ep;
+
+	struct zap_io_thread_pool_s *tp;
 };
 
 #endif

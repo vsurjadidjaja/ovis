@@ -9,41 +9,26 @@ ldmsd \- Start an ldms daemon
 ldmsd [OPTION...]
 
 .SH DESCRIPTION
-The ldmsd command can be used
-to start an ldms daemon. Plugin configuration of the ldmsd can be done via the
-a configuration file or the ldmsd_controller.
-
-Starting ldmsd with the configuration file option enables you to statically configure a
-sampler without requiring python. Dynamically configuring samplers with ldmsd_controller requires python.
-Currently, v2's ldmsctl can still be used to dynamically configure a sampler without requiring
-python. This capability will be replaced and it is not recommended that you use this option.
+The \c ldmsd command is used to start an instance of an ldmsd server.
+Configuration of the ldmsd is accomplished statically with a configuration
+file provided on the command line, or dynamically with the ldmsd_controller
+or distributed configuration management server Maestro.
 
 .SH ENVIRONMENT
-.SS
-The ldmsd-check-env program will dump currently set environment variables that may influence ldmsd and plugin behavior.
-The following environment variables must often be set:
-.TP
-LD_LIBRARY_PATH
-Path to ovis/lib and libevent2/lib, if not in a system default path. Depending on the system these may be lib64 instead of lib.
-.TP
-PATH
-Include the path to sbin directory containing ldmsd.
 .SS The following environment variables may be set to override compiled-in defaults:
 .TP
 ZAP_LIBPATH
-Path to ovis/lib/ovis-ldms
+Path to the location of the LDMS transport libraries.
 .TP
 LDMSD_PLUGIN_LIBPATH
-Path to ovis/lib/ovis-ldms
+Path to the location of the LDMS plugin libraries.
 .TP
 LDMSD_PIDFILE
-Full path name of pidfile overriding the default /var/run/ldmsd.pid unless the command line argument "-r pidfilepath" is present.
+Full path name of a file overriding the default of /var/run/ldmsd.pid. The command line
+argument "-r pid-file-path" takes precedence over this value.
 .TP
 LDMSD_LOG_TIME_SEC
 If present, log messages are stamped with the epoch time rather than the date string. This is useful when sub-second information is desired or correlating log messages with other epoch-stamped data.
-.TP
-LDMSD_SOCKPATH
-Path to the unix domain socket for the ldmsd. Default is created within /var/run. If you must change the default (e.g., not running as root and hence /var/run is not writeable), set this variable (e.g., /tmp/run/ldmsd) or specify "-S socketpath" to ldmsd.
 .TP
 LDMSD_MEM_SZ
 The size of memory reserved for metric sets. Set this variable or specify "-m"
@@ -51,11 +36,13 @@ to ldmsd. See the -m option for further details. If both are specified, the -m
 option takes precedence over this environment variable.
 .TP
 LDMSD_UPDTR_OFFSET_INCR
-The increment to the offset hint in microseconds. This is only for updaters that
-determine the update interval and offset automatically. For example, the offset
-hint is 100000 which is 100 millisecond of the second.  The updater offset will
-be 100000 + LDMSD_UPDTR_OFFSET_INCR. The default is 100000 (100 milliseconds).
+The increment to the offset hint in microseconds for updaters that
+determine the update interval and offset automatically. For example, if the offset
+hint is 100000, the updater offset will be 100000 + LDMSD_UPDTR_OFFSET_INCR.
+The default is 100000 (100 milliseconds).
+
 .SS CRAY Specific Environment variables for ugni transport
+.TP
 ZAP_UGNI_PTAG
 For XE/XK, the PTag value as given by apstat -P.
 For XC, The value does not matter but the environment variable must be set.
@@ -65,7 +52,7 @@ For XE/XK, the Cookie value corresponding to the PTag value as given by apstat -
 For XC, the Cookie value (not Cookie2) as given by apstat -P
 .TP
 ZAP_UGNI_CQ_DEPTH
-Optional value for the CQ depth. Default is 2048.
+Optional value for the CQ depth. The default is 2048.
 .TP
 ZAP_UGNI_STATE_INTERVAL
 Optional. If set, then ldmsd will check all nodes' states via rca interface.
@@ -83,14 +70,6 @@ checking the nodes state (see ZAP_UGNI_STATE_INTERVAL, above).
 .SS
 General/Configuration Options:
 .TP
-.BR -F
-Run in foreground mode; don't daemonize the program. Default is false.
-.TP
-.BI "-B, --banner" " version-file-mode [0, 1, 2]"
-When run in daemon mode, controls the existence of the banner file.
-Mode 0 suppresses the version file. Mode 1 deletes it at daemon exit. Mode >= 2 leaves it in place for debugging after daemon exit. Default mode is 1.
-The banner contains the software and protocol versions information, which is also logged at the INFO level. The banner file name is always the pidfile name with .version appended.
-.TP
 .BI "-c " CONFIG_PATH
 The path to configuration file (optional, default: <none>). The configuration
 file contains a batch of ldmsd controlling commands, such as `load` for loading
@@ -105,6 +84,11 @@ deferred configuration objects will be started. Please also note that while
 failover service is in use, prdcr, updtr, and strgp cannot be altered (start,
 stop, or reconfigure) over in-band configuration. See also REORDERED COMMANDS below.
 .TP
+.BI "-y" CONFIG_PATH
+The path to a YAML configuration file (optional, default: <none>). The YAML configuration
+file contains a description of an entire cluster of LDMS daemons. Please see "man ldmsd_yaml_parser"
+for more information regarding the YAML configuration file.
+.TP
 .BI "-m, --set_memory" " MEMORY_SIZE"
 .br
 MEMORY_SIZE is the maximum size of pre-allocated memory for metric sets.
@@ -113,12 +97,12 @@ For example, 20M or 20mb are 20 megabytes. The default is adequate for most ldms
 For aggregating ldmsd, a rough estimate of preallocated memory needed is (Number of nodes aggregated) x (Number of metric sets per node) x 4k.
 Data sets containing arrays may require more. The estimate can be checked by enabling DEBUG logging and examining the mm_stat bytes_used+holes value at ldmsd exit.
 .TP
-.BI "-n, --daemon_name" " NAME"
+.BI "-n, --daemon_name" "NAME"
 .br
-The name of the daemon. By default, it is "\fIHOSTNAME:PORT\fR". The failover feature uses the daemon name to verify the buddy name, and the producer name of kernel metric sets is the daemon name.
+The name of the LDMS daemon. By default it is "HOSTNAME:PORT". When configuring a LDMSD with a YAML configuration file, the "daemon_name" identifies a daemon defined in the configuration file. For more information about YAML configuration files, please see "man ldmsd_yaml_parser".
 .TP
 .BI "-r, --pid_file" " pid_file"
-The path to the pid file and prefix of the .version banner file for daemon mode.
+The path to the pid file and prefix of the .version banner file
 .TP
 .BR -V
 Display LDMS version information and then exit.
@@ -144,7 +128,7 @@ The listening transports can also be specified in the configuration file using
 .TP
 .BI "-a, --default_auth" " AUTH"
 Specify the default LDMS Authentication method for the LDMS connections in this
-daemon (when the connections do not specify authentication method/domain).
+process (when the connections do not specify authentication method/domain).
 Please see \fBldms_authentication\fR(7) for more information. If this option is
 not given, the default is "none" (no authentication). Also see
 \fBldmsd_controller\fR(8) section \fBAUTHENTICATION COMMAND SYNTAX\fR for how to
@@ -155,7 +139,6 @@ Passing the \fINAME\fR=\fIVALUE\fR option to the LDMS Authentication plugin.
 This command line option can be given multiple times. Please see
 \fBldms_authentication\fR(7) for more information, and consult the plugin manual
 page for plugin-specific options.
-
 
 .SS
 Log Verbosity Options:
@@ -168,12 +151,8 @@ Silence can be obtained by specifying /dev/null for the log file or using comman
 .TP
 .BI "-v, --log_level" " LOG_LEVEL"
 .br
-LOG_LEVEL can be one of DEBUG, INFO, ERROR, CRITICAL or QUIET.
+LOG_LEVEL can be one of DEBUG, INFO, WARN, ERROR, CRITICAL or QUIET.
 The default level is ERROR. QUIET produces only user-requested output.
-(Note: this has changed from the previous release where q designated no (QUIET) logging).
-.TP
-.BR -t
-Truncate the log file if it already exists.
 .TP
 .BI -L, --log_config " <CINT:PATH> | <CINT> | <PATH>"
 .br
@@ -189,28 +168,117 @@ Append configuration replay messages or configuration debugging messages to the 
 .fi
 These values may be added together to enable multiple outputs. All messages are logged at the user-requested level, LDMSD_LALL. CINT values 2, 26 and 27 are often interesting. When CINT is omitted, 1 is the default. When PATH is used, the log messages are flushed to as they are generated.
 
-.SS
-Kernel Metric Options:
-.TP
-.BR "-k, --publish_kernel"
-Publish kernel metrics.
-.TP
-.BI "-s, --kernel_set_file" " SETFILE"
-Text file containing kernel metric sets to publish. Default: /proc/sys/kldms/set_list
-
-.SS Thread Options:
-.TP
-.BI "-P, --worker_threads" " THR_COUNT"
-.br
-THR_COUNT is the number of event threads to start.
-
 .SH SPECIFYING COMMAND-LINE OPTIONS IN CONFIGURATION FILES
 .PP
-Users can use the 'option' command to specify some command-line options in a configuration file.
+While command-line options are useful for quick configuration, complex setups or
+repeated deployments benefit from configuration files. These files provide a
+centralized location to define all initial settings for LDMSD, promoting
+readability, maintainability, and easy sharing across deployments. This section
+serves as a reference for configuration commands used in these files. These
+commands offer an alternative approach to specifying the initial state of LDMSD
+compared to using command-line options
+
+.SS Configuration commands to initialize LDMSD
+
+\fBlog_file\fR sets the log file path.
+.RS
+.IP \fBpath\fR=\fIPATH
+The log file path
+.RE
+
+\fBlog_level\fR sets the log verbosify. The default is ERROR.
+.RS
+.IP \fBlevel\fR=\fILEVEL
+The log level ordered from the most to the least severity: CRITICAL, ERROR,
+WARNING, INFO, and DEBUG.
+.RE
+
+\fBset_memory\fR sets the total set memory. The default is 512 MB.
+.RS
+.IP \fBsize\fR=\fISIZE
+The total set memory size.
+.RE
+
+\fBpid_file\fR sets the path to the PID file.
+.RS
+.IP \fBpath\fR=\fIPATH
+The PID file path
+.RE
+
+\fBbanner\fR specifies the banner mode.
+.RS
+.IP \fBmode=\fI0|1|2
+0 means no banner; 1 means auto-deleting the banner file at exit; and 2 means
+leaving the banner file.
+.RE
+
+\fBworker_threads\fR sets the number of threads scheduling sample and update
+events.
+.RS
+.IP \fBnum\fR=\fINUM
+Number of threads that are responsible for scheduling sample, dir, lookup, and
+update events.
+.RE
+
+\fBdefault_auth\fR defines the default authentication domain. The default is no
+authentication.
+.RS
+.IP \fBplugin\fR=\fINAME
+The authentication plugin name
+.IP \fB[auth_attr\fR=\fattr_value\fB]
+The attribute-value pairs of the authentication plugin
+.RE
+
+\fBauth_add\fR defines an additional authentication domain.
+.RS
+.IP \fBname\fR=\fINAME
+The authentication domain name
+.IP \fBplugin\fR=\fIPI_NAME
+The autnentication plugin name
+.IP \fB[auth_attr\fR=\fattr_value\fB]
+The attribute-value pairs of the authentication plugin
+.RE
+
+\fBlisten\fR defines a listen endpoint.
+.RS
+.IP \fBxprt\fR=\fIXPRT
+Endpoint transport: sock, rdma, ugni
+.IP \fBport\fR=\fIPORT
+Listening port
+.IP \fB[host\fR=\fIHOST\fB]
+Listening host
+.IP \fB[auth\fR=\fIAUTH\fB]
+Authentication domain. The default authentication domain is used if none is
+specified.
+.RE
+
+\fBdefault_quota\fR sets the receiving quota in bytes
+.RS
+.IP \fBquota\fR=\fIBYTES
+The quota limit in bytes
+.RE
+
+\fBpublish_kernel\fR enables LDMSD to publish kernel metrics and specifies the
+kernel metric file.
+.RS
+.IP \fBpath\fR=\fIPATH
+The path to the kernel metric file
+.RE
+
+\fBdaemon_name\fR sets the LDMS process name.
+.RS
+.IP \fBname\fR=\fINAME
+LDMS process name
+.RE
+
+
+.SS 'option' configuration command to set the command-line options
+.PP
+Apart from the configuration commands above, the configuration command 'option'
+can be used to specify the command-line option.
 .RS
 option <COMMAND-LINE OPTIONS>
 
-.SS Command-line options supported by the 'option' command and the corresponding attributes
 .TP
 .BI -a, --default_auth
 .TP
@@ -235,6 +303,7 @@ option <COMMAND-LINE OPTIONS>
 .BI -v, --log_level
 .TP
 .BI -L, --log_config " <CINT[:PATH]>"
+.RE
 
 .SS Specifying the listen endpoints in configuraton files
 .TP
@@ -245,9 +314,11 @@ listen xprt=sock port=411
 > cat ldmsd.conf
 .nf
   # cmd-line options
-  option --log_file /opt/ovis/var/ldmsd.log --log_level ERROR
-  option -m 2GB -P 16
-  option -a munge
+  log_file path=/opt/ovis/var/ldmsd.log
+  log_level level=ERROR
+  set_memory size=2GB
+  worker_threads num=16
+  default_auth plugin=munge
   listen xprt=ugni port=411
   # meminfo
   load name=meminfo
@@ -280,7 +351,7 @@ Set the environment variables ZAP_UGNI_PTAG and ZAP_UGNI_COOKIE with the appropr
 Run ldmsd directly or as part of a script launched from aprun. In either case, Use aprun with the correct -p <ptag> when running.
 
 .SH REORDERED COMMANDS
-Certain commands in are reordered when processing input scripts specified with -c. Items related to failover are handled as described in the '-c' section above. Other commands are promoted to run before any non-promoted commands from the loaded script. In particular, env, loglevel, listen, auth, and option are promoted.
+Certain commands in are reordered when processing input scripts specified with -c or -y. Items related to failover are handled as described in the '-c' and '-y' sections above. Other commands are promoted to run before any non-promoted commands from the loaded script. In particular, env, loglevel, listen, auth, and option are promoted.
 
 .SH NOTES
 OCM flags are unsupported at this time.

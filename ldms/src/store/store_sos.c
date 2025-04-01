@@ -69,8 +69,9 @@
 #include "ldms.h"
 #include "ldmsd.h"
 
+static ovis_log_t mylog;
 #define LOG_(level, ...) do { \
-	msglog(level, "store_sos: "__VA_ARGS__); \
+	ovis_log(mylog, level, ## __VA_ARGS__); \
 } while(0);
 
 /*
@@ -84,6 +85,7 @@ typedef struct sos_handle_s {
 	LIST_ENTRY(sos_handle_s) entry;
 } *sos_handle_t;
 
+pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static LIST_HEAD(sos_handle_list, sos_handle_s) sos_handle_list;
 
 struct sos_single_list_records {
@@ -144,12 +146,13 @@ struct sos_instance {
 
 	struct rbt schema_rbt;
 };
-static pthread_mutex_t cfg_lock;
-LIST_HEAD(sos_inst_list, sos_instance) inst_list;
 
-static char root_path[PATH_MAX]; /**< store root path */
-static ldmsd_msg_log_f msglog __attribute__(( format(printf, 2, 3) ));
-time_t timeout = 5;		/* Default is 5 seconds */
+typedef struct store_sos_s {
+	pthread_mutex_t cfg_lock;
+	LIST_HEAD(sos_inst_list, sos_instance) inst_list;
+	char root_path[PATH_MAX]; /**< store root path */
+	time_t timeout;		  /* Default is forever */
+} *store_sos_t;
 
 struct row_schema_key_s {
 	const struct ldms_digest_s *digest;
@@ -185,7 +188,7 @@ sos_type_t sos_type_map[] = {
 	[LDMS_V_U8] = SOS_TYPE_UINT32,
 	[LDMS_V_S8] = SOS_TYPE_INT32,
 	[LDMS_V_U16] = SOS_TYPE_UINT16,
-	[LDMS_V_S16] = SOS_TYPE_UINT16,
+	[LDMS_V_S16] = SOS_TYPE_INT16,
 	[LDMS_V_U32] = SOS_TYPE_UINT32,
 	[LDMS_V_S32] = SOS_TYPE_INT32,
 	[LDMS_V_U64] = SOS_TYPE_UINT64,
@@ -370,7 +373,7 @@ static void sos_mval_set_ts(sos_value_t v, ldms_mval_t mval)
 	v->data->prim.timestamp_.fine.usecs = mval->v_ts.usec;
 }
 
-sos_mval_set_fn sos_mval_set_tbl[] = {
+static sos_mval_set_fn sos_mval_set_tbl[] = {
 	[LDMS_V_CHAR] = sos_mval_set_char,
 	[LDMS_V_U8] = sos_mval_set_u8,
 	[LDMS_V_S8] = sos_mval_set_s8,
@@ -426,13 +429,13 @@ static sos_handle_t __create_container(const char *path)
 
 	rc = sos_container_new(path, 0660);
 	if (rc) {
-		LOG_(LDMSD_LERROR, "Error %d creating the container at '%s'\n",
+		LOG_(OVIS_LERROR, "Error %d creating the container at '%s'\n",
 		       rc, path);
 		goto err_0;
 	}
 	sos = sos_container_open(path, SOS_PERM_RW);
 	if (!sos) {
-		LOG_(LDMSD_LERROR, "Error %d opening the container at '%s'\n",
+		LOG_(OVIS_LERROR, "Error %d opening the container at '%s'\n",
 		       errno, path);
 		goto err_0;
 	}
@@ -444,18 +447,18 @@ static sos_handle_t __create_container(const char *path)
 	sprintf(part_name, "%d", (unsigned int)t);
 	rc = sos_part_create(sos, part_name, path);
 	if (rc) {
-		LOG_(LDMSD_LERROR, "Error %d creating the partition '%s' in '%s'\n",
+		LOG_(OVIS_LERROR, "Error %d creating the partition '%s' in '%s'\n",
 		       rc, part_name, path);
 		goto err_1;
 	}
 	part = sos_part_find(sos, part_name);
 	if (!part) {
-		LOG_(LDMSD_LERROR, "Newly created partition was not found\n");
+		LOG_(OVIS_LERROR, "Newly created partition was not found\n");
 		goto err_1;
 	}
 	rc = sos_part_state_set(part, SOS_PART_STATE_PRIMARY);
 	if (rc) {
-		LOG_(LDMSD_LERROR, "New partition could not be made primary\n");
+		LOG_(OVIS_LERROR, "New partition could not be made primary\n");
 		goto err_2;
 	}
 	sos_part_put(part);
@@ -548,44 +551,45 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	int rc = 0;
 	int len;
 	char *value;
+	store_sos_t ss = (store_sos_t)self->context;
 
 	value = av_value(avl, "timeout");
 	if (value)
-		timeout = strtol(value, NULL, 0);
+		ss->timeout = strtol(value, NULL, 0);
 
 	value = av_value(avl, "path");
 	if (!value) {
-		LOG_(LDMSD_LERROR,
+		LOG_(OVIS_LERROR,
 		       "%s[%d]: The 'path' configuration option is required.\n",
 		       __func__, __LINE__);
 		return EINVAL;
 	}
-	pthread_mutex_lock(&cfg_lock);
-	if (0 == strcmp(value, root_path))
+	pthread_mutex_lock(&ss->cfg_lock);
+	if (0 == strcmp(value, ss->root_path))
 		/* Ignore the call if the root_path is unchanged */
 		goto out;
 	len = strlen(value);
 	if (len >= PATH_MAX) {
-		LOG_(LDMSD_LERROR,
+		LOG_(OVIS_LERROR,
 		       "%s[%d]: The 'path' is too long.\n",
 		       __func__, __LINE__);
 		rc = ENAMETOOLONG;
 		goto out;
 	}
-	strcpy(root_path, value);
+	strcpy(ss->root_path, value);
 
 	/* Run through all open containers and close them. They will
 	 * get re-opened when store() is next called
 	 */
 	rc = ENOMEM;
-	LIST_FOREACH(si, &inst_list, entry) {
+	LIST_FOREACH(si, &ss->inst_list, entry) {
 		pthread_mutex_lock(&si->lock);
 		if (si->sos_handle) {
 			put_container_no_lock(si->sos_handle);
 			si->sos_handle = NULL;
 		}
 		size_t pathlen =
-			strlen(root_path) + strlen(si->container) + 4;
+			strlen(ss->root_path) + strlen(si->container) + 4;
 		if (si->path)
 			free(si->path);
 		si->path = malloc(pathlen);
@@ -594,12 +598,12 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 			pthread_mutex_unlock(&si->lock);
 			goto out;
 		}
-		sprintf(si->path, "%s/%s", root_path, si->container);
+		sprintf(si->path, "%s/%s", ss->root_path, si->container);
 		pthread_mutex_unlock(&si->lock);
 	}
 	rc = 0;
  out:
-	pthread_mutex_unlock(&cfg_lock);
+	pthread_mutex_unlock(&ss->cfg_lock);
 	return rc;
 }
 
@@ -609,8 +613,9 @@ static void term(struct ldmsd_plugin *self)
 
 static const char *usage(struct ldmsd_plugin *self)
 {
-	return  "    config name=store_sos path=<path>\n"
-		"       path The path to primary storage\n";
+	return  "    config name=<NAME> plugin=store_sos path=<path> timeout=<secs>\n"
+		"       path   - The path to primary storage\n"
+		"       timeout - Max wait in seconds to acquire database transaction.\n";
 }
 
 static void *get_ucontext(ldmsd_store_handle_t _sh)
@@ -624,10 +629,12 @@ open_store(struct ldmsd_store *s, const char *container, const char *schema,
 	   struct ldmsd_strgp_metric_list *metric_list, void *ucontext)
 {
 	struct sos_instance *si = NULL;
+	store_sos_t ss = (store_sos_t)s->base.context;
 
 	si = calloc(1, sizeof(*si));
 	if (!si)
 		goto out;
+	si->store = s;
 	rbt_init(&si->schema_rbt, row_schema_rbn_cmp);
 	si->ucontext = ucontext;
 	si->container = strdup(container);
@@ -637,15 +644,15 @@ open_store(struct ldmsd_store *s, const char *container, const char *schema,
 	if (!si->schema_name)
 		goto err2;
 	size_t pathlen =
-		strlen(root_path) + strlen(si->container) + 4;
+		strlen(ss->root_path) + strlen(si->container) + 4;
 	si->path = malloc(pathlen);
 	if (!si->path)
 		goto err3;
-	sprintf(si->path, "%s/%s", root_path, container);
+	sprintf(si->path, "%s/%s", ss->root_path, container);
 	pthread_mutex_init(&si->lock, NULL);
-	pthread_mutex_lock(&cfg_lock);
-	LIST_INSERT_HEAD(&inst_list, si, entry);
-	pthread_mutex_unlock(&cfg_lock);
+	pthread_mutex_lock(&ss->cfg_lock);
+	LIST_INSERT_HEAD(&ss->inst_list, si, entry);
+	pthread_mutex_unlock(&ss->cfg_lock);
 	return si;
  err3:
 	free(si->schema_name);
@@ -676,7 +683,7 @@ __schema_list(sos_schema_t schema, ldms_set_t set, int list_idx)
 			if (-1 == rec_type) {
 				rec_type = ldms_record_type_get(lent);
 			} else if (rec_type != ldms_record_type_get(lent)) {
-				LOG_(LDMSD_LERROR, "set '%s' contains a list of records "
+				LOG_(OVIS_LERROR, "set '%s' contains a list of records "
 					"of multiple record types, which store_sos does "
 					"not support records of multiple record types.\n",
 					ldms_set_instance_name_get(set));
@@ -684,7 +691,7 @@ __schema_list(sos_schema_t schema, ldms_set_t set, int list_idx)
 			}
 		}
 		if ((LDMS_V_NONE != prev_mtype) && (prev_mtype != mtype)) {
-			LOG_(LDMSD_LERROR, "List '%s' in set '%s' contains "
+			LOG_(OVIS_LERROR, "List '%s' in set '%s' contains "
 					"multiple value types. "
 					"store_sos doesn't support this.\n",
 					lname, ldms_set_instance_name_get(set));
@@ -750,7 +757,7 @@ create_schema(struct sos_instance *si, ldms_set_t set,
 			continue;
 		if (0 == strcmp("job_id", ldms_metric_name_get(set, metric_arry[i])))
 			continue;
-		LOG_(LDMSD_LINFO, "Adding attribute %s to the schema\n",
+		LOG_(OVIS_LINFO, "Adding attribute %s to the schema\n",
 		       ldms_metric_name_get(set, metric_arry[i]));
 
 		mtype = ldms_metric_type_get(set, metric_arry[i]);
@@ -855,7 +862,7 @@ __sos_mode_set(struct sos_instance *si, ldms_set_t set,
 		if (LDMS_V_LIST == ldms_metric_type_get(set, metric_arry[i])) {
 			num_lists++;
 			if (num_lists > 1) {
-				LOG_(LDMSD_LERROR, "'%s' contains multiple lists. "
+				LOG_(OVIS_LERROR, "'%s' contains multiple lists. "
 						"Please store the set using "
 						"a decomposition.\n",
 						ldms_set_instance_name_get(set));
@@ -876,7 +883,7 @@ __sos_mode_set(struct sos_instance *si, ldms_set_t set,
 		si->ctxt.lists.num_lists = num_lists;
 		si->ctxt.lists.list = calloc(num_lists, sizeof(struct sos_list));
 		if (!si->ctxt.lists.list) {
-			LOG_(LDMSD_LCRITICAL, "store_sos: Out of memory\n");
+			LOG_(OVIS_LCRITICAL, "store_sos: Out of memory\n");
 			return ENOMEM;
 		}
 	} else {
@@ -934,7 +941,7 @@ _open_store(struct sos_instance *si, ldms_set_t set,
 			if (schema)
 				goto out;
 		}
-		LOG_(LDMSD_LERROR, "Error %d adding the schema to the container\n", rc);
+		LOG_(OVIS_LERROR, "Error %d adding the schema to the container\n", rc);
 		goto err_1;
 	}
  out:
@@ -989,7 +996,7 @@ __store_timestamp(struct sos_instance *si, sos_obj_t obj, ldms_set_t set)
 
 	/* timestamp */
 	if (NULL == sos_value_init(value, obj, si->ts_attr)) {
-		LOG_(LDMSD_LERROR, "Error initializing timestamp attribute\n");
+		LOG_(OVIS_LERROR, "Error initializing timestamp attribute\n");
 		return ENOMEM;
 	}
 	value->data->prim.timestamp_.fine.secs = timestamp.sec;
@@ -1025,7 +1032,7 @@ __store_metric(sos_obj_t obj, sos_attr_t attr, ldms_set_t set,
 		for (i = 0; i < ldms_record_card(mval); i++) {
 			mtype = ldms_record_metric_type_get(mval, i, &cnt);
 			rent = ldms_record_metric_get(mval, i);
-			LOG_(LDMSD_LDEBUG, "store_sos: attr[%s, %d]: metric[%s, %s, %d]\n",
+			LOG_(OVIS_LDEBUG, "store_sos: attr[%s, %d]: metric[%s, %s, %d]\n",
 					sos_attr_name(attr), sos_attr_type(attr),
 					ldms_record_metric_name_get(mval, i),
 					ldms_metric_type_to_str(mtype),
@@ -1036,7 +1043,7 @@ __store_metric(sos_obj_t obj, sos_attr_t attr, ldms_set_t set,
 			}
 		}
 	} else if (metric_type < LDMS_V_CHAR_ARRAY) {
-		LOG_(LDMSD_LDEBUG, "store_sos: attr[%s, %d]: metric[null, %s, %d]\n",
+		LOG_(OVIS_LDEBUG, "store_sos: attr[%s, %d]: metric[null, %s, %d]\n",
 				sos_attr_name(attr), sos_attr_type(attr),
 				ldms_metric_type_to_str(metric_type),
 				sos_type_map[metric_type]);
@@ -1044,7 +1051,7 @@ __store_metric(sos_obj_t obj, sos_attr_t attr, ldms_set_t set,
 			assert(0);
 		}
 		if (NULL == sos_value_init(value, obj, attr)) {
-			LOG_(LDMSD_LERROR, "Error initializing '%s' attribute\n",
+			LOG_(OVIS_LERROR, "Error initializing '%s' attribute\n",
 			       sos_attr_name(attr));
 			errno = ENOMEM;
 			return NULL;
@@ -1053,7 +1060,7 @@ __store_metric(sos_obj_t obj, sos_attr_t attr, ldms_set_t set,
 		sos_value_put(value);
 		attr = sos_schema_attr_next(attr);
 	} else {
-		LOG_(LDMSD_LINFO, "store_sos: attr[%s, %d]: metric[null, %s, %d]\n",
+		LOG_(OVIS_LINFO, "store_sos: attr[%s, %d]: metric[null, %s, %d]\n",
 				sos_attr_name(attr), sos_attr_type(attr),
 				ldms_metric_type_to_str(metric_type),
 				sos_type_map[metric_type]);
@@ -1071,7 +1078,7 @@ __store_metric(sos_obj_t obj, sos_attr_t attr, ldms_set_t set,
 		}
 		array_value = sos_array_new(array_value, attr, obj, array_len);
 		if (!array_value) {
-			LOG_(LDMSD_LERROR, "Error %d allocating '%s' array of size %d\n",
+			LOG_(OVIS_LERROR, "Error %d allocating '%s' array of size %d\n",
 			     errno,
 			     sos_attr_name(attr),
 			     array_len);
@@ -1111,7 +1118,7 @@ __store_list_row(struct sos_instance *si, ldms_set_t s,
 
 	obj = sos_obj_new(si->sos_schema);
 	if (!obj) {
-		LOG_(LDMSD_LERROR, "Error %d: %s at %s:%d\n", errno,
+		LOG_(OVIS_LERROR, "Error %d: %s at %s:%d\n", errno,
 		       STRERROR(errno), __FILE__, __LINE__);
 		rc = ENOMEM;
 		goto err;
@@ -1124,7 +1131,7 @@ __store_list_row(struct sos_instance *si, ldms_set_t s,
 	attr = si->first_attr;
 	for (i = 0; i < metric_count; i++) {
 		if (!attr) {
-			LOG_(LDMSD_LERROR,
+			LOG_(OVIS_LERROR,
 			       "The set '%s' with schema '%s' has more "
 			       "attributes than the SOS schema '%s' to which "
 			       "it is being stored.\n",
@@ -1143,7 +1150,7 @@ __store_list_row(struct sos_instance *si, ldms_set_t s,
 			count = 0;
 		if (LDMS_V_LIST == mtype) {
 			if (LDMS_V_LIST == lent[list_no].mtype) {
-				LOG_(LDMSD_LERROR, "List '%s' in set '%s' "
+				LOG_(OVIS_LERROR, "List '%s' in set '%s' "
 					"contains a list, which store_sos "
 					"does not support.\n",
 					ldms_metric_name_get(s, metric_arry[i]),
@@ -1152,7 +1159,7 @@ __store_list_row(struct sos_instance *si, ldms_set_t s,
 				goto err;
 			}
 			if (si->ctxt.lists.list[list_no].mtype != lent[list_no].mtype) {
-				LOG_(LDMSD_LERROR, "List '%s' in set '%s' "
+				LOG_(OVIS_LERROR, "List '%s' in set '%s' "
 					"contains a metric of '%s' instead of '%s'.\n",
 					ldms_metric_name_get(s, metric_arry[i]),
 					ldms_set_instance_name_get(s),
@@ -1217,7 +1224,7 @@ __store_lists(struct sos_instance *si, ldms_set_t set,
 	num_lists = si->ctxt.lrec.num_lists;
 	lent = calloc(num_lists, sizeof(*lent));
 	if (!lent) {
-		LOG_(LDMSD_LCRITICAL, "store_sos: Out of memory\n");
+		LOG_(OVIS_LCRITICAL, "store_sos: Out of memory\n");
 		rc = ENOMEM;
 		goto err;
 	}
@@ -1229,7 +1236,7 @@ __store_lists(struct sos_instance *si, ldms_set_t set,
 		mval = ldms_metric_get(set, mid);
 		lent[i].list_len = ldms_list_len(set, mval);
 		if (0 == lent[i].list_len) {
-			LOG_(LDMSD_LINFO, "store_sos: List '%s' in set '%s' is "
+			LOG_(OVIS_LINFO, "store_sos: List '%s' in set '%s' is "
 					"empty. store_sos won't store the data.\n",
 					ldms_metric_name_get(set, mid),
 					ldms_set_instance_name_get(set));
@@ -1270,7 +1277,7 @@ __store_basic(struct sos_instance *si, ldms_set_t s,
 
 	obj = sos_obj_new(si->sos_schema);
 	if (!obj) {
-		LOG_(LDMSD_LERROR, "Error %d: %s at %s:%d\n", errno,
+		LOG_(OVIS_LERROR, "Error %d: %s at %s:%d\n", errno,
 		       STRERROR(errno), __FILE__, __LINE__);
 		rc = ENOMEM;
 		goto err;
@@ -1289,7 +1296,7 @@ __store_basic(struct sos_instance *si, ldms_set_t s,
 		size_t count = 0;
 		if (!attr) {
 			errno = E2BIG;
-			LOG_(LDMSD_LERROR,
+			LOG_(OVIS_LERROR,
 			       "The set '%s' with schema '%s' has fewer "
 			       "attributes than the SOS schema '%s' to which "
 			       "it is being stored.\n",
@@ -1322,10 +1329,8 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
       int *metric_arry, size_t metric_count)
 {
 	struct sos_instance *si = _sh;
-	struct ldms_timestamp timestamp;
+	store_sos_t ss = si->store->base.context;
 	struct timespec now;
-	SOS_VALUE(value);
-	sos_obj_t obj;
 	int rc = 0;
 
 	if (!si)
@@ -1346,7 +1351,7 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
 		rc = _open_store(si, set, metric_arry, metric_count);
 		if (rc) {
 			pthread_mutex_unlock(&si->lock);
-			LOG_(LDMSD_LERROR, "Failed to create store "
+			LOG_(OVIS_LERROR, "Failed to create store "
 			       "for %s.\n", si->container);
 			errno = rc;
 			return -1;
@@ -1357,18 +1362,18 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
 		si->first_attr = sos_schema_attr_by_name(si->sos_schema,
 				ldms_metric_name_get(set, metric_arry[0]));
 		if (si->comp_id_idx < 0)
-			LOG_(LDMSD_LINFO,
+			LOG_(OVIS_LINFO,
 			       "The component_id is missing from the metric set/schema.\n");
 		if (si->job_id_idx < 0)
-			LOG_(LDMSD_LERROR,
+			LOG_(OVIS_LERROR,
 			       "The job_id is missing from the metric set/schema.\n");
 		assert(si->ts_attr);
 	}
-	if (timeout > 0) {
+	if (ss->timeout > 0) {
 		clock_gettime(CLOCK_REALTIME, &now);
-		now.tv_sec += timeout;
+		now.tv_sec += ss->timeout;
 		if (sos_begin_x_wait(si->sos_handle->sos, &now)) {
-			LOG_(LDMSD_LERROR,
+			LOG_(OVIS_LERROR,
 			     "Timeout attempting to open a transaction on the container '%s'.\n",
 			     si->path);
 			errno = ETIMEDOUT;
@@ -1376,27 +1381,16 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
 			return -1;
 		}
 	} else {
-		sos_begin_x(si->sos_handle->sos);
+		clock_gettime(CLOCK_REALTIME, &now);
+		while (sos_begin_x_wait(si->sos_handle->sos, &now)) {
+			now.tv_sec += 5; /* Report warning every 5 seconds */
+			LOG_(OVIS_LWARN,
+			     "Timeout attempting to open a transaction "
+			     "on the container '%s'...retrying.\n",
+			     si->path);
+			clock_gettime(CLOCK_REALTIME, &now);
+		}
 	}
-	obj = sos_obj_new(si->sos_schema);
-	if (!obj) {
-		LOG_(LDMSD_LERROR, "Error %d: %s at %s:%d\n", errno,
-		       STRERROR(errno), __FILE__, __LINE__);
-		errno = ENOMEM;
-		goto err;
-	}
-	timestamp = ldms_transaction_timestamp_get(set);
-
-	/* timestamp */
-	if (NULL == sos_value_init(value, obj, si->ts_attr)) {
-		LOG_(LDMSD_LERROR, "Error initializing timestamp attribute\n");
-		errno = ENOMEM;
-		goto err;
-	}
-	value->data->prim.timestamp_.fine.secs = timestamp.sec;
-	value->data->prim.timestamp_.fine.usecs = timestamp.usec;
-	sos_value_put(value);
-
 	switch (si->mode) {
 		case STORE_SOS_M_BASIC:
 			rc = __store_basic(si, set, metric_arry, metric_count);
@@ -1405,7 +1399,7 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
 			rc = __store_lists(si, set, metric_arry, metric_count);
 			break;
 		default:
-			LOG_(LDMSD_LERROR, "Unrecognized store_sos mode '%d' "
+			LOG_(OVIS_LERROR, "Unrecognized store_sos mode '%d' "
 							"at %s:%d\n", si->mode,
 							   __FILE__, __LINE__);
 			errno = EINVAL;
@@ -1413,7 +1407,7 @@ store(ldmsd_store_handle_t _sh, ldms_set_t set,
 	}
 	sos_end_x(si->sos_handle->sos);
 	if (rc) {
-		LOG_(LDMSD_LERROR, "Error %d: %s at %s:%d\n", errno,
+		LOG_(OVIS_LERROR, "Error %d: %s at %s:%d\n", errno,
 		       STRERROR(errno), __FILE__, __LINE__);
 	}
 	pthread_mutex_unlock(&si->lock);
@@ -1467,6 +1461,7 @@ static void close_store(ldmsd_store_handle_t _sh)
 static int init_store_instance(ldmsd_strgp_t strgp)
 {
 	struct sos_instance *si;
+	store_sos_t ss = (store_sos_t)strgp->store->api->base.context;
 	int len, rc;
 
 	si = calloc(1, sizeof(*si));
@@ -1474,8 +1469,9 @@ static int init_store_instance(ldmsd_strgp_t strgp)
 		rc = errno;
 		goto err_0;
 	}
+	si->store = strgp->store->api;
 	rbt_init(&si->schema_rbt, row_schema_rbn_cmp);
-	len = asprintf(&si->path, "%s/%s", root_path, strgp->container);
+	len = asprintf(&si->path, "%s/%s", ss->root_path, strgp->container);
 	if (len < 0) {
 		rc = errno;
 		goto err_1;
@@ -1487,9 +1483,9 @@ static int init_store_instance(ldmsd_strgp_t strgp)
 	}
 	strgp->store_handle = si;
 	pthread_mutex_init(&si->lock, NULL);
-	pthread_mutex_lock(&cfg_lock);
-	LIST_INSERT_HEAD(&inst_list, si, entry);
-	pthread_mutex_unlock(&cfg_lock);
+	pthread_mutex_lock(&ss->cfg_lock);
+	LIST_INSERT_HEAD(&ss->inst_list, si, entry);
+	pthread_mutex_unlock(&ss->cfg_lock);
 	return 0;
 
  err_2:
@@ -1513,7 +1509,7 @@ create_row_schema(ldmsd_strgp_t strgp, ldmsd_row_t row)
 
 	sos_schema = sos_schema_new(row->schema_name);
 	if (!sos_schema) {
-		LOG_(LDMSD_LERROR, "sos_schema_new() failed, errno: %d, "
+		LOG_(OVIS_LERROR, "sos_schema_new() failed, errno: %d, "
 		     "container: %s, schema: %s\n",
 		     errno, si->path, row->schema_name);
 		goto err_0;
@@ -1523,7 +1519,7 @@ create_row_schema(ldmsd_strgp_t strgp, ldmsd_row_t row)
 	for (i = 0; i < row->col_count; i++) {
 		sos_type = sos_type_from_ldms_type(row->cols[i].type);
 		if (sos_type == -1) {
-			LOG_(LDMSD_LERROR, "Unsupported type %s, "
+			LOG_(OVIS_LERROR, "Unsupported type %s, "
 			     "errno: %d, container: %s, schema: %s\n",
 			     ldms_metric_type_to_str(row->cols[i].type),
 			     errno, si->path, row->schema_name);
@@ -1590,7 +1586,7 @@ get_row_schema(ldmsd_strgp_t strgp, ldmsd_row_t row)
 
 	rrbn = calloc(1, sizeof(*rrbn));
 	if (!rrbn) {
-		LOG_(LDMSD_LERROR, "Not enough memory, errno: %d, "
+		LOG_(OVIS_LERROR, "Not enough memory, errno: %d, "
 		     "container: %s, schema: %s\n",
 		     errno, si->path, row->schema_name);
 		goto err_0;
@@ -1647,12 +1643,13 @@ commit_rows(ldmsd_strgp_t strgp, ldms_set_t set, ldmsd_row_list_t row_list, int 
 			goto out;
 		}
 	}
-	if (timeout > 0) {
+	store_sos_t ss = si->store->base.context;
+	if (ss->timeout > 0) {
 		struct timespec now;
 		clock_gettime(CLOCK_REALTIME, &now);
-		now.tv_sec += timeout;
+		now.tv_sec += ss->timeout;
 		if (sos_begin_x_wait(si->sos_handle->sos, &now)) {
-			LOG_(LDMSD_LERROR,
+			LOG_(OVIS_LERROR,
 			     "Timeout attempting to open a transaction on the container '%s'.\n",
 			     si->path);
 			errno = ETIMEDOUT;
@@ -1670,7 +1667,7 @@ commit_rows(ldmsd_strgp_t strgp, ldms_set_t set, ldmsd_row_list_t row_list, int 
 		}
 		sos_obj = sos_obj_new(rrbn->sos_schema);
 		if (!sos_obj) {
-			LOG_(LDMSD_LERROR, "cannot create SOS object, "
+			LOG_(OVIS_LERROR, "cannot create SOS object, "
 			     "errno: %d, container: %s, schema: %s\n",
 			     errno, si->path, rrbn->key.name);
 			goto row_next;
@@ -1679,14 +1676,14 @@ commit_rows(ldmsd_strgp_t strgp, ldms_set_t set, ldmsd_row_list_t row_list, int 
 		for (i = 0; i < row->col_count; i++) {
 			col = &row->cols[i];
 			if (!sos_attr) {
-				LOG_(LDMSD_LERROR,
+				LOG_(OVIS_LERROR,
 				     "sos attribute - ldms metric mismatch: "
 				     "expecting more sos attributes\n");
 				goto row_err;
 			}
 			sos_type = sos_type_from_ldms_type(col->type);
 			if (sos_attr_type(sos_attr) != sos_type) {
-				LOG_(LDMSD_LERROR,
+				LOG_(OVIS_LERROR,
 				     "sos attribute - ldms metric type mismatch: "
 				     "expecting %s, but got %s\n",
 				     sos_type_sym(sos_type),
@@ -1710,7 +1707,7 @@ commit_rows(ldmsd_strgp_t strgp, ldms_set_t set, ldmsd_row_list_t row_list, int 
 				array_value = sos_array_new(array_value,
 						sos_attr, sos_obj, array_len);
 				if (!array_value) {
-					LOG_(LDMSD_LERROR, "Error %d allocating '%s' array of size %d\n",
+					LOG_(OVIS_LERROR, "Error %d allocating '%s' array of size %d\n",
 					     errno,
 					     sos_attr_name(sos_attr),
 					     array_len);
@@ -1739,26 +1736,39 @@ commit_rows(ldmsd_strgp_t strgp, ldms_set_t set, ldmsd_row_list_t row_list, int 
 	return rc;
 }
 
-static struct ldmsd_store store_sos = {
-	.base = {
-		.name = "sos",
-		.term = term,
-		.config = config,
-		.usage = usage,
-		.type = LDMSD_PLUGIN_STORE,
-	},
-	.open = open_store,
+void store_sos_del(struct ldmsd_cfgobj *obj)
+{
+	store_sos_t ss = (void*)obj;
+	free(ss);
+}
+
+static struct ldmsd_store sos_store = {
+	.base.type   = LDMSD_PLUGIN_STORE,
+	.base.name   = "store_sos",
+	.base.term   = term,
+	.base.config = config,
+	.base.usage  = usage,
+	.base.context_size = sizeof(struct store_sos_s),
+	.open        = open_store,
 	.get_context = get_ucontext,
-	.store = store,
-	.flush = flush_store,
-	.close = close_store,
-	.commit = commit_rows,
+	.store       = store,
+	.flush       = flush_store,
+	.close       = close_store,
+	.commit      = commit_rows,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
-	return &store_sos.base;
+	int rc;
+	if (!mylog) {
+		mylog = ovis_log_register("store.sos", "The log subsystem of the store_sos plugin");
+		if (!mylog) {
+			rc = errno;
+			ovis_log(NULL, OVIS_LWARN,
+				"Error %d creating the log subsystem 'store.sos'.", rc);
+		}
+	}
+	return &sos_store.base;
 }
 
 static void __attribute__ ((constructor)) store_sos_init();

@@ -13,6 +13,7 @@ ldmsd.man \
 ldms-plugins.man \
 ldmsd_exits.man \
 ldmsd_controller.man \
+ldmsd_yaml_parser.man \
 ldmsctl.man
 
 dist_man7_MANS= \
@@ -25,16 +26,11 @@ ldms_quickstart.man \
 ldms_sampler_base.man \
 ldmsd_failover.man \
 ldmsd_setgroup.man \
-Plugin_cray_system_sampler_variants.man \
-Plugin_cray_dvs_sampler.man \
 Plugin_jobid.man \
 Plugin_store_csv.man \
 Plugin_store_sos.man \
-Plugin_lustre2_client.man \
-Plugin_shm_sampler.man \
 Plugin_store_papi.man \
 Plugin_store_app.man \
-ldmsd_decomposition.man \
 Plugin_store_kafka.man
 
 if ENABLE_SLURMTEST

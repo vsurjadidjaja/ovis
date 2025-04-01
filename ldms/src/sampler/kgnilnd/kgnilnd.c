@@ -72,18 +72,14 @@
 
 static char *procfile = PROC_FILE;
 
+static ovis_log_t mylog;
+
 static ldms_set_t set = NULL;
 static FILE *mf = 0;
-static ldmsd_msg_log_f msglog;
 #define SAMP "kgnilnd"
 static int metric_offset = 0;
 static int nmetrics = 0;
 static base_data_t base;
-
-static ldms_set_t get_set(struct ldmsd_sampler *self)
-{
-	return set;
-}
 
 
 static char *replace_space(char *s)
@@ -117,14 +113,14 @@ static int create_metric_set(base_data_t base)
 
 	mf = fopen(procfile, "r");
 	if (!mf) {
-		msglog(LDMSD_LERROR, "Could not open the " SAMP " file "
+		ovis_log(mylog, OVIS_LERROR, "Could not open the " SAMP " file "
 				"'%s'...aborting\n", procfile);
 		return ENOENT;
 	}
 
 	schema = base_schema_new(base);
 	if (!schema) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: The schema '%s' could not be created, errno=%d.\n",
 		       __FILE__, base->schema_name, errno);
 		rc = errno;
@@ -136,7 +132,7 @@ static int create_metric_set(base_data_t base)
 
 	/* Process the file to define all the metrics.*/
 	if (fseek(mf, 0, SEEK_SET) != 0){
-		msglog(LDMSD_LERROR, "Could not seek in the kgnilnd file "
+		ovis_log(mylog, OVIS_LERROR, "Could not seek in the kgnilnd file "
 		       "'%s'...aborting\n", procfile);
 		rc = EINVAL;
 		goto err;
@@ -195,7 +191,7 @@ static int config_check(struct attr_value_list *kwl, struct attr_value_list *avl
 	for (i = 0; i < numdep; i++){
 		value = av_value(avl, deprecated[i]);
 		if (value){
-			msglog(LDMSD_LERROR, SAMP ": config argument %s has been deprecated.\n",
+			ovis_log(mylog, OVIS_LERROR, "config argument %s has been deprecated.\n",
 			       deprecated[i]);
 			return EINVAL;
 		}
@@ -211,7 +207,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	int rc = 0;
 
 	if (set) {
-		msglog(LDMSD_LERROR, SAMP ": Set already created.\n");
+		ovis_log(mylog, OVIS_LERROR, "Set already created.\n");
 		return EINVAL;
 	}
 
@@ -221,7 +217,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	}
 
 
-	base = base_config(avl, SAMP, SAMP, msglog);
+	base = base_config(avl, self->cfg_name, SAMP, mylog);
 	if (!base){
 		rc = EINVAL;
 		goto err;
@@ -229,7 +225,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 
 	rc = create_metric_set(base);
 	if (rc) {
-		msglog(LDMSD_LERROR, SAMP ": failed to create a metric set.\n");
+		ovis_log(mylog, OVIS_LERROR, "failed to create a metric set.\n");
 		goto err;
 	}
 	return 0;
@@ -259,7 +255,7 @@ static int sample(struct ldmsd_sampler *self)
 	union ldms_value v;
 
 	if (!set){
-	  msglog(LDMSD_LDEBUG, SAMP ": plugin not initialized\n");
+	  ovis_log(mylog, OVIS_LDEBUG, "plugin not initialized\n");
 	  /* let this one fail */
 	  //return 0;
 	  return EINVAL;
@@ -268,7 +264,7 @@ static int sample(struct ldmsd_sampler *self)
 	if (!mf){
 		mf = fopen(procfile, "r");
 		if (!mf) {
-			msglog(LDMSD_LERROR, "Could not open the kgnilnd file "
+			ovis_log(mylog, OVIS_LERROR, "Could not open the kgnilnd file "
 			       "'%s'...\n", procfile);
 			__kgnilnd_reset();
 			/* return success so it wont exit. try again next time */
@@ -281,7 +277,7 @@ static int sample(struct ldmsd_sampler *self)
 		/* perhaps the file handle has become invalid.
 		 * close it so it will reopen it on the next round.
 		 */
-		msglog(LDMSD_LERROR, "Could not seek in the " SAMP " file "
+		ovis_log(mylog, OVIS_LERROR, "Could not seek in the " SAMP " file "
 		       "'%s'...closing filehandle\n", procfile);
 		fclose(mf);
 		mf = 0;
@@ -343,12 +339,17 @@ static struct ldmsd_sampler kgnilnd_plugin = {
 		.config = config,
 		.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler."SAMP, "Message for the " SAMP " plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of '" SAMP "' plugin. Error %d\n", rc);
+	}
 	return &kgnilnd_plugin.base;
 }

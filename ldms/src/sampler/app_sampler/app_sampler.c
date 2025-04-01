@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2020-2022 National Technology & Engineering Solutions
+ * Copyright (c) 2020-2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2020-2022 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,17 +64,18 @@
 #include <pwd.h>
 
 #include <coll/rbt.h>
+#include "ovis_json/ovis_json.h"
 
 #include "ldmsd.h"
 #include "../sampler_base.h"
-#include "ldmsd_stream.h"
 
 #define SAMP "app_sampler"
 
 #define DEFAULT_STREAM "slurm"
 
-#define INST_LOG(inst, lvl, fmt, ...) \
-		 inst->log((lvl), "%s: " fmt, SAMP, ##__VA_ARGS__)
+#define INST_LOG(inst, lvl, fmt, ...) do { \
+	ovis_log(inst->mylog, (lvl), SAMP ": " fmt, ##__VA_ARGS__); \
+} while (0)
 
 #ifndef ARRAY_LEN
 #define ARRAY_LEN(a) (sizeof((a))/sizeof((a)[0]))
@@ -436,14 +437,14 @@ typedef int (*handler_fn_t)(app_sampler_inst_t inst, pid_t pid, ldms_set_t set);
 struct app_sampler_inst_s {
 	struct ldmsd_sampler samp;
 
-	ldmsd_msg_log_f log;
+	ovis_log_t mylog;
 	base_data_t base_data;
 
 	struct rbt set_rbt;
 	pthread_mutex_t mutex;
 
 	char *stream_name;
-	ldmsd_stream_client_t stream;
+	ldms_stream_client_t stream;
 
 	handler_fn_t fn[16];
 	int n_fn;
@@ -691,7 +692,7 @@ static int stat_handler(app_sampler_inst_t inst, pid_t pid, ldms_set_t set)
 	str = buff;
 	if (s != buff) {
 		if (errno) {
-			INST_LOG(inst, LDMSD_LERROR,
+			INST_LOG(inst, OVIS_LERROR,
 				"error reading /proc/%d/stat %s\n", pid, STRERROR(errno));
 			return errno;
 		}
@@ -1221,7 +1222,7 @@ app_sampler_update_schema(app_sampler_inst_t inst, ldms_schema_t schema)
 		}
 		if (idx < 0) {
 			/* error */
-			INST_LOG(inst, LDMSD_LERROR,
+			INST_LOG(inst, OVIS_LERROR,
 				 "Error %d adding metric %s into schema.\n",
 				 -idx, mi->name);
 			return -idx;
@@ -1260,7 +1261,7 @@ app_sampler config synopsis: \n\
                             [metrics=METRICS] [cfg_file=FILE]\n\
 \n\
 Option descriptions:\n\
-    stream    The name of the `ldmsd_stream` to listen for SLURM job events.\n\
+    stream    The name of the `ldms_stream` to listen for SLURM job events.\n\
               (default: slurm).\n\
     metrics   The comma-separated list of metrics to monitor.\n\
               The default is "" (empty), which is equivalent to monitor ALL\n\
@@ -1313,7 +1314,7 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 	sz = lseek(fd, 0, SEEK_END);
 	if (sz < 0) {
 		rc = errno;
-		INST_LOG(inst, LDMSD_LERROR,
+		INST_LOG(inst, OVIS_LERROR,
 			 "lseek() failed, errno: %d", errno);
 		goto out;
 	}
@@ -1321,7 +1322,7 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 	buff = malloc(sz);
 	if (!buff) {
 		rc = errno;
-		INST_LOG(inst, LDMSD_LERROR, "Out of memory");
+		INST_LOG(inst, OVIS_LERROR, "Out of memory");
 		goto out;
 	}
 	off = 0;
@@ -1329,7 +1330,7 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 		rc = read(fd, buff + off, sz);
 		if (rc < 0) {
 			rc = errno;
-			INST_LOG(inst, LDMSD_LERROR, "read() error: %d", errno);
+			INST_LOG(inst, OVIS_LERROR, "read() error: %d", errno);
 			goto out;
 		}
 		off += rc;
@@ -1339,12 +1340,12 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 	jp = json_parser_new(0);
 	if (!jp) {
 		rc = errno;
-		INST_LOG(inst, LDMSD_LERROR, "json_parser_new() error: %d", errno);
+		INST_LOG(inst, OVIS_LERROR, "json_parser_new() error: %d", errno);
 		goto out;
 	}
 	rc = json_parse_buffer(jp, buff, sz, &jdoc);
 	if (rc) {
-		INST_LOG(inst, LDMSD_LERROR, "JSON parse failed: %d", rc);
+		INST_LOG(inst, OVIS_LERROR, "JSON parse failed: %d", rc);
 		goto out;
 	}
 
@@ -1352,13 +1353,13 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 	if (ent) {
 		if (ent->type != JSON_STRING_VALUE) {
 			rc = EINVAL;
-			INST_LOG(inst, LDMSD_LERROR, "Error: `stream` must be a string.");
+			INST_LOG(inst, OVIS_LERROR, "Error: `stream` must be a string.");
 			goto out;
 		}
 		inst->stream_name = strdup(ent->value.str_->str);
 		if (!inst->stream_name) {
 			rc = ENOMEM;
-			INST_LOG(inst, LDMSD_LERROR, "Out of memory.");
+			INST_LOG(inst, OVIS_LERROR, "Out of memory.");
 			goto out;
 		}
 	} /* else, caller will later set default stream_name */
@@ -1368,14 +1369,14 @@ int __handle_cfg_file(app_sampler_inst_t inst, char *val)
 					ent = json_item_next(ent)) {
 			if (ent->type != JSON_STRING_VALUE) {
 				rc = EINVAL;
-				INST_LOG(inst, LDMSD_LERROR,
+				INST_LOG(inst, OVIS_LERROR,
 					 "Error: metric must be a string.");
 				goto out;
 			}
 			minfo = find_metric_info_by_name(ent->value.str_->str);
 			if (!minfo) {
 				rc = ENOENT;
-				INST_LOG(inst, LDMSD_LERROR,
+				INST_LOG(inst, OVIS_LERROR,
 					 "Error: metric '%s' not found",
 					 ent->value.str_->str);
 				goto out;
@@ -1478,33 +1479,34 @@ int __handle_task_exit(app_sampler_inst_t inst, json_entity_t data)
 	return 0;
 }
 
-int __stream_cb(ldmsd_stream_client_t c, void *ctxt,
-		ldmsd_stream_type_t stream_type,
-		const char *msg, size_t msg_len, json_entity_t entity)
+int __stream_cb(ldms_stream_event_t ev, void *ctxt)
 {
 	app_sampler_inst_t inst = ctxt;
 	json_entity_t event, data;
 	const char *event_name;
 
-	if (stream_type != LDMSD_STREAM_JSON) {
-		INST_LOG(inst, LDMSD_LDEBUG, "Unexpected stream type data...ignoring\n");
-		INST_LOG(inst, LDMSD_LDEBUG, "%s\n", msg);
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
+
+	if (ev->recv.type != LDMS_STREAM_JSON) {
+		INST_LOG(inst, OVIS_LDEBUG, "Unexpected stream type data...ignoring\n");
+		INST_LOG(inst, OVIS_LDEBUG, "%s\n", ev->recv.data);
 		return EINVAL;
 	}
 
-	event = json_value_find(entity, "event");
+	event = json_value_find(ev->recv.json, "event");
 	if (!event) {
-		INST_LOG(inst, LDMSD_LERROR, "'event' attribute missing\n");
+		INST_LOG(inst, OVIS_LERROR, "'event' attribute missing\n");
 		goto out_0;
 	}
 	if (event->type != JSON_STRING_VALUE) {
-		INST_LOG(inst, LDMSD_LERROR, "'event' is not a string\n");
+		INST_LOG(inst, OVIS_LERROR, "'event' is not a string\n");
 		goto out_0;
 	}
 	event_name = event->value.str_->str;
-	data = json_value_find(entity, "data");
+	data = json_value_find(ev->recv.json, "data");
 	if (!data) {
-		INST_LOG(inst, LDMSD_LERROR,
+		INST_LOG(inst, OVIS_LERROR,
 			 "'%s' event is missing the 'data' attribute\n",
 			 event_name);
 		goto out_0;
@@ -1531,11 +1533,11 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 
 	if (inst->base_data) {
 		/* already configured */
-		INST_LOG(inst, LDMSD_LERROR, "already configured.\n");
+		INST_LOG(inst, OVIS_LERROR, "already configured.\n");
 		return EALREADY;
 	}
 
-	inst->base_data = base_config(avl, SAMP, SAMP, inst->log);
+	inst->base_data = base_config(avl, pi->cfg_name, SAMP, inst->mylog);
 	if (!inst->base_data) {
 		/* base_config() already log error message */
 		return errno;
@@ -1552,7 +1554,7 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 		if (val) {
 			inst->stream_name = strdup(val);
 			if (!inst->stream_name) {
-				INST_LOG(inst, LDMSD_LERROR, "Out of memory");
+				INST_LOG(inst, OVIS_LERROR, "Out of memory");
 				rc = ENOMEM;
 				goto err;
 			}
@@ -1564,7 +1566,7 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 			while (tkn) {
 				minfo = find_metric_info_by_name(tkn);
 				if (!minfo) {
-					INST_LOG(inst, LDMSD_LERROR,
+					INST_LOG(inst, OVIS_LERROR,
 						 "Error: metric '%s' not found",
 						 tkn);
 					rc = ENOENT;
@@ -1584,7 +1586,7 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 	if (!inst->stream_name) {
 		inst->stream_name = strdup("slurm");
 		if (!inst->stream_name) {
-			INST_LOG(inst, LDMSD_LERROR, "Out of memory");
+			INST_LOG(inst, OVIS_LERROR, "Out of memory");
 			rc = ENOMEM;
 			goto err;
 		}
@@ -1603,7 +1605,7 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 
 	/* create schema */
 	if (!base_schema_new(inst->base_data)) {
-		INST_LOG(inst, LDMSD_LERROR, "Out of memory");
+		INST_LOG(inst, OVIS_LERROR, "Out of memory");
 		rc = errno;
 		goto err;
 	}
@@ -1612,9 +1614,9 @@ app_sampler_config(struct ldmsd_plugin *pi, struct attr_value_list *kwl,
 		goto err;
 
 	/* subscribe to the stream */
-	inst->stream = ldmsd_stream_subscribe(inst->stream_name, __stream_cb, inst);
+	inst->stream = ldms_stream_subscribe(inst->stream_name, 0, __stream_cb, inst, "app_sampler");
 	if (!inst->stream) {
-		INST_LOG(inst, LDMSD_LERROR,
+		INST_LOG(inst, OVIS_LERROR,
 			 "Error subcribing to stream `%s`: %d",
 			 inst->stream_name, errno);
 		rc = errno;
@@ -1637,7 +1639,7 @@ void app_sampler_term(struct ldmsd_plugin *pi)
 	struct app_sampler_set *app_set;
 
 	if (inst->stream)
-		ldmsd_stream_close(inst->stream);
+		ldms_stream_close(inst->stream);
 	pthread_mutex_lock(&inst->mutex);
 	while ((rbn = rbt_min(&inst->set_rbt))) {
 		rbt_del(&inst->set_rbt, rbn);
@@ -1712,12 +1714,17 @@ struct app_sampler_inst_s __inst = {
 		},
 		.sample = app_sampler_sample,
 	},
-	.log = ldmsd_log,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	__inst.log = pf;
+	int rc;
+	__inst.mylog = ovis_log_register("sampler."SAMP, "Message for the " SAMP " plugin");
+	if (!__inst.mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of '" SAMP "' plugin. Error %d\n", rc);
+	}
 	return &__inst.samp.base;
 }
 

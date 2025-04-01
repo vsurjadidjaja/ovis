@@ -1,8 +1,8 @@
-/**
- * Copyright (c) 2019-2021 National Technology & Engineering Solutions
+/*
+ * Copyright (c) 2019-2021,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2019-2021 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2019-2021,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -67,7 +67,6 @@
 #include <coll/rbt.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldmsd_stream.h"
 
 /*
  * CURRENT GROUND RULES:
@@ -96,7 +95,7 @@
 
 #define PNAME "stream_csv_store"
 
-static ldmsd_msg_log_f msglog;
+static ovis_log_t mylog;
 static int flushtime = 0;
 static int rollover = 0;
 static int rollagain = 0;
@@ -199,7 +198,7 @@ struct csv_stream_handle {
 	int64_t byte_count; /* for the roll. Cumulative since last roll */
 	struct timeval tlastrcv; /* for the flush. */
 	struct linedata dataline; /* used to keep track of keys for the header */
-	ldmsd_stream_client_t client; /* subscribe/unsubscribe */
+	ldms_stream_client_t client; /* subscribe/unsubscribe */
 	pthread_mutex_t lock;
 };
 
@@ -251,12 +250,12 @@ static void close_streamstore(void *obj, void *cb_arg)
 	}
 
 	pthread_mutex_lock(&stream_handle->lock);
-	msglog(LDMSD_LDEBUG, PNAME ": Closing stream store <%s>\n",
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": Closing stream store <%s>\n",
 			stream_handle->stream);
 
 	/* unsubscribe */
 	if (stream_handle->client)
-		ldmsd_stream_close(stream_handle->client);
+		ldms_stream_close(stream_handle->client);
 	stream_handle->client = NULL;
 
 	if (stream_handle->file) {
@@ -309,11 +308,11 @@ static int _parse_list_for_header(struct linedata *dataline, json_entity_t e)
 	li = json_item_first(e);
 
 	if (li == NULL) {
-		msglog(LDMSD_LERROR, PNAME ": list cannot be empty for header.\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": list cannot be empty for header.\n");
 		return -1;
 	}
 	if (li->type != JSON_DICT_VALUE) {
-		msglog(LDMSD_LERROR, PNAME ": list can only have dict entries\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": list can only have dict entries\n");
 		return -1;
 	}
 	/* parse the dict. process once to fill and 2nd time to fill */
@@ -330,7 +329,7 @@ static int _parse_list_for_header(struct linedata *dataline, json_entity_t e)
 			idict++;
 		}
 		if (idict == 0) {
-			msglog(LDMSD_LDEBUG, PNAME ": empty dict for header parse\n");
+			ovis_log(mylog, OVIS_LDEBUG, PNAME ": empty dict for header parse\n");
 			return -1;
 		}
 		if (i == 0) {
@@ -377,7 +376,7 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 			 * the same keys for all time
 			 */
 			if (ilist != 0) {
-				msglog(LDMSD_LDEBUG,
+				ovis_log(mylog, OVIS_LDEBUG,
 					PNAME ": can only support 1 list in the header\n");
 				rc = EINVAL;
 				goto err;
@@ -385,7 +384,7 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 			ilist++;
 			break;
 		case JSON_DICT_VALUE:
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 				PNAME ": not handling type JSON_DICT_VALUE in header\n");
 			rc = EINVAL;
 			goto err;
@@ -395,7 +394,7 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 			isingleton++;
 			break;
 		case JSON_ATTR_VALUE:
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 				PNAME ": should not have ATTR type now\n");
 			rc = EINVAL;
 			goto err;
@@ -409,7 +408,7 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 	}
 
 	if ((isingleton == 0) && (ilist == 0)) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 			PNAME ": no keys for header. Waiting for next one\n");
 		rc = EINVAL;
 		goto err;
@@ -438,13 +437,13 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 				goto err;
 			break;
 		case JSON_DICT_VALUE:
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 				PNAME ": not handling type JSON_DICT_VALUE in header\n");
 			rc = EINVAL;
 			goto err;
 			break;
 		case JSON_ATTR_VALUE:
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 					PNAME ": should not have ATTR type now\n");
 			rc = EINVAL;
 			goto err;
@@ -499,7 +498,7 @@ static int _get_header_from_data(struct linedata *dataline, json_entity_t e)
 
 err:
 	jbuf_free(jb);
-	msglog(LDMSD_LDEBUG, PNAME ": header build failed\n");
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": header build failed\n");
 	_clear_key_info(dataline);
 
 	return rc;
@@ -529,8 +528,8 @@ static int _append_singleton(json_entity_t en, jbuf_t jb)
 		break;
 	default:
 		/* this should not happen */
-		msglog(LDMSD_LDEBUG,
-				PNAME, ": cannot process JSON type '%s' "
+		ovis_log(mylog, OVIS_LDEBUG,
+				PNAME ": cannot process JSON type '%s' "
 				"as singleton\n", json_type_name(en->type));
 		return -1;
 		break;
@@ -589,7 +588,7 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 			} else {
 				rc = _append_singleton(en, jbs);
 				if (rc) {
-					msglog(LDMSD_LDEBUG,
+					ovis_log(mylog, OVIS_LDEBUG,
 						PNAME ": Cannot print data because "
 						"of a variable print problem\n");
 					jbuf_free(jbs);
@@ -631,7 +630,7 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 	en = json_value_find(e, dataline->listkey);
 	/* if data has no list */
 	if (en == NULL) {
-		msglog(LDMSD_LDEBUG, PNAME ": no match for %s\n", dataline->listkey);
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": no match for %s\n", dataline->listkey);
 		/* write out just the singleton line and empty vals for the dict items */
 		for (i = 0; i < dataline->ndict - 1; i++) {
 			jbs = jbuf_append_str(jbs, ",");
@@ -651,7 +650,7 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 
 	/* if we got the val, but its not a list */
 	if (en->type != JSON_LIST_VALUE) {
-		msglog(LDMSD_LERROR, PNAME ": %s is not a LIST type %s. "
+		ovis_log(mylog, OVIS_LERROR, PNAME ": %s is not a LIST type %s. "
 						"skipping this data.\n",
 						dataline->listkey,
 						json_type_name(en->type));
@@ -684,7 +683,7 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 	/* if there are dicts */
 	for (li = json_item_first(en); li; li = json_item_next(li)) {
 		if (li->type != JSON_DICT_VALUE) {
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 					PNAME ": LIST %s has innards that are not "
 					"a DICT type %s. skipping this data.\n",
 					dataline->listkey,
@@ -700,14 +699,14 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 		for (i = 0; i < dataline->ndict; i++) {
 			json_entity_t edict = json_value_find(li, dataline->dictkey[i]);
 			if (edict == NULL) {
-				msglog(LDMSD_LDEBUG,
+				ovis_log(mylog, OVIS_LDEBUG,
 						PNAME ": NULL return from find for "
 						"key <%s>\n", dataline->dictkey[i]);
 				/* print nothing */
 			} else {
 				rc = _append_singleton(edict, jb);
 				if (rc) {
-					msglog(LDMSD_LDEBUG,
+					ovis_log(mylog, OVIS_LDEBUG,
 						PNAME ": Cannot print data because "
 						"of a variable print problem\n");
 					jbuf_free(jbs);
@@ -734,16 +733,14 @@ static int _print_data_lines(struct csv_stream_handle *stream_handle,
 
 out:
 #ifdef STREAM_CSV_DIAGNOSTICS
-	msglog(LDMSD_LDEBUG, PNAME ": message processed. store_count = %d\n",
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": message processed. store_count = %d\n",
 						stream_handle->store_count);
 #endif
 	return 0;
 }
 
 static void _roll_innards(struct csv_stream_handle *stream_handle);
-static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
-			ldmsd_stream_type_t stream_type, const char *msg,
-			size_t msg_len, json_entity_t e)
+static int stream_cb(ldms_stream_event_t ev, void *ctxt)
 {
 
 	struct csv_stream_handle *stream_handle;
@@ -751,28 +748,31 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 	int gottime = 0;
 	int rc = 0;
 
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
+
 #ifdef STREAM_CSV_DIAGNOSTICS
 	static uint64_t msg_count = 0;
 
 
 	/* diagnostics logging */
-	msglog(LDMSD_LDEBUG,
+	ovis_log(mylog, OVIS_LDEBUG,
 		PNAME ": Calling stream_cb. msg_count %d on stream '%s'\n",
-		msg_count, ldmsd_stream_client_name(c));
+		msg_count, ev->recv.name);
 
 	msg_count += 1;
 	if (0 == (msg_count % CB_MSG_LOG)) {
 		extern struct rbt *msg_tree;
 		time_t t = time(NULL);
-		msglog(LDMSD_LERROR, "timestamp %ld msg_tree %ld msg_count %lu\n",
+		ovis_log(mylog, OVIS_LERROR, "timestamp %ld msg_tree %ld msg_count %lu\n",
 						t, msg_tree->card, msg_count);
 	}
 #endif
 
 	/* don't need to check the cfgstate. if you've subscribed, it's ok */
-	const char *skey = ldmsd_stream_client_name(c);
+	const char *skey = ev->recv.name;
 	if (!skey) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 				PNAME ": Cannot get stream_name from client\n");
 		return -1;
 	}
@@ -781,7 +781,7 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
         /* really don't need lock since streams cannot be dynamically added */
 	stream_handle = idx_find(stream_idx, (void*) skey, strlen(skey));
 	if (!stream_handle) {
-		msglog(LDMSD_LERROR, PNAME ": No stream_store for '%s'\n", skey);
+		ovis_log(mylog, OVIS_LERROR, PNAME ": No stream_store for '%s'\n", skey);
                 pthread_mutex_unlock(&cfg_lock);
 		return -1;
 	}
@@ -810,7 +810,7 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 	}
 
 	if (!stream_handle->file) {
-		msglog(LDMSD_LERROR, PNAME ": Cannot insert values for '%s': "
+		ovis_log(mylog, OVIS_LERROR, PNAME ": Cannot insert values for '%s': "
 					"file is NULL\n", stream_handle->stream);
 		rc = EPERM;
 		goto out;
@@ -821,14 +821,14 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 	 * entity will also be populated.
 	 */
 
-	if (stream_type == LDMSD_STREAM_STRING) {
+	if (ev->recv.type == LDMS_STREAM_STRING) {
 		/* note that the string might have a newline as part of it */
 #ifdef TIMESTAMP_STORE
 		rc = fprintf(stream_handle->file, "%s,%f\n",
 				msg,
 				tv_prev.tv_sec + tv_prev.tv_usec/1000000.0);
 #else
-		rc = fprintf(stream_handle->file, "%s\n", msg);
+		rc = fprintf(stream_handle->file, "%s\n", ev->recv.data);
 #endif
 		stream_handle->byte_count += rc;
 		stream_handle->store_count++;
@@ -841,24 +841,24 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 			fflush(stream_handle->file);
 			fsync(fileno(stream_handle->file));
 		}
-	} else if (stream_type == LDMSD_STREAM_JSON) {
-		if (!e) {
-			msglog(LDMSD_LERROR, PNAME ": why is entity NULL?\n");
+	} else if (ev->recv.type == LDMS_STREAM_JSON) {
+		if (!ev->recv.json) {
+			ovis_log(mylog, OVIS_LERROR, "Why is entity NULL?\n");
 			rc = EINVAL;
 			goto out;
 		}
 
-		if (e->type != JSON_DICT_VALUE) {
-			msglog(LDMSD_LERROR, PNAME ": Expected a dict object, "
-					"not a %s.\n", json_type_name(e->type));
+		if (ev->recv.json->type != JSON_DICT_VALUE) {
+			ovis_log(mylog, OVIS_LERROR, "Expected a dict object, "
+					"not a %s.\n", json_type_name(ev->recv.json->type));
 			rc = EINVAL;
 			goto out;
 		}
 
 		if (!stream_handle->dataline.header) {
-			rc = _get_header_from_data(&stream_handle->dataline, e);
+			rc = _get_header_from_data(&stream_handle->dataline, ev->recv.json);
 			if (rc != 0) {
-				msglog(LDMSD_LDEBUG, PNAME ": error getting header "
+				ovis_log(mylog, OVIS_LDEBUG, PNAME ": error getting header "
 							"from data <%d>\n", rc);
 				goto out;
 			}
@@ -869,14 +869,14 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 			_print_header(stream_handle);
 		}
 
-		_print_data_lines(stream_handle, &tv_prev, e);
+		_print_data_lines(stream_handle, &tv_prev, ev->recv.json);
 
 		if (!buffer) {
 			fflush(stream_handle->file);
 			fsync(fileno(stream_handle->file));
 		}
 	} else {
-		msglog(LDMSD_LERROR, PNAME ": unknown stream type\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": unknown stream type\n");
 		rc = EINVAL;
 		goto out;
 	}
@@ -898,14 +898,14 @@ static int open_streamstore(char *stream)
 
 	/* already have the cfg_lock */
 	if ((cfgstate != CFG_BASIC) && (cfgstate != CFG_DONE)) {
-		msglog(LDMSD_LERROR, PNAME ": config not called. cannot open.\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": config not called. cannot open.\n");
 		return ENOENT;
 	}
 
 	/* NOTE: unlike store, this doesn't have the possibility of closing yet. */
 	stream_handle = idx_find(stream_idx, (void*) stream, strlen(stream));
 	if (stream_handle) {
-		msglog(LDMSD_LERROR, PNAME ": cannot open stream item. already have it\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": cannot open stream item. already have it\n");
 		return EINVAL;
 	}
 
@@ -926,13 +926,13 @@ static int open_streamstore(char *stream)
 	sprintf(tmp_filename, "%s/%s/%s.%lu", root_path, container, stream,
 			tspath);
 
-	msglog(LDMSD_LDEBUG, PNAME ": stream '%s' will have file '%s'\n",
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": stream '%s' will have file '%s'\n",
 						stream, tmp_filename);
 
 	/* create path if not already there. */
 	rc = f_mkdir_p(dpath, 0777);
 	if ((rc != 0) && (errno != EEXIST)) {
-		msglog(LDMSD_LERROR, PNAME ": Failure '%s' creating directory '%s'\n",
+		ovis_log(mylog, OVIS_LERROR, PNAME ": Failure '%s' creating directory '%s'\n",
 							STRERROR(errno), dpath);
 		rc = errno;
 		goto err1;
@@ -941,7 +941,7 @@ static int open_streamstore(char *stream)
 
 	tmp_file = fopen_perm(tmp_filename, "a+", LDMSD_DEFAULT_FILE_PERM);
 	if (!tmp_file) {
-		msglog(LDMSD_LERROR, PNAME ": Error %d opening the file %s.\n",
+		ovis_log(mylog, OVIS_LERROR, PNAME ": Error %d opening the file %s.\n",
 							errno, tmp_filename);
 		rc = ENOENT;
 		goto err1;
@@ -965,10 +965,9 @@ static int open_streamstore(char *stream)
 		goto err1;
 	}
 
-	/* NOTE: subscribing but rollover not set yet */
-	msglog(LDMSD_LDEBUG, PNAME ": subscribing to stream '%s'\n", stream);
-	stream_handle->client = ldmsd_stream_subscribe(stream, stream_cb,
-								stream_handle);
+	ovis_log(mylog, OVIS_LDEBUG, "Subscribing to stream '%s'\n", stream);
+	stream_handle->client = ldms_stream_subscribe(stream, 0, stream_cb,
+					stream_handle, "stream_csv_store");
 	idx_add(stream_idx, (void*) stream, strlen(stream), stream_handle);
 	pthread_mutex_unlock(&stream_handle->lock);
 
@@ -1018,12 +1017,12 @@ static void _roll_innards(struct csv_stream_handle *stream_handle)
 	tmp_tspath = (unsigned long) (time(NULL));
 	sprintf(tmp_filename, "%s.%lu", stream_handle->basename, tmp_tspath);
 
-	msglog(LDMSD_LDEBUG, PNAME ": stream '%s' will have file '%s'\n",
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": stream '%s' will have file '%s'\n",
 					stream_handle->stream, tmp_filename);
 
 	nfp = fopen_perm(tmp_filename, "a+", LDMSD_DEFAULT_FILE_PERM);
 	if (!nfp) {
-		msglog(LDMSD_LERROR, PNAME ": Error %d opening the file %s.\n",
+		ovis_log(mylog, OVIS_LERROR, PNAME ": Error %d opening the file %s.\n",
 							errno, tmp_filename);
 		goto out;
 	}
@@ -1068,7 +1067,7 @@ static void roll_cb(void *obj, void *cb_arg)
 		}
 		break;
 	default:
-		msglog(LDMSD_LDEBUG, PNAME ": Error: unexpected rolltype "
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": Error: unexpected rolltype "
 					"in store(%d)\n", rolltype);
 		break;
 	}
@@ -1107,7 +1106,7 @@ static void flush_cb(void *obj, void *cb_arg)
 
 	if (stream_handle->file) { /* this should always be true */
 		if (timex - stream_handle->tlastrcv.tv_sec > flushtime) {
-			msglog(LDMSD_LDEBUG, PNAME ": Async Flush: %s "
+			ovis_log(mylog, OVIS_LDEBUG, PNAME ": Async Flush: %s "
 					"(curr %ld last %ld)\n",
 					stream_handle->stream, timex,
 					stream_handle->tlastrcv.tv_sec);
@@ -1257,14 +1256,14 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	pthread_mutex_lock(&cfg_lock);
 	/* only call once. cannot reset state from subscribe. */
 	if (cfgstate != CFG_PRE) {
-		msglog(LDMSD_LDEBUG, PNAME ": cannot call config again\n");
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": cannot call config again\n");
 		pthread_mutex_unlock(&cfg_lock);
 		return -1;
 	}
 
         stream_idx = idx_create();
 	if (!stream_idx) {
-		msglog(LDMSD_LERROR, PNAME ": should have empty stream_idx\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": should have empty stream_idx\n");
 		pthread_mutex_unlock(&cfg_lock);
 		return -1;
 	}
@@ -1273,12 +1272,12 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	s = av_value(avl, "buffer");
 	if (s) {
 		buffer = atoi(s);
-		msglog(LDMSD_LDEBUG, PNAME ": setting buffer to '%d'\n", buffer);
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": setting buffer to '%d'\n", buffer);
 	}
 
 	s = av_value(avl, "stream");
 	if (!s) {
-		msglog(LDMSD_LDEBUG, PNAME ": missing stream in config\n");
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": missing stream in config\n");
 		rc = EINVAL;
 		goto out;
 	} else {
@@ -1291,7 +1290,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 
 	s = av_value(avl, "path");
 	if (!s) {
-		msglog(LDMSD_LDEBUG, PNAME ": missing path in config\n");
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": missing path in config\n");
 		rc = EINVAL;
 		goto out;
 	} else {
@@ -1300,12 +1299,12 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 			rc = ENOMEM;
 			goto out;
 		}
-		msglog(LDMSD_LDEBUG, PNAME ": setting root_path to '%s'\n", root_path);
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": setting root_path to '%s'\n", root_path);
 	}
 
 	s = av_value(avl, "container");
 	if (!s) {
-		msglog(LDMSD_LDEBUG, PNAME ": missing container in config\n");
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": missing container in config\n");
 		rc = EINVAL;
 		goto out;
 	} else {
@@ -1314,7 +1313,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 			rc = ENOMEM;
 			goto out;
 		}
-		msglog(LDMSD_LDEBUG, PNAME ": setting container to '%s'\n", container);
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": setting container to '%s'\n", container);
 	}
 
 	cfgstate = CFG_BASIC;
@@ -1326,10 +1325,10 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	}
 	pch = strtok_r(templist, ",", &saveptr);
 	while (pch != NULL) {
-		msglog(LDMSD_LDEBUG, PNAME ": opening streamstore for '%s'\n", pch);
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": opening streamstore for '%s'\n", pch);
 		rc = open_streamstore(pch);
 		if (rc) {
-			msglog(LDMSD_LERROR, PNAME ": Error opening store for stream '%s'\n", pch);
+			ovis_log(mylog, OVIS_LERROR, PNAME ": Error opening store for stream '%s'\n", pch);
 			goto err;
 		}
 		pch = strtok_r(NULL, ",", &saveptr);
@@ -1341,7 +1340,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	s = av_value(avl, "rolltype");
 	m = av_value(avl, "rollover");
 	if ((s && !m) || (m && !s)) {
-		msglog(LDMSD_LERROR, PNAME ": rolltype given without rollover.\n");
+		ovis_log(mylog, OVIS_LERROR, PNAME ": rolltype given without rollover.\n");
 		rolltype = DEFAULT_ROLLTYPE;
 		rc = EINVAL;
 		goto err;
@@ -1350,13 +1349,13 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 		rolltype = atoi(s);
 		rollover = atoi(m);
 		if (rolltype < MINROLLTYPE || rolltype > MAXROLLTYPE) {
-			msglog(LDMSD_LERROR, PNAME ": rolltype out of range '%s'.\n", s);
+			ovis_log(mylog, OVIS_LERROR, PNAME ": rolltype out of range '%s'.\n", s);
 			rc = EINVAL;
 			goto err;
 		}
 
 		if (rollover < 0) {
-			msglog(LDMSD_LERROR, PNAME ": Error: bad rollover value '%s'\n", m);
+			ovis_log(mylog, OVIS_LERROR, PNAME ": Error: bad rollover value '%s'\n", m);
 			rc = EINVAL;
 			goto err;
 		}
@@ -1366,31 +1365,31 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 			if (s) {
 				rollagain = atoi(s);
 				if (rollagain < 0) {
-					msglog(LDMSD_LERROR, PNAME
+					ovis_log(mylog, OVIS_LERROR, PNAME
 						": bad rollagain value '%s'\n", s);
 					rc = EINVAL;
 					goto err;
 				}
 				if (rollagain < rollover||
 				rollagain < MIN_ROLL_1) {
-					msglog(LDMSD_LERROR, PNAME
+					ovis_log(mylog, OVIS_LERROR, PNAME
 						"rolltype=5 needs rollagain"
 						" > max(rollover,10) :"
-						" rollagain='%s' "
-						" rollover='%s'\n",
+						" rollagain='%d' "
+						" rollover='%d'\n",
 						rollover, rollagain);
 					rc = EINVAL;
 					goto err;
 				}
 			} else {
-				msglog(LDMSD_LERROR, PNAME ": rolltype %d requires"
+				ovis_log(mylog, OVIS_LERROR, PNAME ": rolltype %d requires"
 						" rollagain=<value>\n", rolltype);
 			}
 		}
 
 		pthread_create(&rothread, NULL, rolloverThreadInit, NULL);
 		rothread_used = 1;
-		msglog(LDMSD_LDEBUG, PNAME ": using rolltype %d rollover %d\n",
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": using rolltype %d rollover %d\n",
 							rolltype, rollover);
 	}
 
@@ -1401,7 +1400,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 
 		pthread_create(&flthread, NULL, flushThreadInit, NULL);
 		flthread_used = 1;
-		msglog(LDMSD_LDEBUG, PNAME ": setting default flush time to %d\n",
+		ovis_log(mylog, OVIS_LDEBUG, PNAME ": setting default flush time to %d\n",
 									flushtime);
 	}
 
@@ -1416,7 +1415,7 @@ err:
 	idx_destroy(stream_idx);
 	stream_idx = idx_create();
 
-	msglog(LDMSD_LDEBUG, PNAME ": failed config\n");
+	ovis_log(mylog, OVIS_LDEBUG, PNAME ": failed config\n");
 
 out:
 	free(templist);
@@ -1467,7 +1466,6 @@ static void term(struct ldmsd_plugin *self)
 
 	cfgstate = CFG_PRE;
 	pthread_mutex_unlock(&cfg_lock);
-
 	return;
 }
 
@@ -1497,8 +1495,15 @@ static struct ldmsd_store stream_csv_store = {
 	},
 };
 
-struct ldmsd_plugin* get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin* get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("store.stream_csv_store",
+				"Log subsystem of the 'stream_csv_store' plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
+				"of 'stream_csv_store' plugin. Error %d\n", rc);
+	}
 	return &stream_csv_store.base;
 }

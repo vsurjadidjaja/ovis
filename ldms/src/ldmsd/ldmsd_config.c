@@ -78,41 +78,42 @@
 #include <mmalloc/mmalloc.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldms_xprt.h"
 #include "ldmsd_request.h"
 #include "config.h"
 
 extern void cleanup(int x, char *reason);
+/* Defined in ldmsd.c */
+extern ovis_log_t config_log;
 
 pthread_mutex_t host_list_lock = PTHREAD_MUTEX_INITIALIZER;
 LIST_HEAD(host_list_s, hostspec) host_list;
 pthread_mutex_t sp_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define LDMSD_PLUGIN_LIBPATH_MAX	1024
-struct plugin_list plugin_list;
 
 void ldmsd_cfg_ldms_xprt_cleanup(ldmsd_cfg_xprt_t xprt)
 {
 	/* nothing to do */
 }
 
-struct ldmsd_plugin_cfg *ldmsd_get_plugin(char *name)
+void ldmsd_sampler_cleanup(ldmsd_cfgobj_sampler_t samp)
 {
-	struct ldmsd_plugin_cfg *p;
-	LIST_FOREACH(p, &plugin_list, entry) {
-		if (0 == strcmp(p->name, name))
-			return p;
-	}
-	return NULL;
+	return;
 }
 
-struct ldmsd_plugin_cfg *new_plugin(char *plugin_name,
-				char *errstr, size_t errlen)
+void ldmsd_store_cleanup(ldmsd_cfgobj_store_t store)
+{
+	return;
+}
+
+enum ldmsd_plugin_data_e {
+	LDMSD_PLUGIN_DATA_CONTEXT_SIZE = 1,
+};
+
+ldmsd_plugin_t load_plugin(const char *plugin_name)
 {
 	char library_name[LDMSD_PLUGIN_LIBPATH_MAX];
 	char library_path[LDMSD_PLUGIN_LIBPATH_MAX];
-	struct ldmsd_plugin *lpi;
-	struct ldmsd_plugin_cfg *pi = NULL;
 	char *pathdir = library_path;
 	char *libpath;
 	char *saveptr = NULL;
@@ -123,10 +124,10 @@ struct ldmsd_plugin_cfg *new_plugin(char *plugin_name,
 		path = LDMSD_PLUGIN_LIBPATH_DEFAULT;
 
 	strncpy(library_path, path, sizeof(library_path) - 1);
-
 	while ((libpath = strtok_r(pathdir, ":", &saveptr)) != NULL) {
-		ldmsd_log(LDMSD_LDEBUG, "Checking for %s in %s\n",
-			plugin_name, libpath);
+		ovis_log(config_log, OVIS_LDEBUG,
+			"Checking for '%s' in '%s'\n",
+			 plugin_name, libpath);
 		pathdir = NULL;
 		snprintf(library_name, sizeof(library_name), "%s/lib%s.so",
 			libpath, plugin_name);
@@ -137,77 +138,99 @@ struct ldmsd_plugin_cfg *new_plugin(char *plugin_name,
 		struct stat buf;
 		if (stat(library_name, &buf) == 0) {
 			char *dlerr = dlerror();
-			ldmsd_log(LDMSD_LERROR, "Bad plugin "
+			ovis_log(config_log, OVIS_LERROR, "Bad plugin "
 				"'%s': dlerror %s\n", plugin_name, dlerr);
-			snprintf(errstr, errlen, "Bad plugin"
-				" '%s'. dlerror %s", plugin_name, dlerr);
-			goto err;
+			goto err_0;
 		}
 	}
 
 	if (!d) {
 		char *dlerr = dlerror();
-		ldmsd_log(LDMSD_LERROR, "Failed to load the plugin '%s': "
+		ovis_log(config_log, OVIS_LERROR, "Failed to load the plugin '%s': "
 				"dlerror %s\n", plugin_name, dlerr);
-		snprintf(errstr, errlen, "Failed to load the plugin '%s'. "
-				"dlerror %s", plugin_name, dlerr);
-		goto err;
+		goto err_0;
 	}
 
-	ldmsd_plugin_get_f pget = dlsym(d, "get_plugin");
+	ldmsd_plugin_get_f pget;
+	pget = dlsym(d, "get_plugin");
 	if (!pget) {
-		snprintf(errstr, errlen,
+		ovis_log(config_log, OVIS_LERROR,
 			"The library, '%s',  is missing the get_plugin() "
-			 "function.", plugin_name);
-		goto err;
+			"function.", plugin_name);
+		goto err_0;
 	}
-	lpi = pget(ldmsd_log);
-	if (!lpi) {
-		snprintf(errstr, errlen, "The plugin '%s' could not be loaded.",
-								plugin_name);
-		goto err;
-	}
-	pi = calloc(1, sizeof *pi);
-	if (!pi)
-		goto enomem;
-	pthread_mutex_init(&pi->lock, NULL);
-	pi->thread_id = -1;
-	pi->handle = d;
-	pi->name = strdup(plugin_name);
-	if (!pi->name)
-		goto enomem;
-	pi->libpath = strdup(library_name);
-	if (!pi->libpath)
-		goto enomem;
-	pi->plugin = lpi;
-	lpi->pi = pi;
-	pi->sample_interval_us = 1000000;
-	pi->sample_offset_us = 0;
-	LIST_INSERT_HEAD(&plugin_list, pi, entry);
+	struct ldmsd_plugin *pi = pget();
+	if (pi)
+		pi->libpath = strdup(library_name);
 	return pi;
-enomem:
-	snprintf(errstr, errlen, "No memory");
-err:
-	if (pi) {
-		pthread_mutex_destroy(&pi->lock);
-		if (pi->name)
-			free(pi->name);
-		if (pi->libpath)
-			free(pi->libpath);
-		free(pi);
-	}
+
+err_0:
 	if (d)
 		dlclose(d);
 	return NULL;
 }
 
-void destroy_plugin(struct ldmsd_plugin_cfg *p)
+ldmsd_cfgobj_sampler_t
+ldmsd_sampler_add(const char *cfg_name,
+		  struct ldmsd_sampler *api,
+		  ldmsd_cfgobj_del_fn_t __del,
+		  uid_t uid, gid_t gid, int perm)
 {
-	free(p->libpath);
-	free(p->name);
-	LIST_REMOVE(p, entry);
-	dlclose(p->handle);
-	free(p);
+	ldmsd_cfgobj_sampler_t sampler;
+	struct ldmsd_sampler *api_inst;
+	api_inst = calloc(1, sizeof (*api_inst) + api->base.context_size);
+	if (!api_inst)
+		return NULL;
+	memcpy(api_inst, api, sizeof(*api));
+	if (api->base.context_size)
+		api_inst->base.context = (void *)(api_inst + 1);
+	sampler = (void*)ldmsd_cfgobj_new_with_auth(cfg_name, LDMSD_CFGOBJ_SAMPLER,
+						sizeof(*sampler),
+						__del, uid, gid, perm);
+	if (!sampler) {
+		ovis_log(config_log, OVIS_LERROR,
+			"Error %d creating the sampler configuration object '%s'\n",
+				errno, cfg_name);
+		free(api_inst);
+		return NULL;
+	}
+	sampler->api = api_inst;
+	sampler->api->base.cfg_name = strdup(cfg_name);
+	sampler->thread_id = -1;	/* stopped */
+#ifdef _CFG_REF_DUMP_
+	ref_dump(&sampler->cfg.ref, sampler->cfg.name, stderr);
+#endif
+	ldmsd_cfgobj_unlock(&sampler->cfg);
+	return sampler;
+}
+
+ldmsd_cfgobj_store_t ldmsd_store_add(const char *cfg_name,
+		struct ldmsd_store *api,
+		ldmsd_cfgobj_del_fn_t __del,
+		uid_t uid, gid_t gid, int perm)
+{
+	ldmsd_cfgobj_store_t store;
+	struct ldmsd_store *api_inst;
+	api_inst = calloc(1, sizeof (*api_inst) + api->base.context_size);
+	if (!api_inst)
+		return NULL;
+	memcpy(api_inst, api, sizeof(*api));
+	if (api->base.context_size)
+		api_inst->base.context = (void *)(api_inst + 1);
+	store = (void*)ldmsd_cfgobj_new_with_auth(cfg_name, LDMSD_CFGOBJ_STORE,
+						sizeof(*store),
+						__del, uid, gid, perm);
+	if (!store) {
+		ovis_log(config_log, OVIS_LERROR,
+			"Error %d creating the store configuration object '%s'\n",
+				errno, cfg_name);
+		free(api_inst);
+		return NULL;
+	}
+	store->api = api_inst;
+	store->api->base.cfg_name = strdup(cfg_name);
+	ldmsd_cfgobj_unlock(&store->cfg);
+	return store;
 }
 
 const char *prdcr_state_str(enum ldmsd_prdcr_state state)
@@ -223,6 +246,8 @@ const char *prdcr_state_str(enum ldmsd_prdcr_state state)
 		return "CONNECTED";
 	case LDMSD_PRDCR_STATE_STOPPING:
 		return "STOPPING";
+	case LDMSD_PRDCR_STATE_STANDBY:
+		return "STANDBY";
 	}
 	return "BAD STATE";
 }
@@ -255,21 +280,60 @@ int ldmsd_compile_regex(regex_t *regex, const char *regex_str,
 	return rc;
 }
 
+void ldmsd_sampler___del(ldmsd_cfgobj_t obj)
+{
+	ldmsd_cfgobj_sampler_t samp = (void*)obj;
+	struct ldmsd_sampler_set *_set;
+
+	while (( _set = LIST_FIRST(&samp->set_list))) {
+		LIST_REMOVE(_set, entry);
+		ldms_set_delete(_set->set);
+		free(_set);
+	}
+	free((void*)samp->api->base.cfg_name);
+	free(samp->api);
+	ldmsd_cfgobj___del(obj);
+}
+
+void ldmsd_store___del(ldmsd_cfgobj_t obj)
+{
+	ldmsd_cfgobj_store_t store = (void*)obj;
+	free((void*)store->api->base.cfg_name);
+	free(store->api);
+	ldmsd_cfgobj___del(obj);
+}
+
 /*
  * Load a plugin
  */
-int ldmsd_load_plugin(char *plugin_name, char *errstr, size_t errlen)
+int ldmsd_load_plugin(char* cfg_name, char *plugin_name,
+		      char *errstr, size_t errlen)
 {
-	struct ldmsd_plugin_cfg *pi = ldmsd_get_plugin(plugin_name);
-	if (pi) {
-		snprintf(errstr, errlen, "Plugin '%s' already loaded",
-							plugin_name);
-		return EEXIST;
+	struct ldmsd_plugin *api;
+	if (!plugin_name || !cfg_name)
+		return EINVAL;
+	api = load_plugin(plugin_name);
+	if (!api)
+		return errno;
+	switch (api->type) {
+	case LDMSD_PLUGIN_SAMPLER:
+		if (ldmsd_sampler_add(cfg_name, (struct ldmsd_sampler *)api,
+			ldmsd_sampler___del, geteuid(), getegid(), 0660))
+		break;
+	case LDMSD_PLUGIN_STORE:
+		if (ldmsd_store_add(cfg_name, (struct ldmsd_store *)api,
+			ldmsd_store___del, geteuid(), getegid(), 0660))
+		break;
+	default:
+		errno = EINVAL;
+		ovis_log(config_log, OVIS_LERROR,
+			"Error %d, the '%s' plugin is not a valid plugin type.\n",
+			errno, plugin_name);
+		goto err;
 	}
-	pi = new_plugin(plugin_name, errstr, errlen);
-	if (!pi)
-		return -1;
 	return 0;
+ err:
+	return errno;
 }
 
 /*
@@ -277,48 +341,34 @@ int ldmsd_load_plugin(char *plugin_name, char *errstr, size_t errlen)
  */
 int ldmsd_term_plugin(char *plugin_name)
 {
-	int rc = 0;
-	struct ldmsd_plugin_cfg *pi;
+	int rc = EINVAL;
+	ldmsd_cfgobj_sampler_t sampler = NULL;
+	ldmsd_cfgobj_store_t store = NULL;
+	ldmsd_plugin_t plug = NULL;
+	ldmsd_cfgobj_t cfgobj;
 
-	pi = ldmsd_get_plugin(plugin_name);
-	if (!pi)
-		return ENOENT;
-
-	pthread_mutex_lock(&pi->lock);
-	if (pi->ref_count) {
-		rc = EINVAL;
-		pthread_mutex_unlock(&pi->lock);
-		goto out;
+	sampler = ldmsd_sampler_find(plugin_name);
+	if (sampler) {
+		plug = &sampler->api->base;
+		cfgobj = &sampler->cfg;
+	} else {
+		store = ldmsd_store_find(plugin_name);
+		if (!store) {
+			rc = ENOENT;
+			goto out;
+		}
+		plug = &store->api->base;
+		cfgobj = &store->cfg;
 	}
-	pi->plugin->term(pi->plugin);
-	pthread_mutex_unlock(&pi->lock);
-	destroy_plugin(pi);
-out:
-	return rc;
-}
-
-/*
- * Configure a plugin
- */
-int ldmsd_config_plugin(char *plugin_name,
-			struct attr_value_list *_av_list,
-			struct attr_value_list *_kw_list)
-{
-	int rc = 0;
-	struct ldmsd_plugin_cfg *pi;
-
-	pi = ldmsd_get_plugin(plugin_name);
-	if (!pi)
-		return ENOENT;
-
-	pthread_mutex_lock(&pi->lock);
-	rc = pi->plugin->config(pi->plugin, _kw_list, _av_list);
-	pthread_mutex_unlock(&pi->lock);
+	plug->term(plug);
+	ldmsd_cfgobj_put(cfgobj, "find");
+	rc = 0;
+ out:
 	return rc;
 }
 
 int _ldmsd_set_udata(ldms_set_t set, char *metric_name, uint64_t udata,
-						char err_str[LEN_ERRSTR])
+		     char err_str[LEN_ERRSTR])
 {
 	int i = ldms_metric_by_name(set, metric_name);
 	if (i < 0) {
@@ -450,13 +500,13 @@ static int log_response_fn(void *_xprt, char *data, size_t data_len)
 	attr = ldmsd_first_attr(req_reply);
 
 	/* We don't dump attributes to the log */
-	ldmsd_log(LDMSD_LDEBUG, "msg_no %d flags %x rec_len %d rsp_err %d\n",
+	ovis_log(config_log, OVIS_LDEBUG, "msg_no %d flags %x rec_len %d rsp_err %d\n",
 		  req_reply->msg_no, req_reply->flags, req_reply->rec_len,
 		  req_reply->rsp_err);
 
 	if (req_reply->rsp_err && (attr->attr_id == LDMSD_ATTR_STRING)) {
 		/* Print the error message to the log */
-		ldmsd_log(LDMSD_LERROR, "msg_no %d: error %d: %s\n",
+		ovis_log(config_log, OVIS_LERROR, "msg_no %d: error %d: %s\n",
 				req_reply->msg_no, req_reply->rsp_err, attr->attr_value);
 	}
 	xprt->rsp_err = req_reply->rsp_err;
@@ -523,7 +573,7 @@ static ldmsd_req_hdr_t __aggregate_records(struct ldmsd_req_array *rec_array)
 	return req;
 oom:
 	errno = ENOMEM;
-	ldmsd_log(LDMSD_LCRITICAL, "Out of memory\n");
+	ovis_log(config_log, OVIS_LCRITICAL, "Out of memory\n");
 	return NULL;
 }
 
@@ -534,16 +584,10 @@ static uint64_t __get_cfgfile_id()
 }
 
 extern int is_req_id_priority(enum ldmsd_request req_id);
-/*
- * \param req_filter is a function that returns zero if we want to process the
- *                   request, and returns non-zero otherwise.
- */
 static
 int __process_config_file(const char *path, int *lno, int trust,
-		int (*req_filter)(ldmsd_cfg_xprt_t, ldmsd_req_hdr_t, void *),
-		void *ctxt)
+				req_filter_fn req_filter, void *ctxt)
 {
-	static uint32_t msg_no = 0;
 	int rc = 0;
 	int lineno = 0;
 	FILE *fin = NULL;
@@ -563,7 +607,7 @@ int __process_config_file(const char *path, int *lno, int trust,
 	line = malloc(LDMSD_CFG_FILE_XPRT_MAX_REC);
 	if (!line) {
 		rc = errno;
-		ldmsd_log(LDMSD_LERROR, "Out of memory\n");
+		ovis_log(config_log, OVIS_LERROR, "Out of memory\n");
 		goto cleanup;
 	}
 	line_sz = LDMSD_CFG_FILE_XPRT_MAX_REC;
@@ -571,12 +615,13 @@ int __process_config_file(const char *path, int *lno, int trust,
 	fin = fopen(path, "rt");
 	if (!fin) {
 		rc = errno;
-		ldmsd_log(LDMSD_LERROR, "Failed to open the config file '%s'. %s\n",
+		ovis_log(config_log, OVIS_LERROR, "Failed to open the config file '%s'. %s\n",
 				path, STRERROR(rc));
 		goto cleanup;
 	}
 
 	xprt.type = LDMSD_CFG_TYPE_FILE;
+	xprt.file.path = path;
 	xprt.file.cfgfile_id = __get_cfgfile_id();
 	xprt.send_fn = log_response_fn;
 	xprt.max_msg = LDMSD_CFG_FILE_XPRT_MAX_REC;
@@ -630,7 +675,7 @@ next_line:
 		char *nline = realloc(line, ((cnt + off)/line_sz + 1) * line_sz);
 		if (!nline) {
 			rc = errno;
-			ldmsd_log(LDMSD_LERROR, "Out of memory\n");
+			ovis_log(config_log, OVIS_LERROR, "Out of memory\n");
 			goto cleanup;
 		}
 		line = nline;
@@ -648,10 +693,25 @@ parse:
 	if (!off)
 		goto next_line;
 
-	req_array = ldmsd_parse_config_str(line, msg_no, xprt.max_msg, ldmsd_log);
+	if (ldmsd_is_initialized()) {
+		if ((0 == strncmp(line, "prdcr_add", 9)) ||
+				(0 == strncmp(line, "prdcr_start", 11))) {
+			if (strstr(line, "interval")) {
+				ovis_log(config_log, OVIS_LWARN,
+						"'interval' is begin deprecated. "
+						"Please use 'reconnect' with 'prdcr_add' or 'prdcr_start*' "
+						"in the future.\n");
+			}
+		}
+	}
+
+	/*
+	 * The message number is the line number.
+	 */
+	req_array = ldmsd_parse_config_str(line, lineno, xprt.max_msg);
 	if (!req_array) {
 		rc = errno;
-		ldmsd_log(LDMSD_LERROR, "Process config file error at line %d "
+		ovis_log(config_log, OVIS_LERROR, "Process config file error at line %d "
 				"(%s). %s\n", lineno, path, STRERROR(rc));
 		goto cleanup;
 	}
@@ -681,38 +741,17 @@ parse:
 	if (xprt.max_msg < ntohl(request->rec_len))
 		xprt.max_msg = ntohl(request->rec_len);
 
-	if (req_filter) {
-		rc = req_filter(&xprt, request, ctxt);
-		/* rc = 0, filter OK */
-		if (rc == 0) {
-			__dlog(DLOG_CFGOK, "# deferring line %d (%s): %s\n",
-				lineno, path, line);
-			goto next_req;
-		}
-		/* rc == errno */
-		if (rc > 0) {
-			ldmsd_log(LDMSD_LERROR,
-				  "Configuration error at "
-				  "line %d (%s)\n", lineno, path);
-			goto cleanup;
-		} else {
-			/* rc < 0, filter not applied */
-			rc = 0;
-		}
-	}
-
-	rc = ldmsd_process_config_request(&xprt, request);
+	rc = ldmsd_process_config_request(&xprt, request, req_filter, ctxt);
 	if (rc || xprt.rsp_err) {
 		if (!rc)
 			rc = xprt.rsp_err;
-		ldmsd_log(LDMSD_LERROR, "Configuration error at line %d (%s)\n",
+		ovis_log(config_log, OVIS_LERROR, "Configuration error at line %d (%s)\n",
 				lineno, path);
 		goto cleanup;
 	}
 next_req:
 	free(request);
 	request = NULL;
-	msg_no += 1;
 	off = 0;
 	goto next_line;
 
@@ -731,26 +770,227 @@ cleanup:
 	return rc;
 }
 
-int __req_deferred_start_regex(ldmsd_req_hdr_t req, ldmsd_cfgobj_type_t type)
+static
+int __process_config_str(char *cfg_str, int *lno, int trust,
+				req_filter_fn req_filter, void *ctxt)
+{
+	int rc = 0;
+	int lineno = 0;
+	char *buff = NULL;
+	char *line = NULL;
+	char *tmp;
+	size_t line_sz = 0;
+	char *comment;
+	ssize_t off = 0;
+	ssize_t cnt;
+	size_t buf_len = 0;
+	struct ldmsd_cfg_xprt_s xprt;
+	ldmsd_req_hdr_t request = NULL;
+	struct ldmsd_req_array *req_array = NULL;
+	if (!cfg_str)
+		return EINVAL;
+	line = malloc(LDMSD_CFG_FILE_XPRT_MAX_REC);
+	if (!line) {
+		rc = errno;
+		ovis_log(config_log, OVIS_LERROR, "Out of memory\n");
+		goto cleanup;
+	}
+	line_sz = LDMSD_CFG_FILE_XPRT_MAX_REC;
+	xprt.type = LDMSD_CFG_TYPE_FILE;
+	xprt.send_fn = log_response_fn;
+	xprt.max_msg = LDMSD_CFG_FILE_XPRT_MAX_REC;
+	xprt.trust = trust;
+	xprt.rsp_err = 0;
+	xprt.cleanup_fn = NULL;
+
+next_line:
+	errno = 0;
+	if (buff) {
+		memset(buff, 0, buf_len);
+		buff = strtok(NULL, "\n");
+	} else
+		buff = strtok(cfg_str, "\n");
+	if (!buff)
+		goto cleanup;
+	buf_len = sizeof(buff);
+	cnt = strlen(buff);
+	lineno++;
+	tmp = buff;
+	comment = find_comment(tmp);
+
+	if (comment)
+		*comment = '\0';
+
+	while (cnt && isspace(tmp[cnt-1]))
+		cnt --;
+
+	if (!buff) {
+		/* empty string */
+		goto parse;
+	}
+
+	tmp[cnt] = '\0';
+
+	/* Get rid of leading spaces */
+	while (isspace(*tmp)) {
+		tmp++;
+		cnt--;
+	}
+
+	if (!cnt) {
+		/* empty buffer */
+		goto parse;
+	}
+
+	if (tmp[cnt-1] == '\\') {
+		if (cnt == 1)
+			goto parse;
+	}
+
+	if (cnt + off > line_sz) {
+		char *nline = realloc(line, ((cnt + off)/line_sz + 1) * line_sz);
+		if (!nline) {
+			rc = errno;
+			ovis_log(config_log, OVIS_LERROR, "Out of memory\n");
+			goto cleanup;
+		}
+		line = nline;
+		line_sz = ((cnt + off)/line_sz + 1) * line_sz;
+	}
+	off += snprintf(&line[off], line_sz, "%s", tmp);
+
+	/* attempt to merge multiple lines together */
+	if (off > 0 && line[off-1] == '\\') {
+		line[off-1] = ' ';
+		goto next_line;
+	}
+
+parse:
+	if (!off)
+		goto next_line;
+
+	if (ldmsd_is_initialized()) {
+		if ((0 == strncmp(line, "prdcr_add", 9)) ||
+				(0 == strncmp(line, "prdcr_start", 11))) {
+			if (strstr(line, "interval")) {
+				ovis_log(config_log, OVIS_LWARNING,
+					"'interval' is being deprecated. "
+					"Please use 'reconnect' with 'prdcr_add' or 'prdcr_start*' "
+					"in the future.\n");
+			}
+		}
+	}
+	req_array = ldmsd_parse_config_str(line, lineno, xprt.max_msg);
+	if (!req_array) {
+		rc = errno;
+		ovis_log(config_log, OVIS_LERROR, "Process config string error in line %d. %s\n ",
+				lineno, STRERROR(rc));
+		goto cleanup;
+	}
+
+	request = __aggregate_records(req_array);
+	if (!request) {
+		rc = errno;
+		goto cleanup;
+	}
+	ldmsd_req_array_free(req_array);
+	req_array = NULL;
+
+	if (!ldmsd_is_initialized()) {
+		/* Process only the priority commands, e.g., cmd-line options */
+		if (!is_req_id_priority(ntohl(request->req_id)))
+			goto next_req;
+	} else {
+		/* Process non-priority commands, e.g., cfgobj config commands */
+		if (is_req_id_priority(ntohl(request->req_id)))
+			goto next_req;
+	}
+
+	/*
+	 * Make sure that LDMSD will create large enough buffer to receive
+	 * the config data.
+	 */
+	if (xprt.max_msg < ntohl(request->rec_len))
+		xprt.max_msg = ntohl(request->rec_len);
+
+	rc = ldmsd_process_config_request(&xprt, request, req_filter, ctxt);
+	if (rc || xprt.rsp_err) {
+		if (!rc)
+			rc = xprt.rsp_err;
+		ovis_log(config_log, OVIS_LERROR, "Configuration error at line %d (%s)\n",
+				lineno, cfg_str);
+		goto cleanup;
+	}
+
+next_req:
+	free(request);
+	request = NULL;
+	off = 0;
+	goto next_line;
+
+cleanup:
+	if (line)
+		free(line);
+	if (lno)
+		*lno = lineno;
+	ldmsd_req_array_free(req_array);
+	if (request)
+		free(request);
+	return rc;
+}
+
+char *__process_yaml_config_file(const char *path, const char *dname)
+{
+	FILE *fp;
+	char command[512];
+	size_t buf_sz = 4096;
+	char *cfg_str = malloc(buf_sz);
+	snprintf(command, sizeof(command), "ldmsd_yaml_parser --ldms_config %s --daemon_name %s", path, dname);
+	fp = popen(command, "r");
+	if (!fp) {
+		ovis_log(config_log, OVIS_LERROR, "Error opening pipe to ldmsd_yaml_parser.\n");
+		goto err;
+	}
+	size_t bytes_read;
+	size_t tbytes = 0;
+	while ((bytes_read = fread(&cfg_str[tbytes], 1, 4096, fp)) > 0) {
+		tbytes += bytes_read;
+		if (bytes_read == 4096) {
+			cfg_str = (char *)realloc(cfg_str, tbytes + bytes_read + 1);
+			if (!cfg_str) {
+				ovis_log(config_log, OVIS_LERROR, "Error allocating memory\n");
+				goto err;
+			}
+		}
+	}
+	cfg_str[tbytes] = '\0';
+	int status;
+	status = pclose(fp);
+	if (status) {
+		ovis_log(config_log, OVIS_LERROR, "Error occured processing configuration file %s.\n", path);
+		goto err;
+	}
+	return cfg_str;
+err:
+	if (cfg_str)
+		free(cfg_str);
+	return NULL;
+}
+
+int __req_deferred_start_regex(ldmsd_req_ctxt_t reqc, ldmsd_cfgobj_type_t type)
 {
 	regex_t regex = {0};
-	ldmsd_req_attr_t attr;
 	ldmsd_cfgobj_t obj;
 	int rc;
 	char *val;
-	attr = ldmsd_req_attr_get_by_id((void*)req, LDMSD_ATTR_REGEX);
-	if (!attr) {
-		ldmsd_log(LDMSD_LERROR, "`regex` attribute is required.\n");
-		return EINVAL;
-	}
-	val = str_repl_env_vars((char *)attr->attr_value);
+	val = ldmsd_req_attr_str_value_get_by_id(reqc, LDMSD_ATTR_REGEX);
 	if (!val) {
-		ldmsd_log(LDMSD_LERROR, "Not enough memory.\n");
-		return ENOMEM;
+		ovis_log(NULL, OVIS_LERROR, "`regex` attribute is required.\n");
+		return EINVAL;
 	}
 	rc = regcomp(&regex, val, REG_NOSUB);
 	if (rc) {
-		ldmsd_log(LDMSD_LERROR, "Bad regex: %s\n", val);
+		ovis_log(NULL, OVIS_LERROR, "Bad regex: %s\n", val);
 		free(val);
 		return EBADMSG;
 	}
@@ -766,31 +1006,57 @@ int __req_deferred_start_regex(ldmsd_req_hdr_t req, ldmsd_cfgobj_type_t type)
 	return 0;
 }
 
-int __req_deferred_start(ldmsd_req_hdr_t req, ldmsd_cfgobj_type_t type)
+int __req_deferred_start(ldmsd_req_ctxt_t reqc, ldmsd_cfgobj_type_t type)
 {
-	ldmsd_req_attr_t attr;
 	ldmsd_cfgobj_t obj;
 	char *name;
-	attr = ldmsd_req_attr_get_by_id((void*)req, LDMSD_ATTR_NAME);
-	if (!attr) {
-		ldmsd_log(LDMSD_LERROR, "`name` attribute is required.\n");
-		return EINVAL;
-	}
-	name = str_repl_env_vars((char *)attr->attr_value);
+	name = ldmsd_req_attr_str_value_get_by_id(reqc, LDMSD_ATTR_NAME);
 	if (!name) {
-		ldmsd_log(LDMSD_LERROR, "Not enough memory.\n");
-		return ENOMEM;
+		ovis_log(NULL, OVIS_LERROR, "`name` attribute is required.\n");
+		return EINVAL;
 	}
 	obj = ldmsd_cfgobj_find(name, type);
 	if (!obj) {
-		ldmsd_log(LDMSD_LERROR, "Config object not found: %s\n", name);
+		ovis_log(NULL, OVIS_LERROR, "Config object not found: %s\n", name);
 		free(name);
 		return ENOENT;
 	}
 	free(name);
 	obj->perm |= LDMSD_PERM_DSTART;
-	ldmsd_cfgobj_put(obj);
+	ldmsd_cfgobj_put(obj, "find");
 	return 0;
+}
+
+/* The implementation is in ldmsd_request.c. */
+extern ldmsd_prdcr_t
+__prdcr_add_handler(ldmsd_req_ctxt_t reqc, char *verb, char *obj_name);
+int __req_deferred_advertiser_start(ldmsd_req_ctxt_t reqc)
+{
+	int rc = 0;
+	ldmsd_prdcr_t prdcr;
+	char *name;
+
+	name = ldmsd_req_attr_str_value_get_by_id(reqc, LDMSD_ATTR_NAME);
+	if (!name) {
+		ovis_log(config_log, OVIS_LERROR, "`name` attribute is required.\n");
+		return EINVAL;
+	}
+
+	prdcr = ldmsd_prdcr_find(name);
+	if (!prdcr) {
+		prdcr = __prdcr_add_handler(reqc, "advertiser_start", "advertiser");
+		if (!prdcr) {
+			ovis_log(config_log, OVIS_LERROR, "%s", reqc->line_buf);
+			rc = reqc->errcode;
+			goto out;
+		}
+	}
+
+	prdcr->obj.perm |= LDMSD_PERM_DSTART;
+out:
+	ldmsd_prdcr_put(prdcr, "find");
+	free(name);
+	return rc;
 }
 
 /*
@@ -798,36 +1064,37 @@ int __req_deferred_start(ldmsd_req_hdr_t req, ldmsd_cfgobj_type_t type)
  * rc > 0, rc == -errno, error
  * rc = -1, filter not applied (but not an error)
  */
-int __req_filter_failover(ldmsd_cfg_xprt_t x, ldmsd_req_hdr_t req, void *ctxt)
+int __req_filter_failover(ldmsd_req_ctxt_t reqc, void *ctxt)
 {
 	int *use_failover = ctxt;
 	int rc;
 
-	/* req is in network byte order */
-	ldmsd_ntoh_req_msg(req);
-
-	switch (req->req_id) {
+	switch (reqc->req_id) {
 	case LDMSD_FAILOVER_START_REQ:
 		*use_failover = 1;
 		rc = 0;
 		break;
 	case LDMSD_PRDCR_START_REGEX_REQ:
-		rc = __req_deferred_start_regex(req, LDMSD_CFGOBJ_PRDCR);
+		rc = __req_deferred_start_regex(reqc, LDMSD_CFGOBJ_PRDCR);
+		break;
+	case LDMSD_ADVERTISER_START_REQ:
+		rc = __req_deferred_advertiser_start(reqc);
 		break;
 	case LDMSD_PRDCR_START_REQ:
-		rc = __req_deferred_start(req, LDMSD_CFGOBJ_PRDCR);
+		rc = __req_deferred_start(reqc, LDMSD_CFGOBJ_PRDCR);
 		break;
 	case LDMSD_UPDTR_START_REQ:
-		rc = __req_deferred_start(req, LDMSD_CFGOBJ_UPDTR);
+		rc = __req_deferred_start(reqc, LDMSD_CFGOBJ_UPDTR);
 		break;
 	case LDMSD_STRGP_START_REQ:
-		rc = __req_deferred_start(req, LDMSD_CFGOBJ_STRGP);
+		rc = __req_deferred_start(reqc, LDMSD_CFGOBJ_STRGP);
+		break;
+	case LDMSD_PRDCR_LISTEN_START_REQ:
+		rc = __req_deferred_start(reqc, LDMSD_CFGOBJ_PRDCR_LISTEN);
 		break;
 	default:
 		rc = -1;
 	}
-	/* convert req back to network byte order */
-	ldmsd_hton_req_msg(req);
 	return rc;
 }
 
@@ -848,7 +1115,7 @@ int ldmsd_cfgobjs_start(int (*filter)(ldmsd_cfgobj_t))
 			continue;
 		rc = __ldmsd_prdcr_start((ldmsd_prdcr_t)obj, &sctxt);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(NULL, OVIS_LERROR,
 				  "prdcr_start failed, name: %s, rc: %d\n",
 				  obj->name, rc);
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR);
@@ -865,7 +1132,7 @@ int ldmsd_cfgobjs_start(int (*filter)(ldmsd_cfgobj_t))
 			continue;
 		rc = __ldmsd_updtr_start((ldmsd_updtr_t)obj, &sctxt);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(NULL, OVIS_LERROR,
 				  "updtr_start failed, name: %s, rc: %d\n",
 				  obj->name, rc);
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_UPDTR);
@@ -886,16 +1153,24 @@ int ldmsd_cfgobjs_start(int (*filter)(ldmsd_cfgobj_t))
 			continue;
 		rc = __ldmsd_strgp_start((ldmsd_strgp_t)obj, &sctxt);
 		if (rc) {
-			ldmsd_log(LDMSD_LERROR,
+			ovis_log(NULL, OVIS_LERROR,
 				  "strgp_start failed, name: %s, rc: %d\n",
 				  obj->name, rc);
 			ldmsd_cfg_unlock(LDMSD_CFGOBJ_STRGP);
 			goto out;
 		}
-                __dlog(DLOG_CFGOK, "strgp_start name=%s # delayed \n",
-                        obj->name);
+		__dlog(DLOG_CFGOK, "strgp_start name=%s # delayed \n",
+			obj->name);
 	}
 	ldmsd_cfg_unlock(LDMSD_CFGOBJ_STRGP);
+
+	ldmsd_cfg_lock(LDMSD_CFGOBJ_PRDCR_LISTEN);
+	LDMSD_CFGOBJ_FOREACH(obj, LDMSD_CFGOBJ_PRDCR_LISTEN) {
+		if (filter && filter(obj))
+			continue;
+		((ldmsd_prdcr_listen_t)obj)->state = LDMSD_PRDCR_LISTEN_STATE_RUNNING;
+	}
+	ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR_LISTEN);
 
 out:
 	return rc;
@@ -929,6 +1204,22 @@ int process_config_file(const char *path, int *lno, int trust)
 	return rc;
 }
 
+int process_config_str(char *config_str, int *lno, int trust)
+{
+	int rc;
+	char *cfg_str = strdup(config_str);
+	rc = __process_config_str(cfg_str, lno, trust,
+				__req_filter_failover, &ldmsd_use_failover);
+	return rc;
+}
+
+char *process_yaml_config_file(const char *path, const char *dname)
+{
+	char *cstr;
+	cstr = __process_yaml_config_file(path, dname);
+	return cstr;
+}
+
 static inline void __log_sent_req(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t req)
 {
 	if (!ldmsd_req_debug) /* defined in ldmsd_request.c */
@@ -943,20 +1234,20 @@ static inline void __log_sent_req(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t req)
 	hdr.rec_len = ntohl(req->rec_len);
 	switch (hdr.type) {
 	case LDMSD_REQ_TYPE_CONFIG_CMD:
-		ldmsd_lall("sending %s msg_no: %d:%lu, flags: %#o, "
+		ovis_log(config_log, OVIS_LDEBUG, "sending %s msg_no: %d:%lu, flags: %#o, "
 			   "rec_len: %u\n",
 			   ldmsd_req_id2str(hdr.req_id),
 			   hdr.msg_no, ldms_xprt_conn_id(xprt->ldms.ldms),
 			   hdr.flags, hdr.rec_len);
 		break;
 	case LDMSD_REQ_TYPE_CONFIG_RESP:
-		ldmsd_lall("sending RESP msg_no: %d, rsp_err: %d, flags: %#o, "
+		ovis_log(config_log, OVIS_LDEBUG, "sending RESP msg_no: %d, rsp_err: %d, flags: %#o, "
 			   "rec_len: %u\n",
 			   hdr.msg_no,
 			   hdr.rsp_err, hdr.flags, hdr.rec_len);
 		break;
 	default:
-		ldmsd_lall("sending BAD REQUEST\n");
+		ovis_log(config_log, OVIS_LDEBUG, "sending BAD REQUEST\n");
 	}
 }
 
@@ -986,7 +1277,7 @@ void ldmsd_recv_msg(ldms_t x, char *data, size_t data_len)
 
 	switch (ntohl(request->type)) {
 	case LDMSD_REQ_TYPE_CONFIG_CMD:
-		(void)ldmsd_process_config_request(&xprt, request);
+		(void)ldmsd_process_config_request(&xprt, request, NULL, NULL);
 		break;
 	case LDMSD_REQ_TYPE_CONFIG_RESP:
 		(void)ldmsd_process_config_response(&xprt, request);
@@ -1011,6 +1302,7 @@ static void __listen_connect_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 		ldmsd_recv_msg(x, e->data, e->data_len);
 		break;
 	case LDMS_XPRT_EVENT_SEND_COMPLETE:
+	case LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED:
 		break;
 	default:
 		assert(0);
@@ -1021,37 +1313,20 @@ static void __listen_connect_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 int listen_on_ldms_xprt(ldmsd_listen_t listen)
 {
 	int rc = 0;
-	struct sockaddr_in sin;
-	struct addrinfo *ai = NULL;
-	struct addrinfo ai_hint = { .ai_family = AF_INET,
-				    .ai_flags = AI_PASSIVE };
 	char port_buff[8];
 
 	assert(listen->x);
 
-	sin.sin_family = AF_INET;
-	if (listen->host) {
-		snprintf(port_buff, sizeof(port_buff), "%hu", listen->port_no);
-		rc = getaddrinfo(listen->host, port_buff, &ai_hint, &ai);
-		if (rc) {
-			ldmsd_lerror("xprt listen error, getaddrinfo(%s, %s) error: %d\n", listen->host, port_buff, rc);
-			return rc;
-		}
-		memcpy(&sin, ai->ai_addr, ai->ai_addrlen);
-		freeaddrinfo(ai);
-	} else {
-		sin.sin_addr.s_addr = 0;
-		sin.sin_port = htons(listen->port_no);
-	}
-	rc = ldms_xprt_listen(listen->x, (struct sockaddr *)&sin, sizeof(sin),
-			       __listen_connect_cb, NULL);
+	snprintf(port_buff, sizeof(port_buff), "%hu", listen->port_no);
+	rc = ldms_xprt_listen_by_name(listen->x, listen->host, port_buff,
+					__listen_connect_cb, NULL);
 	if (rc) {
-		ldmsd_log(LDMSD_LERROR, "Error %d Listening on %s:%d using `%s` transport and "
+		ovis_log(NULL, OVIS_LERROR, "Error %d Listening on %s:%d using `%s` transport and "
 			  "`%s` authentication\n", rc, listen->xprt,
 			  listen->port_no, listen->xprt, listen->auth_name);
 		return rc;
 	}
-	ldmsd_log(LDMSD_LINFO, "Listening on %s:%d using `%s` transport and "
+	ovis_log(NULL, OVIS_LINFO, "Listening on %s:%d using `%s` transport and "
 		  "`%s` authentication\n",
 		  listen->xprt, listen->port_no, listen->xprt,
 		  listen->auth_name);
@@ -1068,249 +1343,14 @@ void ldmsd_cfg_ldms_init(ldmsd_cfg_xprt_t xprt, ldms_t ldms)
 	xprt->type = LDMSD_CFG_TYPE_LDMS;
 }
 
-void ldmsd_mm_status(enum ldmsd_loglevel level, const char *prefix)
+void ldmsd_mm_status(int level, const char *prefix)
 {
 	struct mm_stat s;
 	mm_stats(&s);
 	/* compute bound based on current usage */
 	size_t used = s.size - s.grain*s.largest;
-	ldmsd_log(level, "%s: mm_stat: size=%zu grain=%zu chunks_free=%zu grains_free=%zu grains_largest=%zu grains_smallest=%zu bytes_free=%zu bytes_largest=%zu bytes_smallest=%zu bytes_used+holes=%zu\n",
+	ovis_log(NULL, level, "%s: mm_stat: size=%zu grain=%zu chunks_free=%zu grains_free=%zu grains_largest=%zu grains_smallest=%zu bytes_free=%zu bytes_largest=%zu bytes_smallest=%zu bytes_used+holes=%zu\n",
 	prefix,
 	s.size, s.grain, s.chunks, s.bytes, s.largest, s.smallest,
 	s.grain*s.bytes, s.grain*s.largest, s.grain*s.smallest, used);
-}
-
-const char * blacklist[] = {
-	"libpapi_sampler.so",
-	"libtsampler.so",
-	"libtimer_base.so",
-	"liblustre_sampler.so",
-	"libzap.so",
-	"libzap_rdma.so",
-	"libzap_sock.so",
-	NULL
-};
-
-#define APP "ldmsd"
-
-static int ldmsd_plugins_usage_dir(const char *dir, const char *plugname);
-
-/* check path for existence, and if verbose != 0, whine if missing. */
-static int ldmd_plugins_check_dir(const char *path, int verbose) {
-	struct stat buf;
-	memset(&buf, 0, sizeof(buf));
-	int serr = stat(path, &buf);
-	int err = 0;
-	if (serr < 0) {
-		err = errno;
-		fprintf(stderr, "%s: unable to stat plugin library path %s (%d).\n",
-			APP, path, err);
-		return err;
-	}
-	if ( !S_ISDIR(buf.st_mode)) {
-		err = ENOTDIR;
-		fprintf(stderr, "%s: plugin library path %s is not a directory.\n",
-			APP, path);
-		return err;
-	}
-	return 0;
-}
-
-/* Dump plugin names and usages (where available) before ldmsd redirects
- * io. Loads and terms all plugins, which provides a modest check on some
- * coding and deployment issues.
- * \param plugname: list usage only for plugname. If NULL, list all plugins.
- */
-int ldmsd_plugins_usage(const char *plugname)
-{
-	char library_path[LDMSD_PLUGIN_LIBPATH_MAX];
-	char *pathdir = library_path;
-	char *libpath;
-	char *saveptr = NULL;
-
-	if (0 == strcmp(plugname, "all"))
-		plugname = NULL;
-
-	char *path = getenv("LDMSD_PLUGIN_LIBPATH");
-	if (!path)
-		path = PLUGINDIR;
-
-	if (! path ) {
-		fprintf(stderr, "%s: need plugin path input.\n", APP);
-		fprintf(stderr, "Did not find env(LDMSD_PLUGIN_LIBPATH).\n");
-		return EINVAL;
-	}
-	strncpy(library_path, path, sizeof(library_path) - 1);
-
-	int trc=0, rc = 0;
-	int plugfound = 0;
-	while ((libpath = strtok_r(pathdir, ":", &saveptr)) != NULL) {
-		pathdir = NULL;
-		trc = ldmsd_plugins_usage_dir(libpath, plugname);
-		if (trc)
-			rc = trc;
-		else
-			if (plugname)
-				plugfound = 1;
-	}
-	if (plugname && !plugfound) {
-		fprintf(stderr, "%s: no library in %s for %s\n", APP, path, plugname);
-		strncpy(library_path, path, sizeof(library_path) - 1);
-		while ((libpath = strtok_r(pathdir, ":", &saveptr)) != NULL) {
-			pathdir = NULL;
-			(void)ldmd_plugins_check_dir(libpath, 1);
-			fprintf(stderr, "%s: no library in %s for %s\n", APP, path, plugname);
-		}
-	}
-	return rc;
-}
-
-
-static int ldmsd_plugins_usage_dir(const char *path, const char *plugname)
-{
-	assert( path || "null dir name in ldmsd_plugins_usage" == NULL);
-	glob_t pglob;
-
-	int ckdir = ldmd_plugins_check_dir(path, 0);
-	if (ckdir)
-		return ckdir;
-
-	int rc = 0;
-	enum ldmsd_plugin_type tmatch = LDMSD_PLUGIN_OTHER;
-	bool matchtype = false;
-	if (plugname && strcmp(plugname,"store") == 0) {
-		matchtype = true;
-		tmatch = LDMSD_PLUGIN_STORE;
-		plugname = NULL;
-	}
-	if (plugname && strcmp(plugname,"sampler") == 0) {
-		matchtype = true;
-		tmatch = LDMSD_PLUGIN_SAMPLER;
-		plugname = NULL;
-	}
-
-
-	const char *match1 = "/lib";
-	const char *match2 = ".so";
-	size_t patsz = strlen(path) + strlen(match1) + strlen(match2) + 2;
-	if (plugname) {
-		patsz += strlen(plugname);
-	}
-	char *pat = malloc(patsz);
-	if (!pat) {
-		fprintf(stderr, "%s: out of memory?!\n", APP);
-		rc = ENOMEM;
-		goto out;
-	}
-	snprintf(pat, patsz, "%s%s%s%s", path, match1,
-		(plugname ? plugname : "*"), match2);
-	int flags = GLOB_ERR |  GLOB_TILDE | GLOB_TILDE_CHECK;
-
-	int err = glob(pat, flags, NULL, &pglob);
-	switch(err) {
-	case 0:
-		break;
-	case GLOB_NOSPACE:
-		fprintf(stderr, "%s: out of memory!?\n", APP);
-		rc = ENOMEM;
-		break;
-	case GLOB_ABORTED:
-		fprintf(stderr, "%s: error reading %s\n", APP, path);
-		rc = 1;
-		break;
-	case GLOB_NOMATCH:
-		rc = 1;
-		break;
-	default:
-		fprintf(stderr, "%s: unexpected glob error for %s\n", APP, path);
-		rc = 1;
-		break;
-	}
-	if (err)
-		goto out2;
-
-	size_t i = 0;
-	if (pglob.gl_pathc > 0) {
-		printf("LDMSD plugins in %s : \n", path);
-	}
-	for ( ; i  < pglob.gl_pathc; i++) {
-		char * library_name = pglob.gl_pathv[i];
-		char *tmp = strdup(library_name);
-		if (!tmp) {
-			rc = ENOMEM;
-			goto out2;
-		} else {
-			char *b = basename(tmp);
-			int j = 0;
-			int blacklisted = 0;
-			while (blacklist[j]) {
-				if (strcmp(blacklist[j], b) == 0) {
-					blacklisted = 1;
-					break;
-				}
-				j++;
-			}
-			if (blacklisted)
-				goto next;
-			/* strip lib prefix and .so suffix*/
-			b+= 3;
-			char *suff = rindex(b, '.');
-			assert(suff != NULL || NULL == "plugin glob match means . will be found always");
-			*suff = '\0';
-			char err_str[LEN_ERRSTR];
-			if (ldmsd_load_plugin(b, err_str, LEN_ERRSTR)) {
-				fprintf(stderr, "Unable to load plugin %s: %s\n",
-					b, err_str);
-				goto next;
-			}
-			struct ldmsd_plugin_cfg *pi = ldmsd_get_plugin(b);
-			if (!pi) {
-				fprintf(stderr, "Unable to get plugin %s\n",
-					b);
-				goto next;
-			}
-			const char *ptype;
-			switch (pi->plugin->type) {
-			case LDMSD_PLUGIN_OTHER:
-				ptype = "OTHER";
-				break;
-			case LDMSD_PLUGIN_STORE:
-				ptype = "STORE";
-				break;
-			case LDMSD_PLUGIN_SAMPLER:
-				ptype = "SAMPLER";
-				break;
-			default:
-				ptype = "BAD plugin";
-				break;
-			}
-			if (matchtype && tmatch != pi->plugin->type)
-				goto next;
-			printf("======= %s %s:\n", ptype, b);
-			const char *u = pi->plugin->usage(pi->plugin);
-			printf("%s\n", u);
-			printf("=========================\n");
-			rc = ldmsd_term_plugin(b);
-			if (rc == ENOENT) {
-				fprintf(stderr, "plugin '%s' not found\n", b);
-			} else if (rc == EINVAL) {
-				fprintf(stderr, "The specified plugin '%s' has "
-					"active users and cannot be "
-					"terminated.\n", b);
-			} else if (rc) {
-				fprintf(stderr, "Failed to terminate "
-						"the plugin '%s'\n", b);
-			}
- next:
-			free(tmp);
-		}
-
-	}
-
-
- out2:
-	globfree(&pglob);
-	free(pat);
- out:
-	return rc;
 }

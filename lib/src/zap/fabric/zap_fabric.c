@@ -48,6 +48,7 @@
  */
 #define _GNU_SOURCE
 #include <sys/errno.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -120,7 +121,7 @@ static void dlog_(const char *func, int line, char *fmt, ...)
 	va_start(ap, fmt);
 	vasprintf(&buf, fmt, ap);
 	va_end(ap);
-	ovis_log(zflog, OVIS_LDEBUG, "[%d] %d.%09d: %s:%d | %s", tid, ts.tv_sec, ts.tv_nsec, func, line, buf);
+	ovis_log(zflog, OVIS_LDEBUG, "[%d] %ld.%09ld: %s:%d | %s", tid, ts.tv_sec, ts.tv_nsec, func, line, buf);
 	free(buf);
 }
 #endif
@@ -454,6 +455,8 @@ static void z_fi_destroy(zap_ep_t zep)
 	struct z_fi_ep *rep = (void*)zep;
 
 	DLOG("rep %p has %d ctxts\n", rep, rep->num_ctxts);
+
+	zap_io_thread_ep_remove(zep);
 
 	/* Do this first. */
 	while (!LIST_EMPTY(&rep->ep.map_list)) {
@@ -1100,7 +1103,7 @@ static zap_err_t submit_wr(struct z_fi_ep *rep, struct z_fi_context *ctxt, int i
 }
 
 static zap_err_t
-__post_send(struct z_fi_ep *rep, struct z_fi_buffer *rbuf, enum z_fi_op op)
+__post_send(struct z_fi_ep *rep, struct z_fi_buffer *rbuf, enum z_fi_op op, void *cb_arg)
 {
 	int rc;
 	struct z_fi_context *ctxt;
@@ -1108,7 +1111,7 @@ __post_send(struct z_fi_ep *rep, struct z_fi_buffer *rbuf, enum z_fi_op op)
 	DLOG("rep %p rbuf %p\n", rep, rbuf);
 
 	pthread_mutex_lock(&rep->ep.lock);
-	ctxt = __context_alloc(rep, NULL, op);
+	ctxt = __context_alloc(rep, cb_arg, op);
 	if (!ctxt) {
 		errno = ENOMEM;
 		pthread_mutex_unlock(&rep->ep.lock);
@@ -1161,7 +1164,7 @@ static zap_err_t z_fi_close(zap_ep_t ep)
 
 static zap_err_t z_fi_connect(zap_ep_t ep,
 				struct sockaddr *sin, socklen_t sa_len,
-				char *data, size_t data_len)
+				char *data, size_t data_len, int tpi)
 {
 	int rc;
 	zap_err_t zerr;
@@ -1202,7 +1205,7 @@ static zap_err_t z_fi_connect(zap_ep_t ep,
 		zerr = zap_errno2zerr(-rc);
 		goto err_2;
 	}
-	zerr = zap_io_thread_ep_assign(&rep->ep);
+	zerr = zap_io_thread_ep_assign(&rep->ep, tpi);
 	if (zerr)
 		goto err_2;
 
@@ -1496,7 +1499,7 @@ static void process_recv_wc(struct z_fi_ep *rep, struct fi_cq_err_entry *entry)
  out:
 	return;
  err_wrong_dsz:
-	LOG_(rep, "msg type %d has invalid data len %d\n", msg_type, rb->data_len);
+	LOG_(rep, "msg type %d has invalid data len %zd\n", msg_type, rb->data_len);
 	z_fi_close(&rep->ep);
 	return;
 }
@@ -1547,7 +1550,7 @@ static zap_err_t z_fi_reject(zap_ep_t ep, char *data, size_t data_len)
 }
 
 static zap_err_t z_fi_accept(zap_ep_t ep, zap_cb_fn_t cb,
-				char *data, size_t data_len)
+				char *data, size_t data_len, int tpi)
 {
 	int ret;
 	struct z_fi_ep *rep = (struct z_fi_ep *)ep;
@@ -1580,7 +1583,7 @@ static zap_err_t z_fi_accept(zap_ep_t ep, zap_cb_fn_t cb,
 		goto err_1;
 	}
 
-	ret = zap_io_thread_ep_assign(&rep->ep);
+	ret = zap_io_thread_ep_assign(&rep->ep, tpi);
 	if (ret)
 		goto err_1;
 
@@ -2192,7 +2195,7 @@ static zap_err_t z_fi_listen(zap_ep_t ep, struct sockaddr *saddr, socklen_t sa_l
 	if (rc)
 		goto err_1;
 
-	zerr = zap_io_thread_ep_assign(&rep->ep);
+	zerr = zap_io_thread_ep_assign(&rep->ep, -1);
 	if (zerr != ZAP_ERR_OK)
 		goto err_1;
 
@@ -2270,7 +2273,7 @@ static zap_err_t z_get_name(zap_ep_t ep, struct sockaddr *local_sa,
 	return ret;
 }
 
-static zap_err_t z_fi_send(zap_ep_t ep, char *buf, size_t len)
+static zap_err_t z_fi_send2(zap_ep_t ep, char *buf, size_t len, void *cb_arg)
 {
 	struct z_fi_ep *rep = (struct z_fi_ep *)ep;
 	struct z_fi_buffer *rbuf;
@@ -2299,7 +2302,7 @@ static zap_err_t z_fi_send(zap_ep_t ep, char *buf, size_t len)
 	memcpy((char *)rbuf->msg + sizeof(struct z_fi_message_hdr), buf, len);
 	rbuf->data_len = len + sizeof(struct z_fi_message_hdr);
 
-	rc = __post_send(rep, rbuf, Z_FI_WC_SEND);
+	rc = __post_send(rep, rbuf, Z_FI_WC_SEND, cb_arg);
 	if (rc)
 		__buffer_free(rbuf);
 
@@ -2308,6 +2311,11 @@ static zap_err_t z_fi_send(zap_ep_t ep, char *buf, size_t len)
 	pthread_mutex_unlock(&rep->ep.lock);
  out_2:
 	return rc;
+}
+
+static zap_err_t z_fi_send(zap_ep_t ep, char *buf, size_t len)
+{
+	return z_fi_send2(ep, buf, len, NULL);
 }
 
 static zap_err_t z_fi_send_mapped(zap_ep_t ep, zap_map_t map,
@@ -2411,7 +2419,7 @@ static zap_err_t z_fi_share(zap_ep_t ep, zap_map_t map,
 
 	rbuf->data_len = sz;
 
-	rc = __post_send(rep, rbuf, Z_FI_WC_SHARE);
+	rc = __post_send(rep, rbuf, Z_FI_WC_SHARE, NULL);
 	if (rc)
 		__buffer_free(rbuf);
 	return rc;
@@ -2552,6 +2560,8 @@ static void *z_fi_io_thread_proc(void *arg)
 	struct z_fi_ep *cq_reps[N_EV], *rep;
 	struct z_fi_ep *cm_reps[N_EV];
 	struct z_fi_epoll_ctxt *ctxt;
+
+	thr->zap_io_thread.stat->tid = syscall(SYS_gettid);
 
 	sigfillset(&sigset);
 	rc = pthread_sigmask(SIG_BLOCK, &sigset, NULL);
@@ -2784,6 +2794,7 @@ zap_err_t zap_transport_get(zap_t *pz, zap_mem_info_fn_t mem_info_fn)
 	z->listen = z_fi_listen;
 	z->close = z_fi_close;
 	z->send = z_fi_send;
+	z->send2 = z_fi_send2;
 	z->send_mapped = z_fi_send_mapped;
 	z->read = z_fi_read;
 	z->write = z_fi_write;

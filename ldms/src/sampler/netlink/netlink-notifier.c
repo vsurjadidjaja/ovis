@@ -794,7 +794,7 @@ static char *get_username(const uid_t uid, forkstat_t *ft)
 static void uid_name_info_free(forkstat_t *ft)
 {
 	size_t i;
-	if (!ft || !ft->uid_name_info)
+	if (!ft)
 		return;
 
 	int dummy = 0;
@@ -3309,7 +3309,7 @@ static jbuf_t make_process_end_data_slurm(forkstat_t *ft, const struct proc_info
 	int i, iend;
 	iend = sizeof(slurm_env_end_default)/sizeof(slurm_env_end_default[0]);
 	for (i = 0 ; i < iend; i++)
-		if (add_env_attr(&slurm_env_start_default[i], &jb, info, ft))
+		if (add_env_attr(&slurm_env_end_default[i], &jb, info, ft))
 			goto out_1;
 	jb = jbuf_append_str(jb,
 			"\"task_id\":" NULL_STEP_ID ","

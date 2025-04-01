@@ -34,6 +34,7 @@ SUBDIRS += lustre_client
 SUBDIRS += lustre_mdt
 SUBDIRS += lustre_ost
 SUBDIRS += lustre_mdc
+SUBDIRS += json
 
 if HAVE_DCGM
 SUBDIRS += dcgm_sampler
@@ -65,28 +66,8 @@ pkglib_LTLIBRARIES += libjobid.la
 endif
 
 if ENABLE_TSAMPLER
-libtsampler_la_SOURCES = tsampler.c tsampler.h
-libtsampler_la_LIBADD = $(COMMON_LIBADD) \
-			$(top_builddir)/lib/src/ovis_event/libovis_event.la -lpthread
-pkglib_LTLIBRARIES += libtsampler.la
-
-libtimer_base_la_SOURCES = timer_base.c timer_base.h
-libtimer_base_la_LIBADD = $(COMMON_LIBADD) libtsampler.la $(JOBID_LIBFLAGS)
-pkglib_LTLIBRARIES += libtimer_base.la
-
-libhfclock_la_SOURCES = hfclock.c
-libhfclock_la_LIBADD = $(COMMON_LIBADD) libtimer_base.la
-pkglib_LTLIBRARIES += libhfclock.la
-
-if ENABLE_CRAY_POWER_SAMPLER
-libcray_power_sampler_la_SOURCES = cray_power_sampler.c
-libcray_power_sampler_la_CFLAGS = $(AM_CFLAGS)
-libcray_power_sampler_la_LIBADD = $(COMMON_LIBADD) \
-			     libtimer_base.la
-pkglib_LTLIBRARIES += libcray_power_sampler.la
+SUBDIRS += tsampler
 endif
-
-endif #ENABLE_TSAMPLER
 
 if ENABLE_KGNILND
 SUBDIRS += kgnilnd
@@ -202,21 +183,13 @@ endif
 
 if HAVE_LIBPAPI
 SUBDIRS += papi
+
 if HAVE_LIBPFM
 SUBDIRS += syspapi
-
-libhweventpapi_la_SOURCES = hweventpapi.c
-libhweventpapi_la_CFLAGS = $(AM_CFLAGS)
-libhweventpapi_la_LDFLAGS = $(AM_LDFLAGS)
-libhweventpapi_la_LIBADD = $(COMMON_LIBADD) $(JOBID_LIBFLAGS) $(LTLIBPAPI) $(LTLIBPFM) -lm
-pkglib_LTLIBRARIES += libhweventpapi.la
-
-librapl_la_SOURCES = rapl.c
-librapl_la_CFLAGS = $(AM_CFLAGS)
-librapl_la_LDFLAGS = $(AM_LDFLAGS) $(PAPI_LDFLAGS)
-librapl_la_LIBADD = $(COMMON_LIBADD) $(LTLIBPAPI) $(LTLIBPFM) -lm
-pkglib_LTLIBRARIES += librapl.la
+SUBDIRS += rapl
+SUBDIRS += hweventpapi
 endif
+
 endif
 
 if ENABLE_PROCDISKSTATS
@@ -300,6 +273,12 @@ endif
 
 if ENABLE_BLOB_STREAM
 SUBDIRS += blob_stream
+endif
+
+if ENABLE_ZFS
+SUBDIRS += zfs_topvdevs
+SUBDIRS += zfs_leafvdevs
+SUBDIRS += zfs_zpool
 endif
 
 if ENABLE_SLINGSHOT

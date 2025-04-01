@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2019 National Technology & Engineering Solutions
+ * Copyright (c) 2019,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2019 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2019,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -69,9 +69,8 @@
 #include <sched.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldmsd_stream.h"
 
-static ldmsd_msg_log_f msglog;
+static ovis_log_t mylog;
 static char *stream;
 
 static const char *usage(struct ldmsd_plugin *self)
@@ -86,33 +85,31 @@ static const char *usage(struct ldmsd_plugin *self)
 		"                   Defaults to 'hello'\n";
 }
 
-static ldms_set_t get_set(struct ldmsd_sampler *self)
-{
-	return NULL;
-}
-
 static int sample(struct ldmsd_sampler *self)
 {
 	return 0;
 }
 
-static int hello_recv_cb(ldmsd_stream_client_t c, void *ctxt,
-			 ldmsd_stream_type_t stream_type,
-			 const char *msg, size_t msg_len,
-			 json_entity_t entity)
+static int hello_recv_cb(ldms_stream_event_t ev, void *arg)
 {
 	int rc = 0;
 	const char *type = "UNKNOWN";
-	switch (stream_type) {
-	case LDMSD_STREAM_JSON:
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
+	switch (ev->recv.type) {
+	case LDMS_STREAM_JSON:
 		type = "JSON";
 		break;
-	case LDMSD_STREAM_STRING:
+	case LDMS_STREAM_STRING:
 		type = "STRING";
 		break;
+	default:
+		/* unhandled type */
+		return 0;
 	}
-	msglog(LDMSD_LCRITICAL, "stream_type: %s, msg: \"%s\", msg_len: %d, entity: %p\n",
-	       type, msg, msg_len, entity);
+	ovis_log(mylog, OVIS_LCRITICAL, "stream_type: %s, msg: \"%s\", "
+					  "msg_len: %d, entity: %p\n",
+	       type, ev->recv.data, ev->recv.data_len, ev->recv.json);
 	return rc;
 }
 
@@ -128,7 +125,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl,
 	else
 		stream = strdup("hello_stream/hello");
 
-	ldmsd_stream_subscribe(stream, hello_recv_cb, self);
+	ldms_stream_subscribe(stream, 0, hello_recv_cb, self, "hello_sampler");
 
 	return rc;
 }
@@ -145,13 +142,19 @@ static struct ldmsd_sampler hello_sampler = {
 		.config = config,
 		.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler.hello_sampler",
+				"Message for the hello_sampler plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of 'hello_sampler' plugin. Error %d\n", rc);
+	}
 	return &hello_sampler.base;
 }
 

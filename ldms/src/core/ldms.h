@@ -58,6 +58,9 @@
 #include <asm/byteorder.h>
 #include <openssl/sha.h>
 #include <regex.h>
+#include <assert.h>
+#include <time.h>
+#include "zap/zap.h"
 #include "ovis-ldms-config.h"
 #include "ldms_core.h"
 #include "coll/rbt.h"
@@ -340,33 +343,31 @@ typedef struct ldms_record *ldms_record_t;
  * \li \b const\ char\ *name=ldms_record_metric_unit_get(rec_inst, i) returns
  *     the unit of the i_th member of the record.
  *
- * To use the record, first the application needs to create a record definition
- * (\c rec_def) with \c ldms_record_create() and add members into the record
- * definition with \c ldms_record_metric_add(). Then, the \c rec_def must be
- * added into the schema with \c ldms_schema_record_add() so that the record
- * definition is stored in the LDMS schema and will be available to the set
- * created with the schema.
+ * To use the record, first the application needs to create a record
+ * definition (\c rec_def) with \c ldms_record_create() and add
+ * members into the record definition with \c ldms_record_metric_add().
+ * Once all record members are added, the \c rec_def must be added to
+ * the schema with \c ldms_schema_record_add().
  *
- * The instances of the record is dynamically created and reside in the heap
- * memory of the set and the peer can reach it through \c list iteration.
- * \c ldms_record_heap_size_get() determines the size of the LDMS heap memory
- * required for a given record. To support the maximum of \c N records, simply
- * multiply the recrod size with \c N and supply it to
- * \c ldms_schema_metric_list_add() when defining a list of the records in the
- * schema so that the schema will know the size of the heap required.
+ * An instance of a record is dynamically created and resides in \c set-heap
+ * memory. \c ldms_record_heap_size_get() returns the size of the record in
+ * the LDMS heap. This is useful when computing the appropriate \c heap-size
+ * value for the \c ldms_set_new_with_heap() function.
  *
  * \c ldms_record_alloc() allocate a new record instance (\c rec_inst).
- * The \c rec_inst must be appended into the list by calling
- * \c ldms_list_append_record() or the peer won't be able to reach it.
- * \c ldms_record_metric_get() returns the metric value pointer that
- * can be used to directly access the metric in the record. The caller must
- * handle data format conversion. \c ldms_record_get_XXX() and
- * \c ldms_record_array_get_XXX() are convenient record metric getters that
- * handle the data format conversion for you. \c ldms_record_set_XXX() and
- * \c ldms_record_array_set_XXX() are the convenient record metric setters that
- * handle data conversion and data generation number increment. If the
- * application decides to manipulate the metric value directly, it must call
- * \c ldms_metric_modify() to increment the data generation number.
+ * A \c rec_inst must be a member of a list, \c ldms_list_append_record()
+ * or an ldms_record_array.
+ *
+ * \c ldms_record_metric_get() returns an ldms_mval_t that can be used
+ * to access the metric in the record. A set of convenience functions
+ * \c ldms_record_get_XXX() and \c ldms_record_array_get_XXX() will
+ * return values from records.
+ *
+ * \c ldms_record_set_XXX() and \c ldms_record_array_set_XXX() are a
+ * set of record metric setters that handle data conversion and data
+ * generation number increment. If the application decides to
+ * manipulate the metric value directly, it must call \c
+ * ldms_metric_modify() to increment the data generation number.
  *
  * Example:
  * \code
@@ -380,29 +381,28 @@ typedef struct ldms_record *ldms_record_t;
  * int i_name = ldms_record_metric_add(rec_def, "name", NULL, LDMS_V_CHAR_ARRAY, 32);
  * int i_ctrs = ldms_record_metric_add(rec_def, "counters", NULL, * LDMS_V_U64_ARRAY, 4);
  *
- * // calculate required heap size to support 16 devices (records)
+ * // Calculate the required heap size to support 16 devices (records)
  * size_t heap_sz = 16 * ldms_record_heap_size_get(rec_def);
  *
- * // create schema
+ * // Create a schema
  * ldms_schema_t schema = ldms_schema_new("my_schema");
  *
- * // add record definition to the schema
+ * // Add a record definition to the schema
  * int rec_def_idx = ldms_schema_record_add(schema, rec_def);
  *
- * // add a list to the schema with the heap_sz calculated from above.
- * // The list will contain the records (max 16 records).
+ * // Add a list to the schema with the heap_sz calculated above.
  * int lh_idx = ldms_schema_metric_list_add(schema, "my_list", NULL, heap_sz);
  *
  * ldms_set_t set = ldms_set_new("my_set", schema);
  *
  * ldms_mval_t new_record(ldms_set_t set, const char *name)
  * {
- *     // allocate new record
+ *     // Allocate a record
  *     ldms_mval_t rec_inst = ldms_record_alloc(set, rec_def_idx);
  *
  *     ldms_mval_t nm = ldms_record_metric_get(rec_inst, i_name);
- *     // set the name
- *     strncpy(nm.a_char, name, strlen(name)+1);
+ *     // Set the name
+ *     strncpy(nm.a_char, name, strlen(name) + 1);
  *     return rec_inst;
  * }
  *
@@ -428,7 +428,7 @@ typedef struct ldms_record *ldms_record_t;
  * ldms_list_append_record(set, lh, rec0);
  * ldms_list_append_record(set, lh, rec1);
  *
- * // iterating through the records in the list and update the counters
+ * // Iterate through the records in the list and update the record contents
  * enum ldms_value_type type;
  * size_t array_len;
  * ldms_mval_t rec;
@@ -495,10 +495,12 @@ int ldms_version_check(const struct ldms_version *v);
 /**
  * \brief Find a transport that matches the specified address.
  *
- * \param sin	Specifies the address that should match the remote peer's ip address.
+ * The function will only compare the address if the port is 65535.
+ *
+ * \param sa	Specifies the address that should match the remote peer's ip address.
  * \returns	The matching transport endpoint or NULL if no match was found.
  */
-ldms_t ldms_xprt_by_remote_sin(struct sockaddr_in *sin);
+ldms_t ldms_xprt_by_remote_sin(struct sockaddr *sa);
 
 /**
  * \brief Get the local and remote names of a transport
@@ -639,6 +641,29 @@ ldms_t ldms_xprt_new_with_auth(const char *xprt_name,
 			       struct attr_value_list *auth_av_list);
 
 /**
+ * Unlimited value for rail 'quota' and 'rate'.
+ */
+#define LDMS_UNLIMITED (-1)
+
+/**
+ * \brief Create a new LDMS Rail handle.
+ *
+ * \param xprt_name The transport type name string.
+ * \param n The number of endpoints in the rail.
+ * \param recv_quota Our recv buffer quota in bytes, -1 for unlimited.
+ * \param rate_limit Our transfer rate limit in bytes per second.
+ * \param auth_name The authentication plugin name (e.g. munge).
+ * \param auth_av_list The options for the authentication.
+ *
+ * \retval rail The rail handle, if there is no error.
+ * \retval NULL If there is an error. \c errno is set to describe the error.
+ */
+ldms_t ldms_xprt_rail_new(const char *xprt_name,
+			  int n, int64_t recv_quota, int64_t rate_limit,
+			  const char *auth_name,
+			  struct attr_value_list *auth_av_list);
+
+/**
  * \brief Set application's context
  *
  * LDMS calls the given function \c fn to free the context when the reference
@@ -703,12 +728,25 @@ enum ldms_xprt_event_type {
 	LDMS_XPRT_EVENT_SET_DELETE,
 	/*! A send request is completed */
 	LDMS_XPRT_EVENT_SEND_COMPLETE,
+	/*! The send quota is deposited.  */
+	LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED,
+	/*! Peer ask us for quota donation. */
+	LDMS_XPRT_EVENT_QGROUP_ASK,
+	/*! Peer donates quota to us. */
+	LDMS_XPRT_EVENT_QGROUP_DONATE,
+	/*! For donating back the unused donated quota. */
+	LDMS_XPRT_EVENT_QGROUP_DONATE_BACK,
 	LDMS_XPRT_EVENT_LAST
 };
 
 struct ldms_xprt_set_delete_data {
 	ldms_set_t set;		/*! The local set looked up at peer */
 	const char *name;	/*! The name of the set */
+};
+
+struct ldms_xprt_quota_event_data {
+	uint64_t quota; /* current quota */
+	int      ep_idx; /* the index of the endpoint in the rail */
 };
 
 typedef struct ldms_xprt_event {
@@ -724,6 +762,7 @@ typedef struct ldms_xprt_event {
 		 */
 		char *data;
 		struct ldms_xprt_set_delete_data set_delete;
+		struct ldms_xprt_quota_event_data quota;
 	};
 	size_t data_len;
 } *ldms_xprt_event_t;
@@ -838,6 +877,28 @@ extern int ldms_xprt_listen_by_name(ldms_t x, const char *host, const char *port
 		ldms_event_cb_t cb, void *cb_arg);
 
 /**
+ * \brief Set the event callback and the callback context
+ *
+ * This is useful when an application wants to change the callback function
+ * after it accepts a connection request.
+ *
+ * \param x   The transport handle
+ * \param cb  The callback function that receives an ldms event.
+ *            If it is NULL, all events, except LDMS_RECV_COMPLETE, will be handled by ldms.
+ * \param cb_arg An argument to be passed to \c cb when it is called.
+ */
+void ldms_xprt_event_cb_set(ldms_t x, ldms_event_cb_t cb, void *cb_arg);
+
+/**
+ * \brief Check if an LDMS transport endpoint is connected.
+ *
+ * \param x     The transport handle
+ *
+ * \retval      0 if the transport endpoint is connected. Otherwise, 1 is returned.
+ */
+extern int ldms_xprt_connected(ldms_t x);
+
+/**
  * \brief Get local and remote sockaddr from the xprt.
  *
  * \retval 0 If success.
@@ -847,6 +908,61 @@ int ldms_xprt_sockaddr(ldms_t x, struct sockaddr *local_sa,
 		       struct sockaddr *remote_sa,
 		       socklen_t *sa_len);
 
+/* currently only support IPv4 and IPv6 */
+struct ldms_addr {
+	sa_family_t sa_family; /* host-endian */
+	in_port_t   sin_port;  /* network-endian */
+	uint8_t     addr[16];  /* addr[0-3] for IPv4,
+				  addr[0-15] for IPv6 */
+};
+
+/**
+ * \brief Get local and remote address in \c ldms_addr struct from the xprt
+ *
+ * \param x   LDMS Transport pointer
+ * \param local_addr  Local address (re-entrant)
+ * \param remote_addr Remote address (re-entrant)
+ *
+ * \return 0 on success.
+ */
+int ldms_xprt_addr(ldms_t x, struct ldms_addr *local_addr,
+			    struct ldms_addr *remote_addr);
+
+/**
+ * \brief Get addresss string
+ *
+ * \param addr LDMS address
+ * \param buff String buffer to receive the address string
+ * \param sz   Size of \c buff
+ *
+ * \return \c buff on success; otherwise, NULL is returned.
+*/
+const char *ldms_addr_ntop(struct ldms_addr *addr, char *buff, size_t sz);
+
+
+/**
+ * \brief Convert a CIDR IP address string to \c ldms_addr
+ *
+ * The address is stored in \c addr, and the prefix length is stored in \c prefix_len.
+ *
+ * \param addr   ldms_addr pointer
+ * \param prefix_len   Integer pointer
+ *
+ * \retval 0 if success. Otherwise, an errno is returned.
+ */
+int ldms_cidr2addr(const char *cdir_str, struct ldms_addr *addr, int *prefix_len);
+
+/**
+ * \brief Verify if \c sa is in \net_addr with the prefix \c prefix_len
+ *
+ * \param ip_addr    IP Address
+ * \param net_addr   Network Address
+ * \param prefix_len Prefix length for masking
+ *
+ * \return 1 if the IP address is in the network address. Otherwise, 0 is returned.
+ */
+int ldms_addr_in_network_addr(struct ldms_addr *ip_addr,
+				struct ldms_addr *net_addr, int prefix_len);
 /**
  * \brief Close a connection to an LDMS host.
  *
@@ -877,6 +993,782 @@ extern int ldms_xprt_send(ldms_t x, char *msg_buf, size_t msg_len);
  * \retval sz The maximum message size.
  */
 size_t ldms_xprt_msg_max(ldms_t x);
+
+
+/**
+ * \brief Get the threads associated with the xprt.
+ *
+ * \param x   The transport handle.
+ * \param out The buffer array to store the results.
+ * \param n   The length of the buffer array \c out.
+ *
+ * \retval N  A positive integer indicating the number of elemnts in \c out that
+ *            has been written.
+ * \retval -EINVAL if \c n <= 0
+ * \retval -ENOMEM if the buffer is to small.
+ */
+int ldms_xprt_get_threads(ldms_t x, pthread_t *out, int n);
+
+/**
+ * \brief Return the main underlying zap endpoint associated with the xprt.
+ */
+zap_ep_t ldms_xprt_get_zap_ep(ldms_t x);
+
+/**
+ * \brief Check if \c x is a rail.
+ *
+ * \param x  The transport handle.
+ *
+ * \retval 1 If \c x is a rail.
+ * \retval 0 If \c x is not a rail.
+ */
+int ldms_xprt_is_rail(ldms_t x);
+
+/**
+ * \brief Check if the remote peer is also using a rail transport.
+ *
+ * \param x  The transport handle.
+ *
+ * \retval 1 If the remote peer of \c x is a rail.
+ * \retval 0 If the remote peer of \c x is not a rail.
+ */
+int ldms_xprt_is_remote_rail(ldms_t x);
+
+
+/**
+ * \brief Get the number of endpoints in the rail \c x.
+ *
+ * \param x The rail transport handle.
+ *
+ * \retval N       The number of endpoints in the rail.
+ * \retval -EINVAL If \c x is not a rail.
+ */
+int ldms_xprt_rail_eps(ldms_t x);
+
+/**
+ * \brief Get the receive quota of an endpoint
+ *
+ * \param x The transport handle
+ *
+ * \retval Receive limit is retunred.
+ * \retval -EINVAL if \c x is NULL or not a rail
+ */
+int64_t ldms_xprt_rail_recv_quota_get(ldms_t x);
+
+/**
+ * \brief Get the receive rate limit of an endpoint
+ *
+ * \param x The transport handle
+ *
+ * \retval Receive limit is retunred.
+ * \retval -EINVAL if \c x is NULL or not a rail
+ */
+int64_t ldms_xprt_rail_recv_rate_limit_get(ldms_t x);
+
+/**
+ * \brief Get the send rate limit of an endpoint (set by peer)
+ *
+ * \param x The transport handle
+ *
+ * \retval rate_limit The send rate limit.
+ * \retval -EINVAL If \c x is NULL or not a rail
+ */
+int64_t ldms_xprt_rail_send_rate_limit_get(ldms_t x);
+
+/**
+ * \brief Set (reconfig) the new rate limit
+ *
+ * \param rate The new rate
+ *
+ * \retval      0 If succeeded, or
+ * \retval -errno If failed.
+ */
+int ldms_xprt_rail_recv_rate_limit_set(ldms_t x, uint64_t rate);
+
+/**
+ * \brief Get the send quota
+ *
+ * \param[in]  x       The rail transport handle.
+ * \param[out] quota   The array to receive the send-quota for each endpoint in
+ *                     the rail.
+ * \param[in]  n       The size of \c quota array. Must be greater than the
+ *                     number of endpoints in the rail.
+ *
+ * \retval       0 If there is no error.
+ * \retval -EINVAL If \c x is not a rail.
+ * \retval -ENOMEM If \c n is less than the number of endpoints in the rail.
+ */
+int ldms_xprt_rail_send_quota_get(ldms_t x, uint64_t *quota, int n);
+
+/**
+ * Set a new recv quota value.
+ *
+ * This function notifies the peer of the new recv quota \c q so that the peer
+ * can adjust its send quota accordingly.
+ *
+ * \param x The rail transport handle.
+ * \param q The new recv quota value.
+ *
+ * \retval 0     If succeeded,
+ * \retval -errno If failed.
+ */
+int ldms_xprt_rail_recv_quota_set(ldms_t x, uint64_t q);
+
+/* A convenient sockaddr union for IPv4 and IPv6 (for now) */
+union ldms_sockaddr {
+	struct sockaddr     sa;
+	struct sockaddr_in  sin;
+	struct sockaddr_in6 sin6;
+	struct sockaddr_storage storage;
+};
+
+/**
+ * A utility to convert \c host, \c port/service to \c sockaddr.
+ *
+ * \c host could be:
+ * - "IP4_ADDR", e.g. "192.168.0.5"
+ * - "IP6_ADDR", e.g. "::1"
+ * - "HOSTNAME", e.g. "node05"
+ *
+ * \note It is recommended to supply \c sockaddr_storage structure for \c sa.
+ *
+ * \param         host   The host string.
+ * \param         port   The port or service string (see \c getaddrinfo(3)).
+ * \param[out]    sa     The sockaddr output buffer. It is recommended to
+ *                       supply \c sockaddr_storage structure for \c sa.
+ * \param[in,out] sa_len The length of the \c sa buffer. On return, \c sa_len
+ *                       is set to the length of the returned \c sa.
+ *
+ * \retval 0 If there is no error.
+ */
+int ldms_getsockaddr(const char *host, const char *port,
+		     struct sockaddr *sa, socklen_t *sa_len);
+
+/**
+ * Same as \c ldms_getsockaddr(), but only returns AF_INET4 family.
+ */
+int ldms_getsockaddr4(const char *host, const char *port,
+		      struct sockaddr *sa, socklen_t *sa_len);
+
+/**
+ * Same as \c ldms_getsockaddr(), but only returns AF_INET6 family.
+ */
+int ldms_getsockaddr6(const char *host, const char *port,
+		      struct sockaddr *sa, socklen_t *sa_len);
+
+/** \} */
+
+/**
+ * \addtogroup ldms_qgroup LDMS Quota Group (qgroup)
+ *
+ * LDMS Quota Group, or qgroup for short, is a feature in LDMS library that
+ * enables the control of the amount of the stream data going through the
+ * processes participating in the "group". \c qgroup mechanism leverages
+ * \c rail.recv_quota to limit the stream data. Hence, the endpoints in our
+ * process (a member of \c qgroup) has to be created with
+ * \c * ldms_xprt_rail_new() with \c recv_quota. When the peer publishes a
+ * stream data, it has to take quota from the said \c recv_quota. When our
+ * process done processing the stream data (all stream callbacks on the data
+ * have returned), the quota is issued back to the peer. This limits the amount
+ * of buffer in our process. With \c qgruop, before our process returns the
+ * quota, we first consults \c qgroup.quota. The returning quota has to be taken
+ * from \c qgroup.quota. If the \c qgroup.quota is not enough (less than the
+ * required returning quota), the returning quota is held off. If we hold off
+ * enough returning quota, the peer will run out of quota and cannot publish
+ * further stream data. \c qgroup.cfg.quota determines the initial amount of
+ * \c qgroup.quota. When \c qgroup.quota goes below \c qgroup.cfg.ask_mark, the
+ * qgroup mechanism asks members for quota donations (with
+ * \c qgroup.cfg.ask_amount) every \c qgroup.cfg.ask_usec interval. The donation
+ * also takes from \c qgroup.quota. Eventually, all \c qgroup.quota in all
+ * members will run out. The \c qgroup.quota gets reset back to
+ * \c qgroup.cfg.quota every \c qgroup.cfg.reset_usec interval. Roughly, the
+ * amount of data that goes through members of \c qgroup (including us) is:
+ *
+ *   \c N * \c qgroup.cfg.quota over \c qgroup.cfg.reset_usec time interval
+ *
+ * provided that all members use the same parameters.
+ *
+ *
+ * To use qgroup feature, we have to
+ * 1) set qgroup paramters of our process (\c ldms_qgroup_cfg_set()),
+ * 2) add member processes (\c ldms_qgroup_member_add()), and
+ * 3) start the qgroup feature (\c ldms_qgroup_start()).
+ *
+ * The member processes can use \c ldms_qgroup_cfg_set() to set the parameters
+ * at once, or use the following functions to set them individually:
+ * - \c ldms_qgroup_cfg_quota_set()
+ * - \c ldms_qgroup_cfg_ask_usec_set()
+ * - \c ldms_qgroup_cfg_ask_mark_set()
+ * - \c ldms_qgroup_cfg_ask_amount_set()
+ * - \c ldms_qgroup_cfg_reset_usec_set()
+ *
+ * After \c ldms_qgroup_start(), the process has to call \c ldms_qgroup_stop()
+ * before altering the member list or modifying \c qgroup.cfg.
+ *
+ * These functions and types manage and manipulate LDMS Quota Group.
+ * \{
+ */
+
+typedef enum ldms_qgroup_state_e {
+	LDMS_QGROUP_STATE_STOPPED = 0,
+	LDMS_QGROUP_STATE_STOPPING,
+	LDMS_QGROUP_STATE_STARTED,
+	LDMS_QGROUP_STATE_BUSY, /* qgroup is in execution routine */
+	LDMS_QGROUP_STATE_LAST,
+} ldms_qgroup_state_t;
+const char *ldms_qgroup_state_str(ldms_qgroup_state_t state);
+
+typedef enum ldms_qgroup_member_state_e {
+	LDMS_QGROUP_MEMBER_STATE_DISCONNECTED,
+	LDMS_QGROUP_MEMBER_STATE_CONNECTING,
+	LDMS_QGROUP_MEMBER_STATE_CONNECTED,
+	LDMS_QGROUP_MEMBER_STATE_LAST,
+} ldms_qgroup_member_state_t;
+
+typedef struct ldms_qgroup_s *ldms_qgroup_t;
+
+const char *ldms_qgroup_member_state_str(ldms_qgroup_member_state_t state);
+
+typedef struct ldms_qgroup_cfg_s *ldms_qgroup_cfg_t;
+struct ldms_qgroup_cfg_s {
+	uint64_t quota;
+	uint64_t ask_mark;
+	uint64_t ask_amount;
+	uint64_t ask_usec;
+	uint64_t reset_usec;
+};
+
+/**
+ * \brief Set the qgroup config with the provided \c cfg.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_set(ldms_qgroup_cfg_t cfg);
+
+/**
+ * \brief Retrieve the current qgroup config.
+ *
+ * \retval cfg The `ldms_qgroup_cfg_s` structure.
+ */
+struct ldms_qgroup_cfg_s ldms_qgroup_cfg_get();
+
+/**
+ * \brief Set the `cfg.quota` of the qgroup.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_quota_set(uint64_t quota);
+
+/**
+ * \brief Set the `cfg.ask_usec` of the qgroup.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_ask_usec_set(uint64_t usec);
+
+/**
+ * \brief Set the `cfg.reset_usec` of the qgroup.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_reset_usec_set(uint64_t usec);
+
+/**
+ * \brief Set the `cfg.ask_mark` of the qgroup.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_ask_mark_set(uint64_t ask_mark);
+
+/**
+ * \brief Set the `cfg.ask_amount` of the qgroup.
+ *
+ * \retval 0 Success
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ */
+int ldms_qgroup_cfg_ask_amount_set(uint64_t ask_amount);
+
+/**
+ * \brief Add a member into the qgroup.
+ *
+ * \param xprt_name The name of the xprt type (e.g. "sock").
+ * \param host The host of the member.
+ * \param port The port of the member. If \c port is \c NULL, "411" is supplied
+ *             as a default.
+ * \param auth_name The name of the authentication type (e.g. "munge"). The
+ *                  default is "none".
+ * \param auth_av_list The list attribute-value options for \c auth_name. The
+ *                     default is \c NULL.
+ *
+ *
+ * \retval 0 Success.
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ * \retval EINVAL Invalid argument (e.g.\c host being \c NULL).
+ * \retval ENAMETOOLONG A parameter value is too long (e.g. \c host is longer
+ *                      than 256 bytes).
+ * \retval EEXIST The peer "host:port" already exist in the member list.
+ * \retval ENOMEM Not enough memory.
+ */
+int ldms_qgroup_member_add(const char *xprt_name,
+			   const char *host, const char *port,
+			   const char *auth_name,
+			   struct attr_value_list *auth_av_list);
+
+/**
+ * \brief Remove a member from the qgroup.
+ *
+ * \param host The host of the member.
+ * \param port The port of the member. If \c port is \c NULL, "411" is supplied
+ *             as a default.
+ *
+ * \retval 0 Success.
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ * \retval ENOENT If the "host:port" member does not exist in the list.
+ */
+int ldms_qgroup_member_del(const char *host, const char *port);
+
+/**
+ * \brief Start the qgroup service.
+ *
+ * \retval 0 Success.
+ * \retval EBUSY If the `qgroup` is not in the STOPPED state.
+ * \retval EINVAL If the config is invalid (e.g. \c cfg.quota=0).
+ */
+int ldms_qgroup_start();
+
+/**
+ * \brief Stop the qgroup service.
+ */
+int ldms_qgroup_stop();
+
+/* probe the current quota value */
+uint64_t ldms_qgroup_quota_probe();
+
+typedef struct ldms_qgroup_member_info_s {
+	STAILQ_ENTRY(ldms_qgroup_member_info_s) entry;
+	ldms_qgroup_member_state_t state;
+	char   c_host[256]; /* see rfc1034 */
+	char   c_port[32];  /* port or service name */
+	char   c_xprt[32];  /* the transport type */
+	char   c_auth[32];  /* auth type */
+	struct attr_value_list *c_auth_av_list;
+} *ldms_qgroup_member_info_t;
+
+typedef struct ldms_qgroup_info_s {
+	ldms_qgroup_state_t state;
+	struct ldms_qgroup_cfg_s cfg;
+	uint64_t quota; /* the current quota */
+	STAILQ_HEAD(, ldms_qgroup_member_info_s) member_stq;
+} *ldms_qgroup_info_t;
+
+ldms_qgroup_info_t ldms_qgroup_info_get();
+void ldms_qgroup_info_free(ldms_qgroup_info_t qinfo);
+
+/** \} */ /* ldms_qgroup */
+
+/**
+ * \addtogroup ldms_stream LDMS Stream Functions
+ *
+ * These functions manage and manipulate LDMS Stream.
+ * \{
+ */
+
+typedef enum ldms_stream_type_e {
+	LDMS_STREAM_STRING,
+	LDMS_STREAM_JSON,
+	LDMS_STREAM_AVRO_SER,
+	LDMS_STREAM_LAST, /* the last enumureation; not a real type */
+} ldms_stream_type_t;
+
+/**
+ * \brief Stream Type Symbol.
+ *
+ * This function returns a constant string symbol (e.g. "LDMS_STREAM_STRING") of
+ * the given Stream type \c t. If the given type is out of valid range,
+ * "UNKNOWN" is returned.
+ *
+ * \param t The Stream type.
+ *
+ * \retval s The symbol (e.g. "LDMS_STREAM_STRING").
+ */
+const char *ldms_stream_type_sym(ldms_stream_type_t t);
+
+/**
+ * \brief Publish stream data.
+ *
+ * If \c x is \c NULL, publish to all subscribers. Otherwise, publish directly
+ * to the peer of \c x.
+ *
+ * \param x            NULL for loopback, or a valid rail handle.
+ * \param stream_name  The name of the stream.
+ * \param stream_type  The type of the stream (STRING or JSON).
+ * \param cred         The credential of the publisher. This can be \c NULL, and
+ *                       the \c euid and \c egid are used.
+ * \param perm         The permission on the stream data.
+ * \param data         The data to be published.
+ * \param data_len     The length of the data.
+ *
+ * \retval 0        If there is no error.
+ * \retval EAGAIN   If there is not enough send quota.
+ * \retval ENOSTR   If the the handle not valid for publishing a stream.
+ */
+int ldms_stream_publish(ldms_t x, const char *stream_name,
+                        ldms_stream_type_t stream_type,
+			ldms_cred_t cred,
+			uint32_t perm,
+                        const char *data, size_t data_len);
+
+/**
+ * Like \c ldms_stream_publsh(), but publish the content of a file.
+ *
+ * \param x            NULL for loopback, or a valid rail handle.
+ * \param stream_name  The name of the stream.
+ * \param stream_type  The type of the stream (STRING or JSON).
+ * \param cred         The credential of the publisher. This can be \c NULL, and
+ *                       the \c euid and \c egid are used.
+ * \param perm         The permission on the stream data.
+ * \param file         The FILE handle.
+ *
+ * \retval 0        If there is no error.
+ * \retval EAGAIN   If there is not enough send quota.
+ * \retval ENOSTR   If the the handle not valid for publishing a stream.
+ */
+int ldms_stream_publish_file(ldms_t x, const char *stream_name,
+                        ldms_stream_type_t stream_type,
+			ldms_cred_t cred,
+			uint32_t perm,
+			FILE *file);
+
+typedef struct ldms_stream_client_s *ldms_stream_client_t;
+typedef struct json_entity_s *json_entity_t;
+
+enum ldms_stream_event_type {
+	LDMS_STREAM_EVENT_RECV, /* stream data received */
+	LDMS_STREAM_EVENT_SUBSCRIBE_STATUS, /* reporting subscription status */
+	LDMS_STREAM_EVENT_UNSUBSCRIBE_STATUS, /* reporting unsubscription status */
+	LDMS_STREAM_EVENT_CLOSE, /* reporting stream client close event.
+				  * This is the last event to deliver from a
+				  * client. */
+
+	LDMS_STREAM_EVENT_LAST, /* The last enumeration; not a real event */
+};
+
+/**
+ * \brief String symbol of event type \c t for printing.
+ *
+ * \retval s The string symbol of the given event type (e.g. "LDMS_STREAM_EVENT_RECV").
+ * \retval "UNKNOWn" If the event type \c t is out of range.
+ */
+const char *ldms_stream_event_type_sym(enum ldms_stream_event_type t);
+
+/* For stream data delivery to the application */
+struct ldms_stream_recv_data_s {
+	ldms_stream_client_t client;
+	struct ldms_addr src;
+	uint64_t msg_gn;
+	ldms_stream_type_t type;
+	uint32_t name_len;
+	uint32_t data_len;
+	const char *name; /* stream name */
+	const char *data; /* stream data */
+	json_entity_t json; /* json entity */
+	struct ldms_cred cred; /* credential */
+	uint32_t perm; /* permission */
+	uint32_t name_hash; /* stream name hash */
+};
+
+/* To report subscrube / unsubscribe return status */
+struct ldms_stream_return_status_s {
+	const char *match; /* name or regex */
+	int is_regex;
+	int status;
+};
+
+/* For stream close event */
+struct ldms_stream_close_event_s {
+	ldms_stream_client_t client;
+};
+
+typedef struct ldms_stream_event_s {
+	ldms_t r; /* rail */
+	enum ldms_stream_event_type type;
+	struct timespec recv_ts;
+	uint32_t hop_num;
+	union {
+		struct ldms_stream_recv_data_s recv;
+		struct ldms_stream_return_status_s status;
+		struct ldms_stream_close_event_s close;
+	};
+} *ldms_stream_event_t;
+
+typedef int (*ldms_stream_event_cb_t)(ldms_stream_event_t ev, void *cb_arg);
+
+/**
+ * \brief Subscribe to a stream.
+ *
+ * Subscribe to the matching streams that go through our process. The callback
+ * function is called when a matching stream data reaches our process. The
+ * `cb_fn` must not be NULL.
+ *
+ * \param stream   The stream name or regular expression.
+ * \param is_regex 1 if `stream` is a regular expression. Otherwise, 0.
+ * \param cb_fn    The callback function for stream data delivery.
+ * \param cb_arg   The application context to the `cb_fn`.
+ * \param desc     An optional short description of the client of this subscription.
+ *                 This could be useful for client stats.
+ *
+ * \retval NULL  If there is an error. In this case `errno` is set to describe
+ *               the error.
+ * \retval ptr   The stream client handle.
+ */
+ldms_stream_client_t
+ldms_stream_subscribe(const char *stream, int is_regex,
+		      ldms_stream_event_cb_t cb_fn, void *cb_arg,
+		      const char *desc);
+
+/**
+ * \brief Terminate the stream client.
+ *
+ * If the client `c` is a remote subscriber, an "unsubscribe" request will also
+ * be sent to the remote peer.
+ *
+ * \param c  The subscription handle.
+ */
+void ldms_stream_close(ldms_stream_client_t c);
+
+/**
+ * \brief Request a remote stream subscritpion.
+ *
+ * This function send a remote stream subscription request to the remote peer.
+ * The callback function, if not \c NULL, is called to notify the application
+ * whether or not the remote stream subscription is a success. After a
+ * successful subscription, the remote peer will send the matching stream data
+ * to our process. Please note that the application still need a stream client
+ * (from \c ldms_stream_subscribe()) to process the data.
+ *
+ * \param x        The rail handle.
+ * \param stream   The stream name or regular expression.
+ * \param is_regex 1 if `stream` is a regular expression. Otherwise, 0.
+ * \param cb_fn    The callback function for return status notification (could
+ *                 be \c NULL).
+ * \param cb_arg   The application context to the `cb_fn`.
+ * \param rate     The rate limit (bytes/sec). Use `LDMS_UNLIMITED` for
+ *                 unlimited.
+ *
+ * \retval 0     If succeeded.
+ * \retval errno If synchronously failed.
+ */
+int ldms_stream_remote_subscribe(ldms_t x, const char *stream, int is_regex,
+		      ldms_stream_event_cb_t cb_fn, void *cb_arg, int64_t rate);
+
+/**
+ * \brief Request a remote stream unsubscription.
+ *
+ * This function unsubscribe the previous subscription. The subscription
+ * parameters (\c stream and \c is_regex) must be the same as the previously
+ * given at the subscription time. The \c cb_fn is called to let the application
+ * know about the unsubscription status.
+ */
+int ldms_stream_remote_unsubscribe(ldms_t x, const char *stream, int is_regex,
+		      ldms_stream_event_cb_t cb_fn, void *cb_arg);
+
+
+struct ldms_stream_counters_s {
+	struct timespec first_ts; /* Timestamp of the first message */
+	struct timespec last_ts;  /* Timestamp of the last message  */
+	uint64_t        count;    /* The number of messages         */
+	size_t          bytes;    /* Total bytes of messages        */
+};
+
+#define LDMS_STREAM_COUNTERS_INITIALIZER ((struct ldms_stream_counters_s){{INT64_MAX, 999999999}, {0, 0}, 0, 0})
+#define LDMS_STREAM_COUNTERS_INIT(p) do { \
+			*(p) = LDMS_STREAM_COUNTERS_INITIALIZER; \
+		} while (0)
+
+struct ldms_stream_hop {
+	struct timespec recv_ts;
+	struct timespec send_ts;
+};
+
+#define STREAM_MAX_PROFILE_HOPS 8
+struct ldms_stream_profile {
+	uint32_t hop_cnt;
+	struct ldms_stream_hop hops[OVIS_FLEX];
+};
+struct ldms_stream_profile_ent {
+	TAILQ_ENTRY(ldms_stream_profile_ent) ent;
+	struct ldms_stream_profile profiles;
+};
+TAILQ_HEAD(ldms_stream_profile_list, ldms_stream_profile_ent);
+
+/* stream statistics by src */
+struct ldms_stream_src_stats_s {
+	struct rbn rbn; /* key ==> src */
+	struct ldms_addr src;
+	struct ldms_stream_counters_s rx; /* total rx from src */
+	struct ldms_stream_profile_list profiles;
+};
+
+/* stats of stream-client pair */
+struct ldms_stream_client_pair_stats_s {
+	TAILQ_ENTRY(ldms_stream_client_pair_stats_s) entry;
+
+	const char *stream_name; /* allocated with the structure, don't free */
+	const char *client_match; /* allocated with the structure, don't free */
+	const char *client_desc; /* allocated with the structure, don't free */
+	int is_regex; /* client is a regular expression */
+
+	/* client transmission counters for the stream */
+	struct ldms_stream_counters_s tx;
+	/* client drop counters for the stream */
+	struct ldms_stream_counters_s drops;
+};
+TAILQ_HEAD(ldms_stream_client_pair_stats_tq_s, ldms_stream_client_pair_stats_s);
+
+/* stats of a stream */
+struct ldms_stream_stats_s {
+	TAILQ_ENTRY(ldms_stream_stats_s) entry;
+	struct ldms_stream_counters_s rx; /* total rx regardless of src */
+	struct rbt src_stats_rbt; /* tree of statistics by src; the nodes are `struct ldms_stream_src_stats_s` */
+
+	struct ldms_stream_client_pair_stats_tq_s pair_tq; /* stats by client */
+	const char *name; /* allocated with the structure, don't free it */
+};
+TAILQ_HEAD(ldms_stream_stats_tq_s, ldms_stream_stats_s);
+
+/* stats of a stream client */
+struct ldms_stream_client_stats_s {
+	TAILQ_ENTRY(ldms_stream_client_stats_s) entry;
+	struct ldms_stream_counters_s tx;
+	struct ldms_stream_counters_s drops;
+	struct ldms_stream_client_pair_stats_tq_s pair_tq; /* stats by stream */
+	struct ldms_addr dest;
+	int is_regex;
+	const char *match; /* the matching string; allocated with the structure */
+	const char *desc; /* the short description; allocated with the structure */
+};
+TAILQ_HEAD(ldms_stream_client_stats_tq_s, ldms_stream_client_stats_s);
+
+/**
+ * Set the stream statistics collection level.
+ *
+ * When `ldms_init()` is called, the `LDMS_STATS_LEVEL` environment variable is
+ * read and \c ldms_stream_stats_level_set()` is called accordingly. If
+ * `LDMS_STATS_LEVEL` is not defined, the default level is 1.
+ *
+ * Levels:
+ * - 0: disabled; no stats collection.
+ * - 1: shallow collection; only collect "cumulative" stats.
+ * - 2: deep collection; collects stream stats by `src`, also collects
+ *      delivery stats by client for the stream. For each client stat, this also
+ *      collects the client rx stats by stream name.
+ *
+ * \param level The level of stats collection.
+ *
+ * \retval 0     If there is no error, or
+ * \retval errno describing an error.
+ */
+int ldms_stream_stats_level_set(int level);
+
+/**
+ * Obtain the current stream stats level.
+ */
+int ldms_stream_stats_level_get();
+
+/**
+ * \brief Get the statuses/statistics of the matching streams in this process.
+ *
+ * \param match    The stream name or a regular expression.
+ * \param is_regex 1 if \c match is a regular expression; otherwise, 0.
+ * \param is_reset 1 means to reset the streams' statistics
+ *
+ * \retval tq   The collection (tailq) of statistics of the matching entries, or
+ * \retval NULL if there is an error. \c errno is also set to describe the error.
+ *
+ * \note The caller is responsible for freeing the \c rbt and the entries in it.
+ *       \c ldms_stream_stats_tq_free() is a helping function for this.
+ */
+struct ldms_stream_stats_tq_s *
+ldms_stream_stats_tq_get(const char *match, int is_regex, int is_reset);
+
+/**
+ * \brief Free all of the entries in the given \c tq and the \c tq itself.
+ *
+ * \note \c tq must be the one returned from \c ldms_stream_stats_tq_get().
+ */
+void ldms_stream_stats_tq_free(struct ldms_stream_stats_tq_s *tq);
+
+/**
+ * Returns the JSON-formatted text of the stream stats in \c tq.
+ *
+ * \remarks The caller is responsible for freeing the returned string.
+ */
+char *ldms_stream_stats_tq_to_str(struct ldms_stream_stats_tq_s *tq);
+
+/**
+ * \brief Returns a JSON-formatted text describing statuses/statistics of the matching streams in this process.
+ *
+ * \param  match    The stream name or a regular expression.
+ * \param  is_regex 1 if \c match is a regular expression; otherwise, 0.
+ * \param  is_reset 0 means not to reset the statistics.
+ *                  A non-zero value means to reset the statistics.
+ *
+ * \retval str The string describing the stats.
+ *
+ * \note The caller is responsible for freeing the returned string.
+ */
+char *ldms_stream_stats_str(const char *match, int is_regex, int is_reset);
+
+/**
+ * Returns a collection of stats of stream clients.
+ *
+ * \param is_reset   A non-zero value means to reset the statistics
+ */
+struct ldms_stream_client_stats_tq_s *ldms_stream_client_stats_tq_get(int is_reset);
+
+/**
+ * Free the stats entries in the \c tq and the \c tq itself.
+ */
+void ldms_stream_client_stats_tq_free(struct ldms_stream_client_stats_tq_s *tq);
+
+/**
+ * Get stats from a client.
+ *
+ * \param is_reset    A non-zero value means to reset the statistics
+ */
+struct ldms_stream_client_stats_s *
+ldms_stream_client_get_stats(ldms_stream_client_t cli, int is_reset);
+
+/**
+ * Free the stream client stats obtained form \c ldms_stream_client_get_stats().
+ */
+void ldms_stream_client_stats_free(struct ldms_stream_client_stats_s *cs);
+
+/**
+ * Returns the JSON-formatted text of the stream client stats in \c tq.
+ *
+ * \remarks The caller is responsible for freeing the returned string.
+ */
+char *ldms_stream_client_stats_tq_to_str(struct ldms_stream_client_stats_tq_s *tq);
+
+/**
+ * \brief Return a string describing statuses/statistics of stream clients in this process.
+ * \retval str The string describing the stats.
+ * \note The caller is responsible for freeing the returned string.
+ *
+ * \param is_reset non-zero means to reset the statistics
+ */
+char *ldms_stream_client_stats_str(int is_reset);
+
+/**
+ * \brief Reset the statistics of streams and their clients
+ */
+void ldms_stream_n_client_stats_reset();
 
 /** \} */
 
@@ -1216,8 +2108,93 @@ typedef enum ldms_xprt_ops_e {
 	LDMS_XPRT_OP_DIR_REP,
 	LDMS_XPRT_OP_SEND,
 	LDMS_XPRT_OP_RECV,
+	LDMS_XPRT_OP_STREAM_PUBLISH,
+	LDMS_XPRT_OP_STREAM_SUBSCRIBE,
+	LDMS_XPRT_OP_STREAM_UNSUBSCRIBE,
 	LDMS_XPRT_OP_COUNT
 } ldms_xprt_ops_t;
+
+struct  ldms_op_ctxt {
+	enum ldms_xprt_ops_e op_type;
+	union {
+		struct lookup_profile_s {
+			struct timespec app_req_ts;
+			struct timespec req_send_ts;
+			struct timespec req_recv_ts;
+			struct timespec share_ts;
+			struct timespec rendzv_ts;
+			struct timespec read_ts;
+			struct timespec complete_ts;
+			struct timespec deliver_ts;
+		} lookup_profile;
+		struct update_profile {
+			struct timespec app_req_ts;
+			struct timespec read_ts;
+			struct timespec read_complete_ts;
+			struct timespec deliver_ts;
+		} update_profile;
+		struct set_delete_profile_s {
+			struct timespec send_ts;
+			struct timespec recv_ts;
+			struct timespec ack_ts;
+		} set_del_profile;
+		struct send_profile_s {
+			struct timespec app_req_ts;
+			struct timespec send_ts;
+			struct timespec complete_ts;
+			struct timespec deliver_ts;
+		} send_profile;
+		struct strm_publish_profile_s {
+			uint32_t hop_num;
+			struct timespec recv_ts;
+			struct timespec send_ts; /*  to remote client */
+		} stream_pub_profile;
+	};
+	TAILQ_ENTRY(ldms_op_ctxt) ent;
+};
+TAILQ_HEAD(ldms_op_ctxt_list, ldms_op_ctxt);
+
+#define PROFILING_CFG_DISABLED    0
+#define PROFILING_CFG_ENABLED     1
+#define PROFILING_CFG_UNSUPPORTED 2
+
+/**
+ * Enable/disable LDMS operations' profiling
+ *
+ * If profiling is enabled, LDMS collects the following timestamps:
+ *   for LOOKUP: when ldms_xprt_lookup() is called,
+ *               when LDMS sends the lookup request to the peer,
+ *               when the peer receives the lookup request,
+ *               when the peer shares the set memory,
+ *               when LDMS receives the shared memory,
+ *               when LDMS reads the memory,
+ *               when LDMS receives the read completion,
+ *               and when LDMS delivers the lookup data to the application
+ *   for UPDATE: when ldms_xprt_update() is called,
+ *               when LDMS reads the set data,
+ *               when LDMS receives the updated set data,
+ *               when LDMS delivers the update completion to the application
+ *   for SEND:   when ldms_xprt_send() is called,
+ *               when LDMS sends the data to the peer,
+ *               when LDMS receives the send completion event,
+ *               when LDMS delivers the send completion to the application
+ *   for STREAM_PUBLISH: when ldms_stream_publish() is called,
+ *                       when LDMS publishes the stream data,
+ *                       when LDMS delivers the stream data to clients
+ *                       NOTE: LDMS collects the timestamps at each hop where stream data gets forwarded
+ *
+ * \param ops_cnt  Number of operations in \c ops.
+ *                 -1 to enable/disable profiling of all operations
+ * \param ops      Array of operations to enable their profiling
+ * \param ops_err  Array to store an error of each given operation
+ *
+ * \return 0 on success; Otherwise, -1 is given.
+ *         In this case, an error code will be assigned in the \c ops_err
+ *            ENOSYS if the operation does not support profiling;
+ *            EINVAL if the given operation does not exist.
+ */
+int ldms_profiling_enable(int ops_cnt, enum ldms_xprt_ops_e *ops, int *ops_err);
+int ldms_profiling_disable(int ops_cnt, enum ldms_xprt_ops_e *ops, int *ops_err);
 
 extern const char *ldms_xprt_op_names[];
 
@@ -1229,6 +2206,87 @@ struct ldms_xprt_rate_data {
 	double auth_fail_rate_s;
 	double duration;
 };
+
+enum ldms_thrstat_op_e {
+	LDMS_THRSTAT_OP_OTHER, /* Ignore these operations, e.g., notify */
+	LDMS_THRSTAT_OP_CONNECT_SETUP,
+	LDMS_THRSTAT_OP_DIR_REQ,
+	LDMS_THRSTAT_OP_DIR_REPLY,
+	LDMS_THRSTAT_OP_LOOKUP_REQ,
+	LDMS_THRSTAT_OP_LOOKUP_REPLY,
+	LDMS_THRSTAT_OP_UPDATE_REQ,
+	LDMS_THRSTAT_OP_UPDATE_REPLY,
+	LDMS_THRSTAT_OP_STREAM_MSG,
+	LDMS_THRSTAT_OP_STREAM_CLIENT,
+	LDMS_THRSTAT_OP_PUSH_REQ,
+	LDMS_THRSTAT_OP_PUSH_REPLY,
+	LDMS_THRSTAT_OP_SET_DELETE_REQ,
+	LDMS_THRSTAT_OP_SET_DELETE_REPLY,
+	LDMS_THRSTAT_OP_SEND_MSG,
+	LDMS_THRSTAT_OP_RECV_MSG,
+	LDMS_THRSTAT_OP_AUTH,
+	LDMS_THRSTAT_OP_DISCONNECTED,
+	LDMS_THRSTAT_OP_COUNT
+};
+
+/*
+ * TODO: Revise the comment to explain the intended use of the thr stats structure
+ *
+ * ldms_xprt ensures that the thread statistics reported account for
+ * the time from ldms_xprt receiving an event from Zap until it returns
+ * its Zap callback. The time duration includes the time in its
+ * application callback. Applications are responsible for keeping
+ * track of the time usages by its operations. It may cache the data
+ * in \c app_stats field.
+ */
+
+struct ldms_thrstat_entry {
+	uint64_t total; /* Operation's Aggregated time in micro-seconds */
+	int count;
+};
+
+struct ldms_thrstat {
+	struct timespec last_op_start;
+	struct timespec last_op_end;
+	enum ldms_thrstat_op_e last_op;
+	struct ldms_thrstat_entry ops[LDMS_THRSTAT_OP_COUNT];
+};
+
+struct ldms_thrstat_result_entry {
+	struct zap_thrstat_result_entry *zap_res;
+	uint64_t idle;
+	uint64_t zap_time;
+	uint64_t ops[LDMS_THRSTAT_OP_COUNT];
+	void *app_ctxt;
+};
+
+struct ldms_thrstat_result {
+	int count;
+	struct zap_thrstat_result *_zres;
+	struct ldms_thrstat_result_entry entries[0];
+};
+
+/**
+ * \brief Convert \c enum ldms_thrstat_op_e to a string
+ *
+ * \return A string of the operation name
+ */
+char *ldms_thrstat_op_str(enum ldms_thrstat_op_e e);
+
+/**
+ * \brief Return thread usage information
+ *
+ * Return an ldms_thrstat_result structure or NULL on memory allocation failure.
+ * This result must be freed with the ldms_thrstat_free_result() function.
+ *
+ * \return A pointer to an ldms_thrstat_result structure
+ */
+struct ldms_thrstat_result *ldms_thrstat_result_get();
+
+/**
+ * \brief Free an ldms_thrstat_result returned by \c ldms_thrstat_result_get
+ */
+void ldms_thrstat_result_free(struct ldms_thrstat_result *res);
 
 /**
  * Query daemon telemetry data across transports
@@ -1245,15 +2303,25 @@ typedef struct ldms_xprt_stats {
 	struct timespec disconnected;
 	struct timespec last_op;
 	struct ldms_stats_entry ops[LDMS_XPRT_OP_COUNT];
+	struct ldms_op_ctxt_list op_ctxt_lists[LDMS_XPRT_OP_COUNT];
 } *ldms_xprt_stats_t;
+
+#define LDMS_PERF_M_STATS 1
+#define LDMS_PERF_M_PROFILNG 2
+#define LDMS_PERF_M_ALL LDMS_PERF_M_STATS | LDMS_PERF_M_PROFILNG
 
 /**
  * \brief Retrieve transport request statistics
  *
+ * The function gets the statistics and then reset it if \c reset is not 0.
+ * To only reset the statistics, \c stats must be NULL.
+ *
  * \param x The transport handle
- * \param s Pointer to an ldms_xprt_stats structure
+ * \param stats Pointer to an ldms_xprt_stats structure
+ * \param reset Reset the statistics after getting the statistics if not 0
+ *
  */
-extern void ldms_xprt_stats(ldms_t x, ldms_xprt_stats_t stats);
+extern void ldms_xprt_stats(ldms_t x, ldms_xprt_stats_t stats, int mask, int reset);
 
 /*
  * Metric template for:
@@ -1299,7 +2367,15 @@ ldms_schema_t ldms_schema_from_template(const char *name,
 			struct ldms_metric_template_s tmp[],
 			int mid[]);
 
- /**
+/**
+ * \brief Return the schema name
+ *
+ * \param schema The schema handle
+ * \returns The schema name
+ */
+const char *ldms_schema_name_get(ldms_schema_t schema);
+
+/**
  * \brief Write a JSON representation of the schema to a file
  *
  * \param schema The schema handle
@@ -1327,6 +2403,45 @@ extern void ldms_schema_delete(ldms_schema_t schema);
  * \returns The number of metrics in the schema
  */
 extern int ldms_schema_metric_count_get(ldms_schema_t schema);
+
+/**
+ * \brief Populate \c out with information of metric \c mid in \c schema.
+ *
+ * Please note that the pointer members in \c out (e.g. \c out->name) point to
+ * memory that is owned by \c schema. So, please do *NOT* modify or free the
+ * members of \c out. The \c out itself can be freed.
+ *
+ * \param [in]  schema The schema handle.
+ * \param [in]  mid    The metric ID.
+ * \param [out] out    The metric template structure output.
+ *
+ * \retval 0      If succeeded, or
+ * \retval ENOENT if \c mid does not exist.
+ */
+extern int ldms_schema_metric_template_get(ldms_schema_t schema, int mid,
+				struct ldms_metric_template_s *out);
+
+/**
+ * \brief Like \c ldms_schema_metric_template_get(), but in bulk.
+ *
+ * This function copies metric template information from \c schema into \c out
+ * template array up to \c len metrics. The pointers in the template structure
+ * are owned by \c schema, please do not modify or free them. The \c out array,
+ * however, can be freed. Similar to \c snprintf(), this function returns a
+ * number less than or equal to \c len if succeeded, or a number greater than
+ * \c len to indicate the required array length. In the latter case, the
+ * template array \c out contains \c len metric templates.
+ *
+ * \param [in]  schema The schema handle.
+ * \param [in]  len    The length of the \c out array buffer.
+ * \param [out] out    The output template array.
+ *
+ * \retval N<=len If succeeded, or
+ * \retval N>len  if the output array is not long enough
+ *
+ */
+extern int ldms_schema_bulk_template_get(ldms_schema_t schema, int len,
+				struct ldms_metric_template_s out[]);
 
 /**
  * \brief Set the cardinality of the set array created by this schema.
@@ -1381,6 +2496,18 @@ int ldms_record_metric_add(ldms_record_t rec_def, const char *name,
 			   const char *unit, enum ldms_value_type type,
 			   size_t array_len);
 
+/**
+ * Get the number of metrics in record definition \c rec_def.
+ *
+ * \note \c ldms_record_card() does the same thing on \c mavl (\c record_inst or
+ * \c record_type) from an LDMS set.
+ *
+ * \param rec_def  The record definition handle (from \c ldms_record_alloc()).
+ *
+ * \retval N The number of metrics in the record.
+ */
+int ldms_record_metric_card(ldms_record_t rec_def);
+
 
 /**
  * Create a record type definition from the record template entries.
@@ -1423,27 +2550,66 @@ int ldms_record_metric_add_template(ldms_record_t rec_def,
 			struct ldms_metric_template_s tmp[], int mid[]);
 
 /**
- * Get the size (bytes) required in the heap for a record instance.
+ * \brief Return the heap memory required by a record type
  *
- * This function is useful for estimating the minimum heap size required to a
- * record instance of the given record type definition. To determine the minimum
- * heap size supporting \c N record instances, simply multiply the returned
- * number with \c N.
+ * This function returns the heap size required by an instance of a
+ * record type.
  *
  * \param rec_def  The handle returned by \c ldms_record_create().
  *
- * \retval bytes The size of the record instance in the heap.
+ * \retval bytes The size of the record type in the heap.
  */
 size_t ldms_record_heap_size_get(ldms_record_t rec_def);
 
 /**
- * Get the size (bytes) of the heap memory storing the record metric values.
+ * \brief Get the size (bytes) of the heap memory storing the record metric values.
  *
  * \param rec_def  The handle returned by \c ldms_record_create().
  *
  * \retval bytes The size of the heap memory
  */
 size_t ldms_record_value_size_get(ldms_record_t rec_def);
+
+/**
+ * \brief Populate \c out with information of metric \c mid in \c record.
+ *
+ * Please note that the pointer members in \c out (e.g. \c out->name) point to
+ * memory that is owned by \c record. So, please do *NOT* modify or free the
+ * members of \c out. The \c out itself can be freed.
+ *
+ * \param [in]  record The record handle.
+ * \param [in]  mid    The metric ID.
+ * \param [out] out    The metric template structure output.
+ *
+ * \retval 0      If succeeded, or
+ * \retval ENOENT if \c mid does not exist.
+ */
+extern int ldms_record_metric_template_get(ldms_record_t record, int mid,
+				struct ldms_metric_template_s *out);
+
+/**
+ * \brief Like \c ldms_record_metric_template_get(), but in bulk.
+ *
+ * This function copies metric template information from \c record into \c out
+ * template array up to \c len metrics. The pointers in the template structure
+ * are owned by \c record, please do not modify or free them. The \c out array,
+ * however, can be freed. Similar to \c snprintf(), this function returns a
+ * number less than or equal to \c len if succeeded, or a number greater than
+ * \c len to indicate the required array length. In the latter case, the
+ * template array \c out contains \c len metric templates.
+ *
+ * \param [in]  record The record handle.
+ * \param [in]  len    The length of the \c out array buffer.
+ * \param [out] out    The output template array.
+ *
+ * \retval N<=len If succeeded, or
+ * \retval N>len  if the output array is not long enough
+ *
+ */
+extern int ldms_record_bulk_template_get(ldms_record_t record, int len,
+				struct ldms_metric_template_s out[]);
+
+extern const char *ldms_record_name_get(ldms_record_t record);
 
 void _ldms_set_ref_get(ldms_set_t s, const char *reason, const char *func, int line);
 int _ldms_set_ref_put(ldms_set_t s, const char *reason, const char *func, int line);
@@ -1636,21 +2802,18 @@ int ldms_set_publish(ldms_set_t set);
 int ldms_set_unpublish(ldms_set_t set);
 
 /**
- * \brief Delete the set reference
+ * \brief Delete the set
  *
- * Delete the set reference. The set will be deleted when all set references
- * are released.
+ * The set will be deleted when all set references are released.
  *
  * \param s	The metric set handle.
  */
 extern void ldms_set_delete(ldms_set_t s);
 
 /**
- * \brief Free the set reference. The set will not be deleted.
+ * @brief Drop the reference obtained by ldms_set_by_name()
  *
- * Only the set handle \c s will be freed. The set content will not be deleted.
- *
- * \param s	The metric set handle
+ * @param s The metric set handle
  */
 void ldms_set_put(ldms_set_t s);
 
@@ -1740,6 +2903,7 @@ extern uint32_t ldms_set_card_get(ldms_set_t s);
  * \return The schema digest
  */
 #define LDMS_DIGEST_LENGTH SHA256_DIGEST_LENGTH
+#define LDMS_DIGEST_STR_LENGTH ((2 * LDMS_DIGEST_LENGTH) + 1)
 struct ldms_digest_s {
 	unsigned char digest[LDMS_DIGEST_LENGTH];
 };
@@ -1751,7 +2915,7 @@ extern ldms_digest_t ldms_set_digest_get(ldms_set_t s);
  *
  * \param digest  The digest
  * \param buf     The output buffer
- * \param buf_len The buffer length
+ * \param buf_len The buffer length - must be >= LDMS_DIGEST_STR_LENGTH
  *
  * \retval NULL If there is an error (\c errno describing the error)
  * \retval buf  If succeeded, the output buffer containing formatted digest
@@ -1935,8 +3099,8 @@ uint64_t ldms_set_data_gn_get(ldms_set_t s);
 /**
  * \brief Get the heap generation number.
  *
- * The heap generation number get incremented when \c ldms_heap_alloc() or
- * \c ldms_heap_free() is called.
+ * The heap generation number is incremented when \c ldms_heap_alloc() or
+ * \c ldms_heap_free() are called.
  *
  * \param s	The ldms_set_t handle.
  * \returns	The 64bit heap generation number.
@@ -2127,6 +3291,15 @@ extern int ldms_set_info_traverse(ldms_set_t s, ldms_set_info_traverse_cb_fn cb,
 							int flag, void *cb_arg);
 
 /**
+ * \brief Return the thread ID handles the lookup and update complete events of the set
+ *
+ * \param s     The set handle
+ *
+ * \return The thread ID. -1 is returned if the set is not created by lookup.
+ */
+extern pid_t ldms_set_thread_id_get(ldms_set_t s);
+
+/**
  * \brief Add a metric to schema
  *
  * Adds a metric to a metric set schema. The \c name of the metric must be
@@ -2212,6 +3385,7 @@ extern int ldms_schema_metric_add_with_unit(ldms_schema_t s, const char *name,
 extern int ldms_schema_meta_add_with_unit(ldms_schema_t s, const char *name,
 					  const char *unit, enum ldms_value_type t);
 
+size_t ldms_metric_value_size_get(enum ldms_value_type t, uint32_t count);
 
 /**
  * \brief Return the heap bytes required
@@ -2659,6 +3833,27 @@ double ldms_mval_array_get_double(ldms_mval_t mv, int idx);
 struct ldms_timestamp ldms_mval_array_get_ts(ldms_mval_t mv, int idx);
 
 /**
+ * \brief Convert ldms_mval_t mv of type \c type to respective data type
+ *
+ * \param mv   The metric value handle
+ * \param type The type of the metric value handle
+ * \param idx  If \c type is ARRAY, \c idx is the index of the value.
+ *             Otherwise, \c idx is ignored.
+ */
+char ldms_mval_as_char(ldms_mval_t mv, enum ldms_value_type type, int idx);
+uint8_t ldms_mval_as_u8(ldms_mval_t mv, enum ldms_value_type type, int idx);
+int8_t ldms_mval_as_s8(ldms_mval_t mv, enum ldms_value_type type, int idx);
+uint16_t ldms_mval_as_u16(ldms_mval_t mv, enum ldms_value_type type, int idx);
+int16_t ldms_mval_as_s16(ldms_mval_t mv, enum ldms_value_type type, int idx);
+uint32_t ldms_mval_as_u32(ldms_mval_t mv, enum ldms_value_type type, int idx);
+int32_t ldms_mval_as_s32(ldms_mval_t mv, enum ldms_value_type type, int idx);
+uint64_t ldms_mval_as_u64(ldms_mval_t mv, enum ldms_value_type type, int idx);
+int64_t ldms_mval_as_s64(ldms_mval_t mv, enum ldms_value_type type, int idx);
+float ldms_mval_as_float(ldms_mval_t mv, enum ldms_value_type type, int idx);
+double ldms_mval_as_double(ldms_mval_t mv, enum ldms_value_type type, int idx);
+struct ldms_timestamp ldms_mval_as_timestamp(ldms_mval_t mv, enum ldms_value_type type, int idx);
+
+/**
  * \brief Append a new value to a list
  *
  * Append a new value entry to a list metric. The list handle \c lh must be
@@ -2911,6 +4106,7 @@ enum ldms_value_type ldms_record_metric_type_get(ldms_mval_t rec,
  */
 void ldms_record_metric_set(ldms_mval_t rec_inst, int metric_id,
 			    ldms_mval_t val);
+
 
 /**
  * Set value to elements in the array metric in the record instance.

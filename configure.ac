@@ -2,7 +2,7 @@ dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.64)
 AC_INIT([ovis-ldms],
-        m4_esyscmd([config/git-version-gen --prefix 'OVIS-' .tarball-version]),
+        m4_esyscmd([config/git-version-gen --prefix 'v' .tarball-version]),
         [ovis-help@sandia.gov])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([m4/Ovis-top.m4])
@@ -43,6 +43,10 @@ dnl if LEX is not available, the configure still won't fail
 AC_PROG_LEX
 AC_PROG_LN_S
 
+AC_PATH_PROG(FLEX, flex)
+if test -z "$FLEX"; then
+   AC_MSG_ERROR([You need the 'flex' lexer generator to compile LDMS])
+fi
 AC_ARG_VAR([BISON], [bison command])
 AC_CHECK_PROG([BISON], [bison -y], [bison -y], [no])
 AS_IF([test "x$BISON" = "xno"], [AC_MSG_ERROR([bison not found])])
@@ -58,9 +62,18 @@ AM_PROG_CC_C_O
 AC_C_CONST
 AC_C_FLEXIBLE_ARRAY_MEMBER
 
+AC_ARG_VAR([RST2MAN], [rst2man command])
+AC_CHECK_PROG([RST2MAN], [rst2man], [rst2man], [no])
+AS_IF([test "x$RST2MAN" = "xno"],
+      [AC_MSG_WARN([rst2man not found. Please install python3-docutils package.])])
+AM_CONDITIONAL([HAVE_RST2MAN], [test "x$RST2MAN" = xrst2man])
+
 OVIS_PKGLIBDIR
 
 AC_LIB_HAVE_LINKFLAGS([jansson], [], [#include <jansson.h>])
+AS_IF([test "x$HAVE_LIBJANSSON" = xno],
+	[AC_MSG_ERROR([libjansson or jansson.h not found])])
+AM_CONDITIONAL([HAVE_LIBJANSSON], [test "x$HAVE_LIBJANSSON" = xyes])
 
 dnl change sharedstatedir default
 test "$sharedstatedir" = '${prefix}/com' && sharedstatedir='${prefix}/var/lib'
@@ -129,7 +142,6 @@ OPTION_DEFAULT_ENABLE([ovis_auth], [ENABLE_OVIS_AUTH])
 OPTION_DEFAULT_ENABLE([zap], [ENABLE_ZAP])
 OPTION_DEFAULT_DISABLE([rdma], [ENABLE_RDMA])
 OPTION_DEFAULT_DISABLE([nola], [ENABLE_NOLA])
-OPTION_DEFAULT_DISABLE([fabric], [ENABLE_FABRIC])
 OPTION_DEFAULT_DISABLE([ugni], [ENABLE_UGNI])
 dnl dnl OPTION_DEFAULT_DISABLE([sos], [ENABLE_SOS])
 dnl dnl OPTION_WITH_OR_BUILD([sos],[../sos],[sos/src sos/include ods/src ods/include])
@@ -139,22 +151,26 @@ m4_ifndef([PKG_CHECK_MODULES],
       [m4_fatal([pkg.m4 not found. Please install pkg-config (Ubuntu) or pkgconfig (RHEL) package])])
 PKG_PROG_PKG_CONFIG
 
-dnl RDC defaults to no instead of search because amd currently recommends
-dnl multiple non-default path installations (/opt).
+# <rdc/rdc.h> fails to include <assert.h> in at least rocm 6.2.1, hence the
+# include of assert.h here.
+AC_LIB_HAVE_LINKFLAGS([rdc_bootstrap], [], [
+#include <assert.h>
+#include <rdc/rdc.h>
+])
+AM_CONDITIONAL([HAVE_LIBRDC_BOOTSTRAP], [test "x$HAVE_LIBRDC_BOOTSTRAP" = xyes])
+
+AC_LIB_HAVE_LINKFLAGS([rdc_ras], [], [])
+
 AC_ARG_ENABLE([rdc],
-	[AS_HELP_STRING([--enable-rdc], [attempt components that depend upon AMD rdc tooling @<:@default=no@:>@ for GPUs. Set RDC_CFLAGS=-I$rdcinclude and RDC_LIBS=-L$rdclibdir])],
+	[AS_HELP_STRING([--enable-rdc], [Include components that depend upon AMD rdc tooling. @<:@default=no@:>@ for GPUs.])],
 	[],
-	[enable_rdc="no"])
-if test "$enable_rdc" != "no"; then
-    PKG_CHECK_MODULES([RDC], [rdc],
-		      [AC_DEFINE([HAVE_RDC],[1],[if AMD rdc module present.])],
-		      AC_MSG_ERROR([pkg-config rdc failed])
-		      )
-    AC_MSG_RESULT([rdc include: $RDC_CFLAGS])
-    AC_MSG_RESULT([rdc lib: $RDC_LIBS])
-    HAVE_RDC=yes
-fi
-AM_CONDITIONAL([ENABLE_RDC], [test "x$HAVE_RDC" = xyes])
+	[enable_rdc="check"])
+AS_IF([test "x$enable_rdc" = xyes],[
+	AS_IF([test "x$HAVE_LIBRDC_BOOTSTRAP" = xno],[
+		AC_MSG_ERROR([librdc_bootstrap or rdc/rdc.h not found])
+	])
+])
+AM_CONDITIONAL([ENABLE_RDC], [test "x$enable_rdc" != xno -a "x$HAVE_LIBRDC_BOOTSTRAP" = xyes])
 
 have_zap=0
 
@@ -187,23 +203,8 @@ dnl we need libibverbs-devel and librdmacm-devel to support rdma
 		      AC_MSG_ERROR([pkg-config cray-rca failed])
 		      )
   fi
-  if test "$enable_fabric" = "yes"; then
-    AC_ARG_WITH([libfabric],
-      AC_HELP_STRING([--with-libfabric], [Specify libfabric location]),
-        [AS_IF([test -d "$withval/lib"], [LIB_FABRIC="$withval"],
-          AC_MSG_ERROR([libfabric not found at $withval]))],
-          AC_MSG_ERROR([must specify --with-libfabric]))
-    LDFLAGS="$LDFLAGS -L${LIB_FABRIC}/lib"
-    AC_SUBST([LIBFABRIC_INCDIR], [${LIB_FABRIC}/include])
-    saveCPPFLAGS=$CPPFLAGS
-    CPPFLAGS="$CPPFLAGS -I${LIB_FABRIC}/include"
-    AC_CHECK_LIB([fabric], fi_getinfo, [],
-      AC_MSG_ERROR([fi_getinfo() not found. zap requires fabric.]))
-    AC_CHECK_HEADER([rdma/fabric.h], [],
-      [AC_MSG_ERROR([<rdma/fabric.h> not found. zap requires fabric.])])
-    AC_MSG_RESULT([Using fabric at $LIB_FABRIC])
-    CPPFLAGS=$saveCPPFLAGS
-  fi
+  OPTION_WITH_CHECK([libfabric], [LIBFABRIC], [rdma/fabric.h],
+		    [fabric], [fi_getinfo] )
 fi
 OPTION_WITH([libibverbs], [LIBIBVERBS])
 OPTION_WITH([librdmacm], [LIBRDMACM])
@@ -212,11 +213,11 @@ AM_CONDITIONAL([ENABLE_libibverbs], [test "$HAVE_libibverbs" = "yes"])
 AM_CONDITIONAL([ENABLE_librdmacm], [test "$HAVE_librdmacm" = "yes"])
 
 AC_DEFINE_UNQUOTED([HAVE_ZAP],["$have_zap"],[configured with zap transport (1) or not (0)])
+AX_CHECK_OPENSSL([],[AC_MSG_ERROR([openssl not found, and required by ldms])])
 
 have_auth=0
 if test "$enable_ovis_auth" = "yes"; then
 	have_auth=1
-	AX_CHECK_OPENSSL([],[AC_MSG_ERROR([openssl not found, and required by ovis_auth])])
 	AUTH_LIB="-lovis_auth"
 else
 	AUTH_LIB=""
@@ -227,7 +228,6 @@ AC_DEFINE_UNQUOTED([HAVE_AUTH],[$have_auth],[configured with authentication (1) 
 
 OPTION_DEFAULT_ENABLE([sock], [ENABLE_SOCK])
 OPTION_DEFAULT_DISABLE([ugni], [ENABLE_UGNI])
-OPTION_DEFAULT_DISABLE([ssl], [ENABLE_SSL])
 OPTION_DEFAULT_DISABLE([zaptest], [ENABLE_ZAPTEST])
 OPTION_DEFAULT_DISABLE([ovis_event_test], [ENABLE_OVIS_EVENT_TEST])
 OPTION_DEFAULT_DISABLE([ovis_ev_test], [ENABLE_OVIS_EV_TEST])
@@ -307,6 +307,8 @@ AS_IF([test "x$enable_store_avro_kafka" != xno],[
     ])
 ])
 AM_CONDITIONAL([ENABLE_STORE_AVRO_KAFKA], [test "x$enable_store_avro_kafka" != xno])
+AM_CONDITIONAL([HAVE_LIBAVRO], [test "x$HAVE_LIBAVRO" != xno])
+AM_CONDITIONAL([HAVE_LIBSERDES], [test "x$HAVE_LIBSERDES" != xno])
 
 dnl Options for sampler
 OPTION_DEFAULT_ENABLE([sampler], [ENABLE_SAMPLER])
@@ -370,8 +372,10 @@ OPTION_DEFAULT_DISABLE([store-app], [ENABLE_STORE_APP])
 OPTION_DEFAULT_DISABLE([test_sampler], [ENABLE_TEST_SAMPLER])
 OPTION_DEFAULT_DISABLE([list_sampler], [ENABLE_LIST_SAMPLER])
 OPTION_DEFAULT_DISABLE([record_sampler], [ENABLE_RECORD_SAMPLER])
-dnl test_sampler will also build with --enable-ldms-test
+dnl test_sampler, list_sampler and record_sampler will also build with --enable-ldms-test
 AM_CONDITIONAL([ENABLE_TEST_SAMPLER_LDMS_TEST], [test "x$ENABLE_LDMS_TEST_FALSE" = "x#" -o "x$ENABLE_TEST_SAMPLER_FALSE" = "x#"])
+AM_CONDITIONAL([ENABLE_LIST_SAMPLER_LDMS_TEST], [test "x$ENABLE_LDMS_TEST_FALSE" = "x#" -o "x$ENABLE_LIST_SAMPLER_FALSE" = "x#"])
+AM_CONDITIONAL([ENABLE_RECORD_SAMPLER_LDMS_TEST], [test "x$ENABLE_LDMS_TEST_FALSE" = "x#" -o "x$ENABLE_RECORD_SAMPLER_FALSE" = "x#"])
 OPTION_DEFAULT_DISABLE([grptest], [ENABLE_GRPTEST])
 dnl grptest will also build with --enable-ldms-test
 AM_CONDITIONAL([ENABLE_GRPTEST_LDMS_TEST], [test "x$ENABLE_LDMS_TEST_FALSE" = "x#" -o "x$ENABLE_GRPTEST_FALSE" = "x#"])
@@ -451,7 +455,7 @@ AC_ARG_ENABLE([infiniband],
 	[AS_HELP_STRING([--enable-infiniband], [require components that depend upon libibmad and libibumad @<:@default=check@:>@])],
 	[],
 	[enable_infiniband="check"])
-AM_CONDITIONAL([ENABLE_INFINIBAND], [test "xenable_infiniband" != xno])
+AM_CONDITIONAL([ENABLE_INFINIBAND], [test "x$enable_infiniband" != xno])
 AS_IF([test "x$enable_infiniband" = xyes],[
 	AS_IF([test "x$HAVE_LIBIBMAD" = xno],
 		[AC_MSG_ERROR([infiniband required libibmad or <infiniband/mad.h> not found])])
@@ -465,8 +469,9 @@ AC_ARG_ENABLE([ibnet],
 	[AS_HELP_STRING([--enable-ibnet], [require the ibnet plugin @<:@default=check@:>@])],
 	[],
 	[enable_ibnet="check"])
-AM_CONDITIONAL([ENABLE_IBNET], [test "xenable_ibnet" != xno])
+AM_CONDITIONAL([ENABLE_IBNET], [test "x$enable_ibnet" != xno])
 AS_IF([test "$enable_ibnet" = xyes],[
+	AC_MSG_NOTICE([Disable ibnet module NOT requested])
 	AS_IF([test "x$HAVE_LIBIBMAD" = xno],
 		[AC_MSG_ERROR([ibnet required libibmad or <infiniband/mad.h> not found])])
 	AS_IF([test "x$HAVE_LIBIBUMAD" = xno],
@@ -481,7 +486,7 @@ AC_ARG_ENABLE([opa2],
 	[AS_HELP_STRING([--enable-opa2], [require the opa2 plugin @<:@default=check@:>@])],
 	[],
 	[enable_opa2="check"])
-AM_CONDITIONAL([ENABLE_OPA2], [test "xenable_opa2" != xno])
+AM_CONDITIONAL([ENABLE_OPA2], [test "x$enable_opa2" != xno])
 AS_IF([test "x$enable_opa2" = xyes],[
 	AS_IF([test "x$HAVE_LIBIBMAD" = xno],
 		[AC_MSG_ERROR([opa2 required libibmad or <infiniband/mad.h> not found])])
@@ -857,25 +862,9 @@ LIBS=""
 
 
 ## stuff from top
-OPTION_DEFAULT_DISABLE([libgenders], [ENABLE_LIBGENDERS],[  requires C++,boost])
-OPTION_DEFAULT_DISABLE([genderssystemd], [ENABLE_TOSS_SYSTEMD],[  toss systemd init scripts])
 OPTION_DEFAULT_DISABLE([csv_check], [ENABLE_CSV_CHECK],[  requires C++,boost])
 OPTION_EXTRA_BUILD_DIRS([third-plugins], [ENABLE_THIRD_PLUGINS], [THIRD_PLUGINS_DIRS])
 
-if test -z "$ENABLE_LIBGENDERS_TRUE"
-then
-	OPTION_WITH([libgenders], [LIBGENDERS],[/usr])
-	AC_LANG_PUSH([C++])
-	BOOST_REQUIRE( , AC_MSG_ERROR([Genders enabled but boost not found.]))
-	BOOST_STRING_ALGO
-	save_LDFLAGS=$LDFLAGS
-	LDFLAGS=$LIBGENDERS_LIBDIR_FLAG
-	AX_CXX_CHECK_LIB(gendersplusplus,[Gendersplusplus::GendersException], [],
-		AC_MSG_ERROR([libgendersplusplus not found. ]))
-	LDFLAGS=$save_LDFLAGS
-	AC_LANG_POP([C++])
-	LIBS=""
-fi
 if test -z "$ENABLE_CSV_CHECK_TRUE"
 then
 	AC_LANG_PUSH([C++])
@@ -910,6 +899,7 @@ AM_CONDITIONAL([SYSCONFDIR_NOT_ETC], [test "${sysconfdir}" != "/etc"])
 AC_LIB_HAVE_LINKFLAGS([cxi], [], [
 #include <stddef.h> /* libcxi.h fails to include this */
 #include <libcxi/libcxi.h>
+#include <cassini_cntr_desc.h> /* needed at least starting with shs-2.1.0 */
 ])
 AM_CONDITIONAL([HAVE_LIBCXI], [test "x$HAVE_LIBCXI" = xyes])
 
@@ -917,10 +907,21 @@ AC_ARG_ENABLE([slingshot],
     [AS_HELP_STRING([--enable-slingshot], [require the slinghost related plugins @<:@default=check@:>@])],
     [],
     [enable_slingshot="check"])
-AM_CONDITIONAL([ENABLE_SLINGSHOT], [test "xenable_slingshot" != xno])
+AM_CONDITIONAL([ENABLE_SLINGSHOT], [test "x$enable_slingshot" != xno -a "x$HAVE_LIBCXI" = xyes])
 AS_IF([test "x$enable_slingshot" = xyes],[
     AS_IF([test "x$HAVE_LIBCXI" = xno],
         [AC_MSG_ERROR([libcxi or its headers not found])])
+])
+
+AC_ARG_ENABLE([zfs],
+    [AS_HELP_STRING([--enable-zfs], [require the zfs related plugins @<:@default=check@:>@])],
+    [],
+    [enable_zfs="check"])
+AC_SEARCH_LIBS([zpool_vdev_name], [zfs],[HAVE_ZFS=yes])
+AM_CONDITIONAL([ENABLE_ZFS], [test "x$enable_zfs" != xno -a "x$HAVE_ZFS" = xyes])
+AS_IF([test "x$enable_zfs" = xyes],[
+    AS_IF([test "x$HAVE_ZFS" = xno],
+        [AC_MSG_ERROR([libzfs or its headers not found])])
 ])
 
 # define substitutions for configvars and other sed-generated files.
@@ -961,25 +962,9 @@ AC_SUBST(ac_configure_args)
 AC_SUBST(configure_input)
 
 AC_CONFIG_FILES([Makefile
+docs/Makefile
 util/Makefile
 util/relocation/Makefile
-util/sample_init_scripts/Makefile
-util/sample_init_scripts/genders/Makefile
-util/sample_init_scripts/genders/man/Makefile
-util/sample_init_scripts/genders/src/Makefile
-util/sample_init_scripts/genders/systemd/Makefile
-util/sample_init_scripts/genders/systemd/etc/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/ClusterGenders/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/ClusterSecrets/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/plugins-conf/Makefile
-util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/debug/Makefile
-util/sample_init_scripts/genders/systemd/services/Makefile
-util/sample_init_scripts/genders/sysv/Makefile
-util/sample_init_scripts/genders/sysv/etc/Makefile
-util/sample_init_scripts/genders/sysv/etc/init.d/Makefile
-util/sample_init_scripts/genders/examples/Makefile
 lib/Doxyfile
 lib/Makefile
 lib/src/Makefile
@@ -1029,6 +1014,7 @@ ldms/src/store/kafka/Makefile
 ldms/src/store/avro_kafka/Makefile
 ldms/src/store/store_flatfile/Makefile
 ldms/src/store/store_app/Makefile
+ldms/src/store/stream_dump/Makefile
 ldms/src/contrib/store/Makefile
 ldms/src/contrib/store/tutorial/Makefile
 ldms/src/contrib/store/timescale/Makefile
@@ -1095,6 +1081,13 @@ ldms/src/sampler/syspapi/Makefile
 ldms/src/sampler/app_sampler/Makefile
 ldms/src/sampler/slingshot_metrics/Makefile
 ldms/src/sampler/slingshot_info/Makefile
+ldms/src/sampler/json/Makefile
+ldms/src/sampler/hweventpapi/Makefile \
+ldms/src/sampler/rapl/Makefile \
+ldms/src/sampler/tsampler/Makefile \
+ldms/src/sampler/zfs_topvdevs/Makefile
+ldms/src/sampler/zfs_leafvdevs/Makefile
+ldms/src/sampler/zfs_zpool/Makefile
 ldms/src/contrib/sampler/Makefile
 ldms/src/contrib/sampler/daos/Makefile
 ldms/src/contrib/sampler/daos/test/Makefile
@@ -1121,13 +1114,6 @@ ldms/man/Makefile
 AC_CONFIG_FILES([
 	util/relocation/bld_manifest.sh
 	util/relocation/relocate-paths.sh
-	util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/ldmsd
-	util/sample_init_scripts/genders/systemd/etc/sysconfig/ldms.d/ldms-functions
-	util/sample_init_scripts/genders/systemd/ldmsd-pre-systemd
-	util/sample_init_scripts/genders/systemd/ldmsd-wrapper.sh
-	util/sample_init_scripts/genders/sysv/etc/init.d/ldmsd
-	util/sample_init_scripts/genders/sysv/etc/init.d/ldmsd.template
-	util/sample_init_scripts/genders/sysv/ldmsd-pre-sysvinit
 	ldms/scripts/ldms-wrapper
 	ldms/scripts/ldms-static-test.sh
 	ldms/scripts/pll-ldms-static-test.sh

@@ -2,9 +2,15 @@ name: Build Test - Ubuntu-22.04
 
 on:
   push:
-    branches: [ OVIS-4 ]
+    branches:
+      - 'OVIS-4'
+      - main
+      - 'b[0-9]+.[0-9]+'
   pull_request:
-    branches: [ OVIS-4 ]
+    branches:
+      - 'OVIS-4'
+      - main
+      - 'b[0-9]+.[0-9]+'
 
 jobs:
   build:
@@ -12,7 +18,7 @@ jobs:
     container:
         image: ovishpc/ovis-ubuntu-build
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - run: sh autogen.sh
     - run: ./configure CFLAGS="-Wall -Werror"
     - run: make
@@ -22,7 +28,7 @@ jobs:
     container:
         image: ovishpc/ovis-ubuntu-build
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - run: sh autogen.sh
     - run: ./configure
     - run: make distcheck
@@ -32,7 +38,7 @@ jobs:
     container:
         image: ovishpc/ovis-ubuntu-build
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - run: sh autogen.sh
     - run: ./configure --enable-rdma CFLAGS="-Wall -Werror"
     - run: make

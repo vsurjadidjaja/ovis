@@ -1,8 +1,8 @@
 /* -*- c-basic-offset: 8 -*-
- * Copyright (c) 2021 National Technology & Engineering Solutions
+ * Copyright (c) 2021,2023 National Technology & Engineering Solutions
  * of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
  * NTESS, the U.S. Government retains certain rights in this software.
- * Copyright (c) 2021 Open Grid Computing, Inc. All rights reserved.
+ * Copyright (c) 2021,2023 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -67,9 +67,8 @@
 #include <ovis_json/ovis_json.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldmsd_stream.h"
 
-static ldmsd_msg_log_f msglog;
+static ovis_log_t mylog;
 
 static sos_schema_t app_schema;
 static char path_buff[PATH_MAX];
@@ -166,13 +165,13 @@ static int create_schema(sos_t sos, sos_schema_t *app)
 	/* Create and add the App schema */
 	schema = sos_schema_from_template(&kokkos_appmon_template);
 	if (!schema) {
-		msglog(LDMSD_LERROR, "%s: Error %d creating Kokkos App schema.\n",
+		ovis_log(mylog, OVIS_LERROR, "%s: Error %d creating Kokkos App schema.\n",
 		       kokkos_store.name, errno);
 		return errno;
 	}
 	rc = sos_schema_add(sos, schema);
 	if (rc) {
-		msglog(LDMSD_LERROR, "%s: Error %d adding Kokkos App schema.\n",
+		ovis_log(mylog, OVIS_LERROR, "%s: Error %d adding Kokkos App schema.\n",
 		       kokkos_store.name, rc);
 		return rc;
 	}
@@ -185,7 +184,6 @@ static sos_t sos;
 static int reopen_container(char *path)
 {
 	int rc = 0;
-	sos_schema_t schema;
 
 	/* Check if the configuration has changed */
 	if (sos && (0 == strcmp(path, sos_container_path(sos)))
@@ -219,14 +217,11 @@ static const char *usage(struct ldmsd_plugin *self)
 		"     mode      The container permission mode for create, (defaults to 0660).\n";
 }
 
-static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
-			 ldmsd_stream_type_t stream_type,
-			 const char *msg, size_t msg_len,
-			 json_entity_t entity);
+static int stream_recv_cb(ldms_stream_event_t ev, void *ctxt);
+
 static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct attr_value_list *avl)
 {
 	char *value;
-	char *producer_name;
 	int rc = 0;
 
 	pthread_mutex_lock(&cfg_lock);
@@ -234,7 +229,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	if (value)
 		container_mode = strtol(value, NULL, 0);
 	if (!container_mode) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: ignoring container permission mode of %s, using 0660.\n",
 		       kokkos_store.name, value);
 	}
@@ -243,11 +238,11 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 		stream = strdup(value);
 	else
 		stream = strdup("kokkos-perf-data");
-	ldmsd_stream_subscribe(stream, stream_recv_cb, self);
+	ldms_stream_subscribe(stream, 0, stream_recv_cb, self, "kokkos_appmon");
 
 	value = av_value(avl, "path");
 	if (!value) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: the path to the container (path=) must be specified.\n",
 		       kokkos_store.name);
 		rc = ENOENT;
@@ -257,7 +252,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 		free(root_path);
 	root_path = strdup(value);
 	if (!root_path) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: Error allocating %d bytes for the container path.\n",
 		       strlen(value) + 1);
 		rc = ENOMEM;
@@ -266,7 +261,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 
 	rc = reopen_container(root_path);
 	if (rc) {
-		msglog(LDMSD_LERROR, "%s: Error opening %s.\n",
+		ovis_log(mylog, OVIS_LERROR, "%s: Error opening %s.\n",
 		       kokkos_store.name, root_path);
 	}
  out:
@@ -280,7 +275,7 @@ static int get_json_value(json_entity_t e, char *name, int expected_type, json_e
 	json_entity_t a = json_attr_find(e, name);
 	json_entity_t v;
 	if (!a) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: The JSON entity is missing the '%s' attribute.\n",
 		       kokkos_store.name,
 		       name);
@@ -289,7 +284,7 @@ static int get_json_value(json_entity_t e, char *name, int expected_type, json_e
 	v = json_attr_value(a);
 	v_type = json_entity_type(v);
 	if (v_type != expected_type) {
-		msglog(LDMSD_LERROR,
+		ovis_log(mylog, OVIS_LERROR,
 		       "%s: The '%s' JSON entity is the wrong type. "
 		       "Expected %d, received %d\n",
 		       kokkos_store.name,
@@ -300,51 +295,50 @@ static int get_json_value(json_entity_t e, char *name, int expected_type, json_e
 	return 0;
 }
 
-static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
-			  ldmsd_stream_type_t stream_type,
-			  const char *msg, size_t msg_len,
-			  json_entity_t entity)
+static int stream_recv_cb(ldms_stream_event_t ev, void *ctxt)
 {
 	int rc;
 	json_entity_t v, list, item;
 	uint64_t rank, job_id;
 	double timestamp, current_kernel_time, total_kernel_time;
 	uint64_t level, type, current_kernel_count, total_kernel_count;
-	char *name, *attr_name, *node_name;
+	char *name, *node_name;
 
-	if (!entity) {
-		msglog(LDMSD_LERROR,
-		       "%s: NULL entity received in stream callback.\n",
-		       kokkos_store.name);
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
+
+	if (!ev->recv.json) {
+		ovis_log(mylog, OVIS_LERROR,
+		       "NULL entity received in stream callback.\n");
 		return 0;
 	}
-	rc = get_json_value(entity, "rank", JSON_INT_VALUE, &v);
+	rc = get_json_value(ev->recv.json, "rank", JSON_INT_VALUE, &v);
 	if (rc)
 		goto out;
 	rank = json_value_int(v);
 
-	rc = get_json_value(entity, "job-id", JSON_INT_VALUE, &v);
+	rc = get_json_value(ev->recv.json, "job-id", JSON_INT_VALUE, &v);
 	if (rc)
 		goto out;
 	job_id = json_value_int(v);
 
-	rc = get_json_value(entity, "node-name", JSON_STRING_VALUE, &v);
+	rc = get_json_value(ev->recv.json, "node-name", JSON_STRING_VALUE, &v);
 	if (rc)
 		goto out;
 	node_name = json_value_str(v)->str;
 
-	rc = get_json_value(entity, "timestamp", JSON_STRING_VALUE, &v);
+	rc = get_json_value(ev->recv.json, "timestamp", JSON_STRING_VALUE, &v);
 	if (rc)
 		goto out;
 	timestamp = strtod(json_value_str(v)->str, NULL);
 
-	rc = get_json_value(entity, "kokkos-perf-data", JSON_LIST_VALUE, &list);
+	rc = get_json_value(ev->recv.json, "kokkos-perf-data", JSON_LIST_VALUE, &list);
 	if (rc)
 		goto out;
 	for (item = json_item_first(list); item; item = json_item_next(item)) {
 
 		if (json_entity_type(item) != JSON_DICT_VALUE) {
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 			       "%s: Items in kokkos-perf-data must all be dictionaries.\n",
 			       kokkos_store.name);
 			rc = EINVAL;
@@ -389,16 +383,16 @@ static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
 		sos_obj_t obj = sos_obj_new(app_schema);
 		if (!obj) {
 			rc = errno;
-			msglog(LDMSD_LERROR,
+			ovis_log(mylog, OVIS_LERROR,
 			       "%s: Error %d creating Kokkos App Mon object.\n",
 			       kokkos_store.name, errno);
 			goto out;
 		}
 		sos_obj_attr_by_id_set(obj, TIMESTAMP_ID, timestamp);
 		sos_obj_attr_by_id_set(obj, JOB_ID, job_id);
-		sos_obj_attr_by_id_set(obj, NODE_NAME_ID, strlen(node_name)+1, node_name);
+		sos_obj_attr_by_id_set(obj, NODE_NAME_ID, strlen(node_name), node_name);
 		sos_obj_attr_by_id_set(obj, RANK_ID, rank);
-		sos_obj_attr_by_id_set(obj, NAME_ID, strlen(name)+1, name);
+		sos_obj_attr_by_id_set(obj, NAME_ID, strlen(name), name);
 		sos_obj_attr_by_id_set(obj, TYPE_ID, type);
 		sos_obj_attr_by_id_set(obj, CURRENT_KERNEL_COUNT_ID, current_kernel_count);
 		sos_obj_attr_by_id_set(obj, TOTAL_KERNEL_COUNT_ID, total_kernel_count);
@@ -428,8 +422,15 @@ static struct ldmsd_plugin kokkos_store = {
 	.usage = usage,
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("store.kokkos_appmon_store",
+				"Log subsystem of the 'kokkos_appmon_store' plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
+				"of 'kokkos_appmon_store' plugin. Error %d\n", rc);
+	}
 	return &kokkos_store;
 }

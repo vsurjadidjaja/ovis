@@ -440,6 +440,9 @@ int zap_ep_listening(zap_ep_t ep);
 zap_err_t zap_connect(zap_ep_t ep, struct sockaddr *sa, socklen_t sa_len,
 		      char *data, size_t data_len);
 
+zap_err_t zap_connect2(zap_ep_t ep, struct sockaddr *sa, socklen_t sa_len,
+		      char *data, size_t data_len, int tpi);
+
 /**
  * A syncrhonous version of ::zap_connect()
  *
@@ -484,6 +487,25 @@ zap_err_t zap_connect_by_name(zap_ep_t ep, const char *host_port, const char *po
  * \return !0	A Zap error code. See zap_err_t.
  */
 zap_err_t zap_accept(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len);
+
+/**
+ * \brief Same as \c zap_accept(), but with thread pool index.
+ *
+ * The endpoint is assigned a thread in connect or accept steps. The thread pool
+ * index (\c tpi) instructs zap library to pick a thread from the specified
+ * thread pool. Hence, if two endpoints have different \c tpi, they are
+ * guaranteed to be on different threads. This feature is used by ldms_rail.
+ *
+ * \param ep	The endpoint handle.
+ * \param cb	Pointer to a function to receive asynchronous events on the endpoint.
+ * \param data	Pointer to connection data.
+ * \param data_len The size of the connection data in bytes.
+ * \param tpi   The thread pool index.
+ *
+ * \retval 0        If success, or
+ * \retval zap_err  Error code describing the error.
+ */
+zap_err_t zap_accept2(zap_ep_t ep, zap_cb_fn_t cb, char *data, size_t data_len, int tpi);
 
 /** \brief Return the local and remote addresses for an endpoint.
  *
@@ -578,6 +600,18 @@ zap_err_t zap_close(zap_ep_t ep);
  *		reason for failure.
  */
 zap_err_t zap_send(zap_ep_t ep, void *buf, size_t sz);
+
+/**
+ * \brief Like \c zap_send(), but with \c cb_arg for * ZAP_EVENT_SEND_COMPLETE event.
+ *
+ * \param ep	The endpoint handle
+ * \param buf	Pointer to the buffer to send
+ * \param sz	The number of bytes from the buffer to send
+ * \param cb_arg The callback argument for ZAP_EVENT_SEND_COMPLETE
+ * \retval ZAP_ERR_OK If success, or
+ * \retval zap_err    value indicating the reason for failure.
+ */
+zap_err_t zap_send2(zap_ep_t ep, void *buf, size_t sz, void *cb_arg);
 
 /**
  * \brief Send data to peer using map.
@@ -827,12 +861,22 @@ void zap_thrstat_wait_end(zap_thrstat_t stats);
 double zap_thrstat_get_utilization(zap_thrstat_t in);
 
 struct zap_thrstat_result_entry {
-	char *name;				/*< The thread name */
-	double sample_count;	/*< The number of sample periods */
+	char *name;			/*< The thread name */
+	double sample_count;		/*< The number of sample periods */
 	double sample_rate;		/*< Samples per second */
 	double utilization;		/*< The thread utilization */
 	uint64_t n_eps;			/*< Number of endpoints */
 	uint64_t sq_sz;			/*< Send queue size */
+	int pool_idx;			/*< Thread pool index */
+	uint64_t thread_id;		/*< The thread ID (pthread_t) */
+	pid_t tid;			/*< The Linux Thread ID (gettid()) */
+	uint64_t idle_time;		/*< Total idle time in micro-seconds */
+	uint64_t active_time;		/*< Total active time in micro-seconds */
+	struct timespec start;		/*< The reset timestamp */
+	struct timespec wait_start;	/*< The last timestamp the thread started waiting for events */
+	struct timespec wait_end;	/*< The last timestamp the thread woke up */
+	int waiting;			/*< A non-zero value means the thread is active. */
+	void *app_ctxt;			/*< Pointer to application's context */
 };
 
 struct zap_thrstat_result {
@@ -864,6 +908,48 @@ void zap_thrstat_free_result(struct zap_thrstat_result *result);
 const char *zap_thrstat_get_name(zap_thrstat_t stats);
 
 /**
+ * \brief Return the timestamp Zap endpoint's thread went to sleep.
+ *
+ * \return The timestamp the thread went to sleep
+ */
+struct timespec *zap_ep_thrstat_wait_end(zap_ep_t zep);
+
+/**
+ * \brief Set application context of the statistics of a thread corresponding to \c zep
+ *
+ * Applications may track its usage of a Zap thread by creating a context and caching
+ * it in the Zap thread statistics objects.
+ *
+ * Zap will call \c reset_fn() when \c zap_thrstat_reset() or \c zap_thrstat_reset_all()
+ * is called.
+ *
+ * \param zep    a Zap endpoint
+ * \param ctxt   Application context
+ * \param reset_fn  Handle of application's context reset function
+ *
+ * \return 0 on success.
+ *         EBUSY is returned if the endpoint has been assigned to a thread.
+ *         EEXIST is returned if a context has been set already.
+ *
+ * \see zap_thrstat_ctxt_get
+ */
+typedef void (*zap_thrstat_app_reset_fn)(void *ctxt);
+int zap_thrstat_ctxt_set(zap_ep_t zep, void *ctxt, zap_thrstat_app_reset_fn reset_fn);
+/**
+ * \brief Get application context of the statistics of a thread corresponding to \c zep
+ *
+ * \param zep    a Zap endpoint
+ *
+ * \return Application context in the Zap thread corresponding to \c zep.
+ *         NULL returned if Zap cannot retrieve application's context, and
+ *         errno is set. 0 means no application's context has been set.
+ *         EBUSY means no Zap thread has been assigned to the Zap endpoint \c zep.
+ *
+ * \see zap_thrstat_ctxt_set
+ */
+void *zap_thrstat_ctxt_get(zap_ep_t zep);
+
+/**
  * \brief Return the time difference in microseconds
  *
  * Computes the number of microseconds in the interval end - start.
@@ -881,5 +967,31 @@ static inline int64_t zap_timespec_diff_us(struct timespec *start, struct timesp
 	nsecs = end->tv_nsec - start->tv_nsec;
 	return (secs_ns + nsecs) / 1000;
 }
+
+/**
+ * Get the IO thread associated with the endpoint.
+ *
+ * \retval thread_id The thread ID associated to the endpoint
+ */
+pthread_t zap_ep_thread(zap_ep_t ep);
+
+/**
+ * Get the Linux Thread ID of the thread associated with the endpoint.
+ *
+ * The returned Thread ID is the value returned by gettid() and
+ * it is the same as the Thread ID reported by the top command.
+ *
+ * \return The Linux thread id
+ */
+pid_t zap_ep_thread_id(zap_ep_t ep);
+
+/**
+ * Get the send queue depth of an endpoint
+ *
+ * \param ep   A Zap endpoint handle
+ *
+ * \return The send queue depth
+ */
+uint64_t zap_ep_sq_sz(zap_ep_t ep);
 
 #endif

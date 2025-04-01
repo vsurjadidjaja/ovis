@@ -61,6 +61,7 @@
 #include "coll/rbt.h"
 #include "ldms.h"
 #include "ldmsd.h"
+#include "comp_id_helper.h"
 
 #include "gurt/telemetry_common.h"
 #include "gurt/telemetry_consumer.h"
@@ -68,7 +69,15 @@
 
 #include "daos.h"
 
-#define INSTANCE_NAME_BUF_LEN (DAOS_SYS_NAME_MAX + 17)
+/*#define RANK_SCHEMA "daos_rank"*/
+/* $producer/RANK_SCHEMA/$rank */
+/*#define RANK_INSTANCE_BUF_LEN (LDMS_PRODUCER_NAME_MAX + \
+                               strlen(RANK_SCHEMA) + 14)*/
+
+#define RANK_TARGET_SCHEMA "daos_rank_target"
+/* $producer/RANK_TARGET_SCHEMA/$rank/$target */
+#define INSTANCE_NAME_BUF_LEN (LDMS_PRODUCER_NAME_MAX + \
+                               strlen(RANK_TARGET_SCHEMA) + 25)
 
 static ldms_schema_t rank_target_schema;
 
@@ -165,23 +174,28 @@ int rank_target_schema_is_initialized(void)
 
 void rank_target_schema_fini(void)
 {
-	log_fn(LDMSD_LDEBUG, SAMP": rank_target_schema_fini()\n");
+	dao_log(OVIS_LDEBUG, "rank_target_schema_fini()\n");
 	if (rank_target_schema != NULL) {
 		ldms_schema_delete(rank_target_schema);
 		rank_target_schema = NULL;
 	}
 }
 
-int rank_target_schema_init(void)
+int rank_target_schema_init(comp_id_t cid)
 {
 	ldms_schema_t	sch;
 	int		rc, i, j, k;
 	char		name[64];
 
-	log_fn(LDMSD_LDEBUG, SAMP": rank_target_schema_init()\n");
-	sch = ldms_schema_new("daos_rank_target");
+	dao_log(OVIS_LDEBUG, "rank_target_schema_init()\n");
+	sch = ldms_schema_new(RANK_TARGET_SCHEMA);
 	if (sch == NULL)
 		goto err1;
+	rc = comp_id_helper_schema_add(sch, cid);
+	if (rc) {
+		rc = -rc;
+		goto err2;
+	}
 	rc = ldms_schema_meta_array_add(sch, "system", LDMS_V_CHAR_ARRAY, DAOS_SYS_NAME_MAX + 1);
 	if (rc < 0)
 		goto err2;
@@ -262,14 +276,19 @@ int rank_target_schema_init(void)
 	return 0;
 
 err2:
+	dao_log(LDMSD_LERROR, "daos_rank_target failed to add metric\n");
 	ldms_schema_delete(sch);
 err1:
-	log_fn(LDMSD_LERROR, SAMP": daos_rank_target schema creation failed\n");
+	dao_log(OVIS_LERROR, "daos_rank_target schema creation failed\n");
 	return -1;
 }
 
-struct rank_target_data *rank_target_create(const char *system, uint32_t rank,
-					    uint32_t target, const char *instance_name)
+static struct rank_target_data *rank_target_create(const char *producer_name,
+                                                   const char *instance_name,
+                                                   const char *system,
+                                                   const comp_id_t cid,
+                                                   uint32_t rank,
+                                                   uint32_t target)
 {
 	struct rank_target_data	*rtd = NULL;
 	char			*key = NULL;
@@ -299,6 +318,7 @@ struct rank_target_data *rank_target_create(const char *system, uint32_t rank,
 	set = ldms_set_new(instance_name, rank_target_schema);
 	if (set == NULL)
 		goto err3;
+	ldms_set_producer_name_set(set, producer_name);
 	index = ldms_metric_by_name(set, "system");
 	ldms_metric_array_set_str(set, index, system);
 	index = ldms_metric_by_name(set, "rank");
@@ -340,7 +360,7 @@ void rank_targets_destroy(void)
 	struct rank_target_data *rtd;
 
 	if (rbt_card(&rank_targets) > 0)
-		log_fn(LDMSD_LDEBUG, SAMP": destroying %lu rank targets\n", rbt_card(&rank_targets));
+		dao_log(OVIS_LDEBUG, "destroying %lu rank targets\n", rbt_card(&rank_targets));
 
 	while (!rbt_empty(&rank_targets)) {
 		rbn = rbt_min(&rank_targets);
@@ -350,7 +370,11 @@ void rank_targets_destroy(void)
 	}
 }
 
-void rank_targets_refresh(const char *system, int num_engines, int num_targets)
+void rank_targets_refresh(const char *producer_name,
+			  const char *system,
+			  const comp_id_t cid,
+			  int num_engines,
+			  int num_targets)
 {
 	int			 i;
 	struct rbt		 new_rank_targets;
@@ -366,13 +390,13 @@ void rank_targets_refresh(const char *system, int num_engines, int num_targets)
 
 		ctx = d_tm_open(i);
 		if (!ctx) {
-			log_fn(LDMSD_LDEBUG, SAMP": d_tm_open(%d) failed\n", i);
+			dao_log(OVIS_LDEBUG, "d_tm_open(%d) failed\n", i);
 			continue;
 		}
 
 		rc = get_daos_rank(ctx, &rank);
 		if (rc != 0) {
-			log_fn(LDMSD_LERROR, SAMP": get_daos_rank() for shm %d failed: %d\n", i, rc);
+			dao_log(OVIS_LERROR, "get_daos_rank() for shm %d failed: %d\n", i, rc);
 			continue;
 		}
 
@@ -380,21 +404,22 @@ void rank_targets_refresh(const char *system, int num_engines, int num_targets)
 			struct rbn *rbn = NULL;
 			struct rank_target_data *rtd = NULL;
 
-			snprintf(instance_name, sizeof(instance_name), "%s/%d/%d", system, rank, target);
+			snprintf(instance_name, sizeof(instance_name),
+				 "%s/%s/%d/%d", producer_name, RANK_TARGET_SCHEMA, rank, target);
 
 			rbn = rbt_find(&rank_targets, instance_name);
 			if (rbn) {
 				rtd = container_of(rbn, struct rank_target_data, rank_targets_node);
 				rbt_del(&rank_targets, &rtd->rank_targets_node);
-				//log_fn(LDMSD_LDEBUG, SAMP": found %s\n", instance_name);
+				//dao_log(OVIS_LDEBUG, "found %s\n", instance_name);
 			} else {
-				rtd = rank_target_create(system, rank, target, instance_name);
+				rtd = rank_target_create(producer_name, instance_name, system, cid, rank, target);
 				if (rtd == NULL) {
-					log_fn(LDMSD_LERROR, SAMP": failed to create rank target %s (%s)\n",
+					dao_log(OVIS_LERROR, "failed to create rank target %s (%s)\n",
 								instance_name, strerror(errno));
 					continue;
 				}
-				//log_fn(LDMSD_LDEBUG, SAMP": created %s\n", instance_name);
+				//dao_log(OVIS_LDEBUG, "created %s\n", instance_name);
 			}
 			if (rtd == NULL)
 				continue;
@@ -435,12 +460,12 @@ static void rank_target_sample(struct d_tm_context *ctx, struct rank_target_data
 				 rtd->target);
 			node = d_tm_find_metric(ctx, dtm_name);
 			if (node == NULL) {
-				log_fn(LDMSD_LERROR, SAMP": Failed to find metric %s\n", dtm_name);
+				dao_log(OVIS_LERROR, "Failed to find metric %s\n", dtm_name);
 				continue;
 			}
 			rc = d_tm_get_gauge(ctx, &cur, &stats, node);
 			if (rc != DER_SUCCESS) {
-				log_fn(LDMSD_LERROR, SAMP": Failed to fetch gauge %s\n", dtm_name);
+				dao_log(OVIS_LERROR, "Failed to fetch gauge %s\n", dtm_name);
 				continue;
 			}
 
@@ -449,7 +474,7 @@ static void rank_target_sample(struct d_tm_context *ctx, struct rank_target_data
 				rank_target_lat_buckets[j]);
 			index = ldms_metric_by_name(rtd->metrics, ldms_name);
 			if (index < 0) {
-				log_fn(LDMSD_LERROR, SAMP": Failed to fetch index for %s\n", ldms_name);
+				dao_log(OVIS_LERROR, "Failed to fetch index for %s\n", ldms_name);
 				continue;
 			}
 			ldms_metric_set_u64(rtd->metrics, index, cur);
@@ -463,7 +488,7 @@ static void rank_target_sample(struct d_tm_context *ctx, struct rank_target_data
 					 stat_name);
 				index = ldms_metric_by_name(rtd->metrics, ldms_name);
 				if (index < 0) {
-					log_fn(LDMSD_LERROR, SAMP": Failed to fetch index for %s\n", ldms_name);
+					dao_log(OVIS_LERROR, "Failed to fetch index for %s\n", ldms_name);
 					continue;
 				}
 
@@ -483,7 +508,7 @@ static void rank_target_sample(struct d_tm_context *ctx, struct rank_target_data
 
 				index = ldms_metric_by_name(rtd->metrics, ldms_name);
 				if (index < 0) {
-					log_fn(LDMSD_LERROR, SAMP": Failed to fetch index for %s\n", ldms_name);
+					dao_log(OVIS_LERROR, "Failed to fetch index for %s\n", ldms_name);
 					continue;
 				}
 
@@ -501,12 +526,12 @@ static void rank_target_sample(struct d_tm_context *ctx, struct rank_target_data
 			rtd->target);
 		node = d_tm_find_metric(ctx, dtm_name);
 		if (node == NULL) {
-			log_fn(LDMSD_LERROR, SAMP": Failed to find metric %s\n", dtm_name);
+			dao_log(OVIS_LERROR, "Failed to find metric %s\n", dtm_name);
 			continue;
 		}
 		rc = d_tm_get_gauge(ctx, &cur, &stats, node);
 		if (rc != DER_SUCCESS) {
-			log_fn(LDMSD_LERROR, SAMP": Failed to fetch gauge %s\n", dtm_name);
+			dao_log(OVIS_LERROR, "Failed to fetch gauge %s\n", dtm_name);
 			continue;
 		}
 

@@ -157,7 +157,10 @@ The sampler plugin instance access permission. The default is 0440.
 
 .SS Start a sampler plugin
 .BR start
-attr=<value>
+.BI name\fR= NAME
+.BI interval\fR= INTERVAL
+.RB [ offset\fR=\fIOFFSET ]
+.RB [ exclusive_thread\fR=\fI0|1 ]
 .RS
 .TP
 .BI name " name"
@@ -166,15 +169,28 @@ The plugin name.
 .TP
 .BI interval " interval"
 .br
-The sample interval in microseconds.
+The sample interval, which is a float followed by a unit string.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
 .TP
 .BI [offset " offset"]
 .br
-Offset (shift) from the sample mark in microseconds.
+Offset (shift) from the sample mark in the same format as intervals.
 Offset can be positive or negative with magnitude up to 1/2
-the sample interval. If this offset is specified, including 0,
-collection will be synchronous; if the offset is not specified,
-collection will be asynchronous. Optional.
+the sample interval. The default offset is 0. Collection is always synchronous.
+.TP
+.RB [ exclusive_thread\fR=\fI0|1 ]
+.br
+If exclusive_thread is 0, the sampler shares a thread with other sampler.
+If exclusive_thread is 1, the sampler has an exclusive thread to work on.
+The default is 0 (i.e. share sampling threads).
+
 .RE
 
 
@@ -219,6 +235,8 @@ plugin for more information.
 \fBxprt\fR=\fIsock\fR|\fIrdma\fR|\fIugni\fR|\fIfabric\fR
 [\fBhost\fR=\fIHOST\fR]
 [\fBauth\fR=\fIAUTH_REF\fR]
+[\fBquota\fR=\fIQUOTA\fR]
+[\fBrx_rate\fR=\fIRX_RATE\fR]
 .RS
 .TP
 \fBport\fR=\fIPORT\fR
@@ -241,6 +259,27 @@ Instruct \fBldmsd\fR to use \fIAUTH_REF\fR (a name reference to \fBauth\fR
 object created by \fBauth_add\fR command) to authenticate connections on this
 port. If not given, the port uses the default authentication method specified on
 the CLI options (see \fBldmsd\fR(8) option \fB-a\fR).
+.TP
+.BI [quota " BYTES"]
+.br
+The LDMS daemon we are managing uses receive quota (measured in bytes) to
+control the amount of data received on the connections established by accepting
+requests to this listening endpoint. The \fRquota\Fb value functions
+similarly to the \fRquota\fB attribute in the \fRprdcr_add\fB command,
+influencing the amount of data producers created by Sampler Advertisement can
+receive. The default value is determined by the command-line \fR--quota\fB
+option used when starting the LDMS daemon (ldmsd). If neither the
+\fR--quota\fB option nor the \fRquota\fB attribute is specified, there is
+no limit on receive quota.
+
+.TP
+.BI [rx_rate " BYTES_PER_SEC"]
+.br
+The receive rate limit (in bytes/second) controls the rate of data received on
+the connections established by accepting requests to this listening endpoint.
+Unlike \fRquota\fB, which controls the total amount of received data, the receive
+rate limit focuses on the data flow per second. If not specified, it is
+unlimited.
 .RE
 
 .SH PRODUCER COMMAND SYNTAX
@@ -267,9 +306,21 @@ The hostname of the host
 .br
 The connection type [active, passive]
 .TP
+.BI reconnect " interval"
+.br
+The connection retry interval, which is a float followed by a unit string.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
+.TP
 .BI interval " interval"
 .br
-The connection retry interval
+It is being deprecated. Please use 'reconnect'.
 .TP
 .BI [perm " permission"]
 .br
@@ -281,6 +332,25 @@ Instruct \fBldmsd\fR to use \fIAUTH_REF\fR (a name reference to \fBauth\fR
 object created by \fBauth_add\fR command) with the connections to this
 producer. If not given, the default authentication method specified on
 the CLI options (see \fBldmsd\fR(8) option \fB-a\fR) is used.
+.TP
+.BI [rail " NUM"]
+.br
+The number of rail endpooints for the prdcr (default: 1).
+.TP
+.BI [quota " BYTES"]
+.br
+The send quota our ldmsd (the one we are controlling) advertises to the prdcr
+(default: value from ldmsd --quota option). This limits how much outstanding
+data our ldmsd holds for the prdcr.
+.TP
+.BI [rx_rate " BYTES_PER_SEC"]
+.br
+The recv rate (bytes/sec) limit for this connection. The default is -1
+(unlimited).
+.TP
+.BI [cache_ip " cache_ip"]
+.br
+Controls how \fBldmsd\fR handles hostname resolution for producer IP addresses. When set to \fBtrue\fR (default), \fBldmsd\fR resolves the hostname once during \fBprdcr_add\fR and caches the result. If the initial resolution fails and the producer is started (via \fBprdcr_start\R or \fBprdcr_start_regex\fR), \fBldmsd\fR will retry resolution at connection time and each resonnection attempt until successful. When set to \fBfalse\fR, \fBldmsd\fR performs hostname resolution at \fBprdcr_add\fR time and repeats the resolution at every connection and reconnection attempt if the producer is started.
 .RE
 
 .SS Delete a producer from the aggregator
@@ -304,10 +374,22 @@ attr=<value>
 .br
 The producer name
 .TP
+.BI [reconnect " interval"]
+.br
+The connection retry interval, which is a float followed by a unit string.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
+If unspecified, the previously configured value will be used. Optional.
+.TP
 .BI [interval " interval"]
 .br
-The connection retry interval in microsec. If unspecified,
-the previously configured value will be used. Optional.
+It is being deprecated. Please use 'reconnect'.
 .RE
 
 .SS Start all producers matching a regular expression
@@ -319,10 +401,22 @@ attr=<value>
 .br
 A regular expression
 .TP
+.BI [reconnect " interval"]
+.br
+The connection retry interval, which is a float followed by a unit stirng.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
+If unspecified, the previously configured value will be used. Optional.
+.TP
 .BI [interval " interval"]
 .br
-The connection retry interval in microsec. If unspecified,
-the previously configured value will be used. Optional.
+It is being deprecated. Please use 'reconnect'.
 .RE
 
 .SS Stop a producer
@@ -382,7 +476,15 @@ any attributes specified for the metric sets or hosts.
 .TP
 .BI interval " interval"
 .br
-The update/collect interval
+The update/collect interval, which is a float followed by a unit string.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
 .TP
 .BI [offset " offset"]
 .br
@@ -499,8 +601,16 @@ The update policy name
 .TP
 .BI [interval " interval"]
 .br
-The update interval in micro-seconds. If this is not
-specified, the previously configured value will be used. Optional.
+The update interval, which is a float followed by a unit string.
+If no unit string is given, the default unit is microseconds.
+A unit string is one of the followings:
+  us -- microseconds
+  ms -- milliseconds
+  s  -- seconds
+  m  -- minutes
+  h  -- hours
+  d  -- days
+If this is not specified, the previously configured value will be used. Optional.
 .TP
 .BI [offset " offset"]
 .br
@@ -528,6 +638,11 @@ attr=<value>
 .br
 The updater name. If none is given, the statuses of all updaters are
 reported.
+.TP
+.BI [reset " value"]
+.br
+If true, reset the updater's counters after returning the values.
+The default is false.
 .RE
 
 .SS Query the updaters' list of regular expressions to match set names or set schemas
@@ -557,9 +672,13 @@ The name of the storage backend.
 .br
 The storage backend container name.
 .TP
-.BI schema " schema"
+.BI [schema " schema"]
 .br
-The schema name of the metric set to store.
+The schema name of the metric set to store. If 'schema' is given, 'regex' is ignored. Either 'schema' or 'regex' must be given.
+.TP
+.BI [regex " regex"]
+.br
+a regular expression matching set schemas. It must be used with decomposition. Either 'schema' or 'regex' must be given.
 .TP
 .BI [perm " permission"]
 .br
@@ -692,24 +811,55 @@ The stream name
 The data to publish
 .RE
 
-.SS Subscribe to a stream
-.BR subscribe
+.SS Subscribe to a stream on matching producers
+.BR prdcr_subscribe
 attr=<value>
 .RS
 .TP
-.BI name " name"
+.BI regex " PRDCR_REGEX"
 .br
-The stream name
+A regular expression matching PRODUCER names
+.TP
+.BI stream " STREAM_NAME_OR_REGEX"
+.br
+The stream name or regular expression
+.TP
+.BI [rx_rate " BYTES_PER_SECOND"]
+.br
+The recv rate (bytes/sec) limit for the matching streams. The default is -1
+(unlimited).
 .RE
 
 .SH LDMS DAEMON COMMAND SYNTAX
-.SS Changing the verbosity level of ldmsd
+.SS Changing the log levels of LDMSD infrastructures
 .BR loglevel
+attr=<value> (deprecated)
+
+.BR log_level
+attr=<value>
+.TP
+.BI level " string"
+.br
+A string specifying the log levels to be enabled
+
+The valid string are "default", "quiet", and a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL. It is case insensitive. "default" means to set the log level to the defaul log level. "quiet" means disable the log messages. We note that "<level>," and "<level>" give different results. "<level>" -- a single level name -- sets the log level to the given level and all the higher severity levels. In contrast, "<level>," -- a level name followed by a comma -- sets the log level to only the given level.
+.TP
+.BI [name " name"]
+.br
+A logger name
+.TP
+.BI [regex " regex"]
+.br
+A regular expression matching logger names. If neither 'name' or 'regex' is given, the command sets the default log level to the given level. For example, 'regex=xprt.*' will change the transport-related log levels. Use log_status to query the available log infrastructures.
+.RE
+
+.SS Query LDMSD's log information
+.BR log_status
 attr=<value>
 .RS
-.BI level " level"
+.BI [name " value"]
 .br
-Verbosity levels [DEBUG, INFO, ERROR, CRITICAL, QUIET]
+A logger name
 .RE
 
 .SS Exit the connected LDMS daemon gracefully
@@ -824,6 +974,157 @@ A GID. Optional
 An octal number representing the permission bits. Optional
 .RE
 
+.SH STATISTICS COMMAND SYNTAX
+
+.SS Display the IO thread statistics
+.br
+.BR thread_stats
+attr=<value>
+.RS
+.TP
+.BI [reset " true|false"]
+.br
+If true, reset the thread statistics after returning the values. The default is false.
+.RE
+
+.SS Display the transport operation statistics
+.br
+.BR xprt_stats
+attr=<value>
+.RS
+.TP
+.BI [reset " true|false"]
+.br
+If true, reset the statistics after returning the values. The default is false.
+.RE
+
+.SS Display the statistics of updaters' update time per set
+.br
+.BR update_time_stats
+attr=<value>
+.RS
+.TP
+.BI [reset " true|false"]
+.br
+If true, reset the update time statistics after returning the values. The default is false.
+.TP
+.BI [name " name"]
+.br
+An updater name. Only the statistics of the given updater will be reported and reset if reset is true.
+.RE
+
+.SS Display the statistics of storage policy's store time per set
+.br
+.BR store_time_stats
+attr=<value>
+.RS
+.TP
+.BI [reset " true|false"]
+.br
+If true, reset the store time statistics after returning the values. The default is false.
+.TP
+.BI [name " name"]
+.br
+A storage policy name. Only the statistics of the given storage policy will be reported and reset if reset is true.
+.RE
+
+.SH QGROUP COMMAND SYNTAX
+
+.SS Get qgroup information
+.br
+.BR qgroup_info
+.RS
+.TP
+- This command has no attributes. -
+.RE
+
+.SS Set qgroup parameters
+.br
+.BR qgroup_config
+attr=<value>
+.RS
+.TP
+.BI "[quota " BYTES ]
+The amount of our quota (bytes). The \fIBYTES\fR can be expressed with
+quantifiers, e.g. "1k" for 1024 bytes. The supported quantifiers are
+"b" (bytes), "k" (kilobytes), "m" (megabytes), "g" (gigabytes) and "t"
+(terabytes).
+.TP
+.BI "[ask_interval " TIME ]
+The time interval to ask the members when our quota is low. The \fITIME\fR can
+be expressed with units, e.g. "1s", but will be treated as microseconds if no
+units is specified. The supported units are "us" (microseconds), "ms"
+(milliseconds), "s" (seconds), "m" (minutes), "h" (hours), and "d" (days).
+.TP
+.BI "[ask_amount " BYTES ]
+The amount of quota to ask from our members. The \fIBYTES\fR can be expressed
+with quantifiers, e.g. "1k" for 1024 bytes. The supported quantifiers are "b"
+(bytes), "k" (kilobytes), "m" (megabytes), "g" (gigabytes) and "t" (terabytes).
+.TP
+.BI "[ask_mark " BYTES ]
+The amount of quota to determine as 'low', to start asking quota from other
+members. The \fIBYTES\fR can be expressed with quantifiers, e.g. "1k" for 1024
+bytes. The supported quantifiers are "b" (bytes), "k" (kilobytes), "m"
+(megabytes), "g" (gigabytes) and "t" (terabytes).
+.TP
+.BI "[reset_interval " TIME ]
+The time interval to reset our quota to its original value. The \fITIME\fR can
+be expressed with units, e.g. "1s", but will be treated as microseconds if no
+units is specified. The supported units are "us" (microseconds), "ms"
+(milliseconds), "s" (seconds), "m" (minutes), "h" (hours), and "d" (days).
+.RE
+
+.SS Add a member into our qgroup
+.br
+.BR qgroup_member_add
+attr=<value>
+.RS
+.TP
+.BI "xprt " XPRT
+The transport type of the connection (e.g. "sock").
+.TP
+.BI "host " HOST
+The hostname or IP address of the member.
+.TP
+.BI "[port " PORT ]
+The port of the member (default: 411).
+.TP
+.BI "[auth " AUTH_REF ]
+The reference to the authentication domain (the \fBname\fR in \fBauth_add\fR
+command) to be used in this connection If not specified, the default
+authentication domain of the daemon is used.
+.RE
+
+.SS Remove a member from the qgroup
+.br
+.BR qgroup_member_del
+attr=<value>
+.RS
+.TP
+.BI "host " HOST
+The hostname or IP address of the member.
+.TP
+.BI "[port " PORT ]
+The port of the member (default: 411).
+.RE
+
+.SS Start the qgroup service
+.br
+.BR qgroup_start
+.RS
+.TP
+- This command has no attributes. -
+.RE
+
+.SS Stop the qgroup service
+.br
+.BR qgroup_stop
+.RS
+.TP
+- This command has no attributes. -
+.RE
+
+
 .SH MISC COMMAND SYNTAX
 
 .SS Display the list of available commands
@@ -862,9 +1163,9 @@ port1=`expr $portbase + 1`
 port2=`expr $portbase + 2`
 port3=`expr $portbase + 3`
 
-echo "prdcr_add name=localhost2 host=localhost type=active xprt=sock port=$port2 interval=20000000"
+echo "prdcr_add name=localhost2 host=localhost type=active xprt=sock port=$port2 reconnect=20000000"
 echo "prdcr_start name=localhost2"
-echo "prdcr_add name=localhost1 host=localhost type=active xprt=sock port=$port1 interval=20000000"
+echo "prdcr_add name=localhost1 host=localhost type=active xprt=sock port=$port1 reconnect=20000000"
 echo "prdcr_start name=localhost1"
 echo "updtr_add name=policy5_h1 interval=2000000 offset=0"
 echo "updtr_prdcr_add name=policy5_h1 regex=localhost1"
@@ -922,6 +1223,104 @@ meminfo_vmstat
                   meminfo            schema
 node01_procstat2
                   node01/procstat2   inst
+ldmsd_controller>
+.fi
+
+.SS
+Example of log_status's report
+.nf
+ldmsd_controller> log_status
+Name                 Levels                         Description
+-------------------- ------------------------------ ------------------------------
+ldmsd (default)      ERROR,CRITICAL                 The default log subsystem
+config               default                        Messages for the configuration infrastructure
+failover             default                        Messages for the failover infrastructure
+producer             default                        Messages for the producer infrastructure
+sampler              default                        Messages for the common sampler infrastructure
+store                default                        Messages for the common storage infrastructure
+stream               default                        Messages for the stream infrastructure
+updater              default                        Messages for the updater infrastructure
+xprt.ldms            default                        Messages for ldms
+xprt.zap             default                        Messages for Zap
+xprt.zap.sock        default                        Messages for zap_sock
+----------------------------------------------------------------------------------
+The loggers with the Log Level as 'default' use the same log level as the
+default logger (ldmsd). When the default log level changes, their log levels
+change accordingly.
+
+# Change the log level of the config infrastructure to INFO and above
+ldmsd_controller> loglevel name=config level=INFO
+ldmsd_controller> log_status
+Name                 Log Level                      Description
+-------------------- ------------------------------ ------------------------------
+ldmsd (default)      ERROR,CRITICAL                 The default log subsystem
+config               INFO,WARNING,ERROR,CRITICAL    Messages for the configuration infrastructure
+failover             default                        Messages for the failover infrastructure
+producer             default                        Messages for the producer infrastructure
+sampler              default                        Messages for the common sampler infrastructure
+store                default                        Messages for the common storage infrastructure
+stream               default                        Messages for the stream infrastructure
+updater              default                        Messages for the updater infrastructure
+xprt.ldms            default                        Messages for ldms
+xprt.zap             default                        Messages for Zap
+xprt.zap.sock        default                        Messages for zap_sock
+----------------------------------------------------------------------------------
+The loggers with the Log Level as 'default' use the same log level as the
+default logger (ldmsd). When the default log level changes, their log levels
+change accordingly.
+
+# Change the transport-related log levels to ERROR. That is, only the ERROR messages will be reported.
+ldmsd_controller> loglevel regex=xprt.* level=ERROR,
+ldmsd_controller> log_status
+Name                 Log Level                      Description
+-------------------- ------------------------------ ------------------------------
+ldmsd (default)      ERROR,CRITICAL                 The default log subsystem
+config               INFO,WARNING,ERROR,CRITICAL    Messages for the configuration infrastructure
+failover             default                        Messages for the failover infrastructure
+producer             default                        Messages for the producer infrastructure
+sampler              default                        Messages for the common sampler infrastructure
+store                default                        Messages for the common storage infrastructure
+stream               default                        Messages for the stream infrastructure
+updater              default                        Messages for the updater infrastructure
+xprt.ldms            ERROR,                         Messages for ldms
+xprt.zap             ERROR,                         Messages for Zap
+xprt.zap.sock        ERROR,                         Messages for zap_sock
+----------------------------------------------------------------------------------
+The loggers with the Log Level as 'default' use the same log level as the
+default logger (ldmsd). When the default log level changes, their log levels
+change accordingly.
+
+# Set the log levels of all infrastructures to the default level
+ldmsd_controller> loglevel regex=.* level=default
+ldmsd_controller> log_status
+Name                 Log Level                      Description
+-------------------- ------------------------------ ------------------------------
+ldmsd (default)      ERROR,CRITICAL                 The default log subsystem
+config               default                        Messages for the configuration infrastructure
+failover             default                        Messages for the failover infrastructure
+producer             default                        Messages for the producer infrastructure
+sampler              default                        Messages for the common sampler infrastructure
+store                default                        Messages for the common storage infrastructure
+stream               default                        Messages for the stream infrastructure
+updater              default                        Messages for the updater infrastructure
+xprt.ldms            default                        Messages for ldms
+xprt.zap             default                        Messages for Zap
+xprt.zap.sock        default                        Messages for zap_sock
+----------------------------------------------------------------------------------
+The loggers with the Log Level as 'default' use the same log level as the
+default logger (ldmsd). When the default log level changes, their log levels
+change accordingly.
+
+# Get the information of a specific log infrastructure
+ldmsd_controller> log_status name=config
+Name                 Log Level                      Description
+-------------------- ------------------------------ ------------------------------
+ldmsd (default)      ERROR,CRITICAL                 The default log subsystem
+config               default                        Messages for the configuration infrastructure
+----------------------------------------------------------------------------------
+The loggers with the Log Level as 'default' use the same log level as the
+default logger (ldmsd). When the default log level changes, their log levels
+change accordingly.
 ldmsd_controller>
 .fi
 

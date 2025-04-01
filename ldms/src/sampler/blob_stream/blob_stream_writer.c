@@ -66,11 +66,11 @@
 #include <ovis_json/ovis_json.h>
 #include "ldms.h"
 #include "ldmsd.h"
-#include "ldmsd_stream.h"
 
 #define PNAME "blob_stream_writer"
 
-static ldmsd_msg_log_f msglog;
+static ovis_log_t mylog;
+
 static pthread_mutex_t cfg_lock;
 static int closing;
 static char* root_path;
@@ -92,7 +92,7 @@ typedef struct stream_data {
 	char* offsetfile_name;
 	char* timingfile_name;
 	char* typefile_name;
-	ldmsd_stream_client_t subscription;
+	ldms_stream_client_t subscription;
 	/* set at first write */
 	FILE* offsetfile;
 	FILE* streamfile;
@@ -116,9 +116,9 @@ char blob_stream_char_to_type(char c)
 {
 	switch (c) {
 	case 's':
-		return LDMSD_STREAM_STRING;
+		return LDMS_STREAM_STRING;
 	case 'j':
-		return LDMSD_STREAM_JSON;
+		return LDMS_STREAM_JSON;
 		break;
 #if 0
 	case 'b':
@@ -130,34 +130,33 @@ char blob_stream_char_to_type(char c)
 	}
 }
 
-char blob_stream_type_to_char(ldmsd_stream_type_t stream_type)
+char blob_stream_type_to_char(ldms_stream_type_t stream_type)
 {
 	switch (stream_type) {
-	case LDMSD_STREAM_STRING:
+	case LDMS_STREAM_STRING:
 		return 's';
-	case LDMSD_STREAM_JSON:
+	case LDMS_STREAM_JSON:
 		return 'j';
 #if 0
 	case LDMSD_STREAM_BINARY:
 		return 'b';
 #endif
 	default:
-		msglog(LDMSD_LERROR, PNAME ": unexpected stream type %d\n",
+		ovis_log(mylog, OVIS_LERROR, "unexpected stream type %d\n",
 			stream_type);
 		return '\0';
 	}
 }
 
 /* open, if not open or already closed, and write to stream files. */
-static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
-		     ldmsd_stream_type_t stream_type,
-		     const char *msg, size_t msg_len,
-		     json_entity_t e)
+static int stream_cb(ldms_stream_event_t ev, void *ctxt)
 {
 	int rc = 0;
 	stream_data_t sd = ctxt;
+	if (ev->type != LDMS_STREAM_EVENT_RECV)
+		return 0;
 	if (!sd) {
-		msglog(LDMSD_LERROR, PNAME ": stream_cb ctxt is NULL\n");
+		ovis_log(mylog, OVIS_LERROR, "stream_cb ctxt is NULL\n");
 		return EINVAL;
 	}
 
@@ -173,11 +172,11 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 	uint64_t le = htole64(sd->offset);
 	rc = fwrite(&le, sizeof(uint64_t), 1, sd->offsetfile);
 	if ( rc != 1) {
-		msglog(LDMSD_LERROR, PNAME ": error writing offset to %s\n",
+		ovis_log(mylog, OVIS_LERROR, "error writing offset to %s\n",
 			sd->offsetfile_name);
 	}
 	if (debug)
-		msglog(LDMSD_LDEBUG, PNAME ": offset=%ld ...\n", sd->offset);
+		ovis_log(mylog, OVIS_LDEBUG, "offset=%ld ...\n", sd->offset);
 
 	if (sd->timingfile) {
 		struct timeval now;
@@ -187,29 +186,29 @@ static int stream_cb(ldmsd_stream_client_t c, void *ctxt,
 		tbuf[1] = htole64((uint64_t)now.tv_usec);
 		rc = fwrite(tbuf, sizeof(uint64_t), 2, sd->timingfile);
 		if ( rc != 2) {
-			msglog(LDMSD_LERROR, PNAME ": error writing time to %s\n",
+			ovis_log(mylog, OVIS_LERROR, "error writing time to %s\n",
 				sd->timingfile_name);
 		}
 	}
 
 	if (sd->typefile) {
-		char st = blob_stream_type_to_char(stream_type);
+		char st = blob_stream_type_to_char(ev->recv.type);
 		rc = fwrite(&st, 1, 1, sd->typefile);
 		if (rc != 1) {
 			int ferr = ferror(sd->typefile);
-			msglog(LDMSD_LERROR, PNAME ": short type write in %s: %s\n",
+			ovis_log(mylog, OVIS_LERROR, "short type write in %s: %s\n",
 				sd->typefile_name, STRERROR(ferr));
 		}
 	}
-	rc = fwrite(msg, 1, msg_len, sd->streamfile);
+	rc = fwrite(ev->recv.data, 1, ev->recv.data_len, sd->streamfile);
 	sd->offset += rc;
-	if (rc != msg_len) {
+	if (rc != ev->recv.data_len) {
 		int ferr = ferror(sd->streamfile);
-		msglog(LDMSD_LERROR, PNAME ": short write starting at %s:%ld: %s\n",
+		ovis_log(mylog, OVIS_LERROR, "short write starting at %s:%ld: %s\n",
 			sd->streamfile_name, sd->offset, STRERROR(ferr));
 	}
 	if (debug)
-		msglog(LDMSD_LDEBUG, PNAME ": msg=%.50s ...\n", msg);
+		ovis_log(mylog, OVIS_LDEBUG, "msg=%.50s ...\n", ev->recv.data);
 
 out:
 	pthread_mutex_unlock(&sd->write_lock);
@@ -247,7 +246,7 @@ static void stream_data_open(stream_data_t sd)
 	sd->offsetfile = fopen_perm(sd->offsetfile_name, "w", 0640);
 	sd->streamfile = fopen_perm(sd->streamfile_name, "w", 0640);
 	if (!sd->offsetfile || !sd->streamfile) {
-		msglog(LDMSD_LERROR, PNAME ": Error '%s' opening the files %s, %s.\n",
+		ovis_log(mylog, OVIS_LERROR, "Error '%s' opening the files %s, %s.\n",
 		       STRERROR(errno), sd->offsetfile_name, sd->streamfile_name);
 		sd->ws = WS_ERR;
 		return;
@@ -257,8 +256,8 @@ static void stream_data_open(stream_data_t sd)
 		sprintf(sd->timingfile_name + end, "%ld", (long)t);
 		sd->timingfile = fopen_perm(sd->timingfile_name, "w", 0640);
 		if (!sd->timingfile) {
-			msglog(LDMSD_LERROR, PNAME ": Error '%s' opening the file %s.\n",
-			       STRERROR(errno), sd->offsetfile_name, sd->timingfile_name);
+			ovis_log(mylog, OVIS_LERROR, "Error '%s' opening the file %s.\n",
+			       STRERROR(errno), sd->timingfile_name);
 			sd->ws = WS_ERR;
 			return;
 		}
@@ -268,8 +267,8 @@ static void stream_data_open(stream_data_t sd)
 		sprintf(sd->typefile_name + end, "%ld", (long)t);
 		sd->typefile = fopen_perm(sd->typefile_name, "w", 0640);
 		if (!sd->typefile) {
-			msglog(LDMSD_LERROR, PNAME ": Error '%s' opening the file %s.\n",
-			       STRERROR(errno), sd->offsetfile_name, sd->typefile_name);
+			ovis_log(mylog, OVIS_LERROR, "Error '%s' opening the file %s.\n",
+			       STRERROR(errno), sd->typefile_name);
 			sd->ws = WS_ERR;
 			return;
 		}
@@ -279,7 +278,7 @@ static void stream_data_open(stream_data_t sd)
 	int rc = fwrite(magic, strlen(magic)+1, 1, sd->offsetfile);
 	sd->offset += 8;
 	if (rc != 1) {
-		msglog(LDMSD_LERROR, PNAME ": Error '%s' writing to file %s.\n",
+		ovis_log(mylog, OVIS_LERROR, "Error '%s' writing to file %s.\n",
 		       STRERROR(errno), sd->offsetfile_name);
 		sd->ws = WS_ERR;
 		return;
@@ -287,7 +286,7 @@ static void stream_data_open(stream_data_t sd)
 	char magic2[] = "blobdat";
 	rc = fwrite(magic2, strlen(magic2)+1, 1, sd->streamfile);
 	if (rc != 1) {
-		msglog(LDMSD_LERROR, PNAME ": Error '%s' writing to file %s.\n",
+		ovis_log(mylog, OVIS_LERROR, "Error '%s' writing to file %s.\n",
 		       STRERROR(errno), sd->streamfile_name);
 		sd->ws = WS_ERR;
 		return;
@@ -296,7 +295,7 @@ static void stream_data_open(stream_data_t sd)
 		char magic3[] = "blobtim";
 		int rc = fwrite(magic3, strlen(magic3)+1, 1, sd->timingfile);
 		if (rc != 1) {
-			msglog(LDMSD_LERROR, PNAME ": Error '%s' writing to file %s.\n",
+			ovis_log(mylog, OVIS_LERROR, "Error '%s' writing to file %s.\n",
 			       STRERROR(errno), sd->timingfile_name);
 			sd->ws = WS_ERR;
 			return;
@@ -306,7 +305,7 @@ static void stream_data_open(stream_data_t sd)
 		char magic4[] = "blobtyp";
 		int rc = fwrite(magic4, strlen(magic4)+1, 1, sd->typefile);
 		if (rc != 1) {
-			msglog(LDMSD_LERROR, PNAME ": Error '%s' writing to file %s.\n",
+			ovis_log(mylog, OVIS_LERROR, "Error '%s' writing to file %s.\n",
 			       STRERROR(errno), sd->typefile_name);
 			sd->ws = WS_ERR;
 			return;
@@ -339,7 +338,7 @@ static void fclose_and_spool(FILE* *f, char* *fname)
 			case EEXIST:
 				break;
 			default:
-				msglog(LDMSD_LERROR,
+				ovis_log(mylog, OVIS_LERROR,
 					"create_outdir: failed to create"
 					" directory for %s: %s\n",
 					rbuf, STRERROR(err));
@@ -349,12 +348,12 @@ static void fclose_and_spool(FILE* *f, char* *fname)
 		sprintf(rbuf, "%s/spool/%s", dirn, base);
 		err = rename(*fname, rbuf);
 		if (err) {
-			msglog(LDMSD_LERROR, PNAME
-				": rename_output: failed rename(%s, %s):"
+			ovis_log(mylog, OVIS_LERROR,
+				"rename_output: failed rename(%s, %s):"
 				" %s\n", *fname, rbuf, STRERROR(err));
 		} else {
-			msglog(LDMSD_LDEBUG, PNAME
-				": renamed: %s to %s\n",
+			ovis_log(mylog, OVIS_LDEBUG,
+				"renamed: %s to %s\n",
 				*fname, rbuf);
 		}
 	}
@@ -398,7 +397,7 @@ static int set_paths(stream_data_t sd)
 	sprintf(dpath, "%s/%s", root_path, container);
 	int rc = f_mkdir_p(dpath, 0750);
 	if ((rc != 0) && (errno != EEXIST)) {
-		msglog(LDMSD_LERROR, PNAME ": Failure %d creating directory '%s'\n",
+		ovis_log(mylog, OVIS_LERROR, "Failure %d creating directory '%s'\n",
 			 errno, dpath);
 		rc = ENOENT;
 		sd->ws = WS_ERR;
@@ -441,10 +440,10 @@ static int set_paths(stream_data_t sd)
 	snprintf(sd->offsetfile_name, pathlen, "%s/%s/%s.OFFSET.", root_path,
 		container, sd->stream_name);
 	if (!sd->subscription) {
-		msglog(LDMSD_LDEBUG, PNAME ": subscribing to stream '%s'\n",
+		ovis_log(mylog, OVIS_LDEBUG, "subscribing to stream '%s'\n",
 			sd->stream_name);
-		sd->subscription = ldmsd_stream_subscribe(sd->stream_name,
-			stream_cb, sd);
+		sd->subscription = ldms_stream_subscribe(sd->stream_name, 0,
+			stream_cb, sd, "blob_stream_writer");
 		/* stream dispatch to stream_cb now holds a reference to sd. */
 	}
 	return 0;
@@ -503,14 +502,14 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 			const char *sn = av_value_at_idx(avl, i);
 			rc = add_stream(sn);
 			if (rc) {
-				msglog(LDMSD_LERROR, PNAME ": failed to add"
+				ovis_log(mylog, OVIS_LERROR, "failed to add"
 					" stream %s.\n", sn);
 				goto out;
 			}
 		}
 	}
 	if (LIST_FIRST(&data_list) == NULL) {
-		msglog(LDMSD_LERROR, PNAME ": missing 'stream=...' in config\n");
+		ovis_log(mylog, OVIS_LERROR, "missing 'stream=...' in config\n");
 		rc = EINVAL;
 		goto out;
 	}
@@ -535,7 +534,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 
 	s = av_value(avl, "path");
 	if (!s) {
-		msglog(LDMSD_LERROR, PNAME ": missing path in config\n");
+		ovis_log(mylog, OVIS_LERROR, "missing path in config\n");
 		rc = EINVAL;
 		goto out;
 	} else {
@@ -545,7 +544,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 
 	s = av_value(avl, "container");
 	if (!s){
-		msglog(LDMSD_LERROR, PNAME ": missing container in config\n");
+		ovis_log(mylog, OVIS_LERROR, "missing container in config\n");
 		rc = EINVAL;
 		goto out;
 	} else {
@@ -553,13 +552,13 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 	}
 	if (!container || !root_path) {
 		rc = ENOMEM;
-		msglog(LDMSD_LERROR, PNAME ": out of memory in config.\n");
+		ovis_log(mylog, OVIS_LERROR, "out of memory in config.\n");
 		goto out;
 	}
 
 	stream_data_t sd = NULL;
 	LIST_FOREACH(sd, &data_list, entry) {
-		msglog(LDMSD_LINFO, PNAME ": config: %s\n", sd->stream_name);
+		ovis_log(mylog, OVIS_LINFO, "config: %s\n", sd->stream_name);
 		pthread_mutex_lock(&sd->write_lock);
 		if (sd->ws == WS_REOPEN) {
 			reset_paths(sd);
@@ -567,7 +566,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 		if (sd->ws == WS_NEW) {
 			rc = set_paths(sd);
 			if (rc) {
-				msglog(LDMSD_LERROR, PNAME ": config: problem '%s'\n",
+				ovis_log(mylog, OVIS_LERROR, "config: problem '%s'\n",
 					STRERROR(rc));
 			}
 		}
@@ -599,7 +598,7 @@ static void stream_data_close( stream_data_t sd )
 	}
 	free(sd->stream_name);
 	sd->stream_name = NULL;
-	ldmsd_stream_close(sd->subscription);
+	ldms_stream_close(sd->subscription);
 	/* sd reference is no longer hiding inside cb handler */
 	sd->subscription = NULL;
 	sd->ws = WS_CLOSED;
@@ -623,7 +622,6 @@ static void term(struct ldmsd_plugin *self)
 	root_path = NULL;
 	free(container);
 	container = NULL;
-
 	return;
 }
 
@@ -643,11 +641,6 @@ static const char *usage(struct ldmsd_plugin *self)
 		;
 }
 
-static ldms_set_t get_set(struct ldmsd_sampler *self)
-{
-	return NULL;
-}
-
 static int sample(struct ldmsd_sampler *self)
 {
 	return 0;
@@ -661,13 +654,18 @@ static struct ldmsd_sampler blob_stream_writer = {
 			.config = config,
 			.usage = usage,
 	},
-	.get_set = get_set,
 	.sample = sample
 };
 
-struct ldmsd_plugin *get_plugin(ldmsd_msg_log_f pf)
+struct ldmsd_plugin *get_plugin()
 {
-	msglog = pf;
+	int rc;
+	mylog = ovis_log_register("sampler.blob_stream_writer", "Message for the blob_stream_writer plugin");
+	if (!mylog) {
+		rc = errno;
+		ovis_log(NULL, OVIS_LWARN, "Failed to create the log subsystem "
+					"of 'blob_stream_writer' plugin. Error %d\n", rc);
+	}
 	LIST_INIT(&data_list);
 	return &blob_stream_writer.base;
 }
