@@ -1,5 +1,5 @@
-#ifndef HEADER_H
-#define HEADER_H
+#ifndef gpfs_HEADER_H
+#define gpfs_HEADER_H
 
 struct Gpfs
 {

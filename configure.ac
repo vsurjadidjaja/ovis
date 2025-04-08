@@ -334,6 +334,7 @@ if test -z "$ENABLE_MPI_SAMPLER_TRUE" ; then
 	AX_MPI([:],[ AC_MSG_ERROR([MPICC required by mpi_sampler ])])
 fi
 OPTION_DEFAULT_ENABLE([procinterrupts], [ENABLE_PROCINTERRUPTS])
+OPTION_DEFAULT_ENABLE([gpfs], [ENABLE_GPFS])
 OPTION_DEFAULT_ENABLE([procnet], [ENABLE_PROCNET])
 OPTION_DEFAULT_ENABLE([procnetdev], [ENABLE_PROCNETDEV])
 OPTION_DEFAULT_ENABLE([procnfs], [ENABLE_PROCNFS])
@@ -1061,6 +1062,7 @@ ldms/src/sampler/kgnilnd/Makefile
 ldms/src/sampler/tx2mon/Makefile
 ldms/src/sampler/msr_interlagos/Makefile
 ldms/src/sampler/meminfo/Makefile
+ldms/src/sampler/gpfs_sampler/Makefile
 ldms/src/contrib/sampler/gpu_metrics_sampler/Makefile
 ldms/src/sampler/procinterrupts/Makefile
 ldms/src/sampler/procnetdev2/Makefile
